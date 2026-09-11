@@ -7,3 +7,9 @@ backups/
 run-with-sa.js
 poner-secret-worker.js
 .claude/
+
+# Claves de service account / Admin SDK — secretos reales, NUNCA subir
+*serviceAccount*.json
+*serviceaccount*.json
+*adminsdk*.json
+*-firebase-adminsdk-*.json
