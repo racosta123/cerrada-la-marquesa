@@ -7,9 +7,9 @@
 <title>Cerrada La Marquesa</title>
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
-<!-- Fondo (letrero Mixcoac): precarga solo la variante del viewport para no retrasar el render -->
-<link rel="preload" as="image" href="assets/mixcoac-mobile.webp" media="(max-width:699px)">
-<link rel="preload" as="image" href="assets/mixcoac-desktop.webp" media="(min-width:700px)">
+<!-- Fondo (letrero La Marquesa): precarga solo la variante del viewport para no retrasar el render -->
+<link rel="preload" as="image" href="assets/marquesa-mobile.webp" media="(max-width:699px)">
+<link rel="preload" as="image" href="assets/marquesa-desktop.webp" media="(min-width:700px)">
 <style>
   :root{
     --bg:#0d0d0f; --surface:#18181b; --surface-2:#1f1f23; --line:#2a2a30;
@@ -33,14 +33,14 @@
   button{font-family:inherit;cursor:pointer;border:none}
   input,select{font-family:inherit}
 
-  /* ---------- FONDO GLOBAL (letrero Mixcoac) ---------- */
+  /* ---------- FONDO GLOBAL (letrero La Marquesa) ---------- */
   #bgLayer{
     position:fixed;inset:0;z-index:-2;
-    background-image:url('assets/mixcoac-mobile.webp');
+    background-image:url('assets/marquesa-mobile.webp');
     background-size:cover;background-position:center;background-repeat:no-repeat;
     background-color:var(--bg);   /* fallback mientras carga / si falla */
   }
-  @media (min-width:700px){ #bgLayer{ background-image:url('assets/mixcoac-desktop.webp'); } }
+  @media (min-width:700px){ #bgLayer{ background-image:url('assets/marquesa-desktop.webp'); } }
   /* Capa oscura sobre el fondo. LOGIN: suave (degradado, más oscuro abajo para el card).
      INTERNAS (body.in-app): ~85% para que el fondo no compita con el contenido. */
   #bgOverlay{
@@ -324,7 +324,7 @@
 </head>
 <body>
 
-<!-- Fondo global (letrero Mixcoac) + capa oscura, detrás de todo -->
+<!-- Fondo global (letrero La Marquesa) + capa oscura, detrás de todo -->
 <div id="bgLayer"></div>
 <div id="bgOverlay"></div>
 

@@ -1,6 +1,6 @@
-const CACHE = 'marquesa-v1';
+const CACHE = 'marquesa-v2';
 const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json',
-  './assets/mixcoac-mobile.webp','./assets/mixcoac-desktop.webp',
+  './assets/marquesa-mobile.webp','./assets/marquesa-desktop.webp',
   './icons/icon-192.png','./icons/icon-512.png','./icons/icon-maskable-512.png','./icons/apple-touch-icon.png'];
 self.addEventListener('install', e => {
   e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(()=>self.skipWaiting()));
