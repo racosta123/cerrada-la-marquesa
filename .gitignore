@@ -1,0 +1,9 @@
+demo-nuevo*.html
+demo-candado*.html
+*.zip
+files*.zip
+.wrangler/
+backups/
+run-with-sa.js
+poner-secret-worker.js
+.claude/
