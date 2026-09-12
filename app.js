@@ -382,7 +382,7 @@ function buildInviteText(name, dur, uses, expira){
   return `¡Hola, ${name}! 👋\n`
     + `Tienes acceso a *Cerrada La Marquesa*.\n`
     + `🕐 ${fmtInviteVigencia(expira, dur)} · ${fmtInviteUses(uses)}\n`
-    + `📍 Cómo llegar: https://maps.app.goo.gl/St7fExUFhHZJckmf6\n\n`
+    + `📍 Cómo llegar: https://www.google.com/maps/dir/?api=1&destination=29.1209415,-111.054941\n\n`
     + `Muestra el código QR adjunto al llegar a la caseta de acceso.`;
 }
 
