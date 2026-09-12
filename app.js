@@ -344,7 +344,9 @@ async function generateInvite(){
     $('#qrCount').textContent = inviteUses===0 ? 'Usos ilimitados durante la vigencia' : `${inviteUses} ${inviteUses===1?'uso':'usos'} · solo puerta de visitantes`;
     $('#inviteForm').classList.add('hidden');
     $('#inviteResult').classList.remove('hidden');
-    $('#shareQrBtn').onclick = ()=> shareQR(dataUrl, name);
+    // Captura los parámetros de ESTA invitación (las globales pueden cambiar si se reabre la hoja).
+    const dur = inviteDur, uses = inviteUses, payload = r.payload, expira = r.expira;
+    $('#shareQrBtn').onclick = ()=> shareQR({ payload, name, dur, uses, expira });
   } catch(e){
     toast(e.message || 'No se pudo generar', 'bad');
   } finally {
@@ -352,16 +354,168 @@ async function generateInvite(){
   }
 }
 
-async function shareQR(dataUrl, name){
+/* ---- Compartir invitación de visita: mensaje + tarjeta-imagen (QR) ---- */
+
+function fmtInviteDur(h){
+  h = +h || 1;
+  if (h === 24) return '24 horas';
+  return h + (h === 1 ? ' hora' : ' horas');
+}
+function fmtInviteUses(u){
+  u = +u || 0;
+  return u === 0 ? 'usos ilimitados' : (u + (u === 1 ? ' uso' : ' usos'));
+}
+/* Vigencia como hora local exacta: "Vence hoy 8:30 PM" / "Vence mañana 8:30 AM".
+   Si no llega `expira` (p. ej. Worker aún sin desplegar), cae a la vigencia relativa. */
+function fmtInviteVigencia(expira, dur){
+  const d = expira ? new Date(expira) : null;
+  if (!d || isNaN(d.getTime())) return `Válido por ${fmtInviteDur(dur)}`;
+  const hora = d.toLocaleTimeString('en-US', { hour:'numeric', minute:'2-digit', hour12:true }); // "8:30 PM"
+  const startOf = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((startOf(d) - startOf(new Date())) / 86400000);
+  const cuando = days <= 0 ? 'hoy' : (days === 1 ? 'mañana'
+    : 'el ' + d.toLocaleDateString('es-MX', { day:'numeric', month:'long' }));
+  return `Vence ${cuando} ${hora}`;
+}
+/* Texto que acompaña al QR en Web Share / WhatsApp. */
+function buildInviteText(name, dur, uses, expira){
+  return `¡Hola, ${name}! 👋\n`
+    + `Tienes acceso a *Cerrada La Marquesa*.\n`
+    + `🕐 ${fmtInviteVigencia(expira, dur)} · ${fmtInviteUses(uses)}\n`
+    + `📍 Cómo llegar: https://maps.app.goo.gl/St7fExUFhHZJckmf6\n\n`
+    + `Muestra el código QR adjunto al llegar a la caseta de acceso.`;
+}
+
+/* Carga una imagen y resuelve cuando está lista (para componer en canvas). */
+function loadImage(src){
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+/* Rectángulo redondeado (no todos los navegadores traen ctx.roundRect). */
+function roundRectPath(ctx, x, y, w, h, r){
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x,     y + h, r);
+  ctx.arcTo(x,     y + h, x,     y,     r);
+  ctx.arcTo(x,     y,     x + w, y,     r);
+  ctx.closePath();
+}
+/* Recorta un texto con "…" si excede maxW con la fuente activa (nombres largos). */
+function fitText(ctx, text, maxW){
+  if (ctx.measureText(text).width <= maxW) return text;
+  let t = text;
+  while (t.length > 1 && ctx.measureText(t + '…').width > maxW) t = t.slice(0, -1);
+  return t + '…';
+}
+
+/* Compone una tarjeta vertical (foto + capa oscura + recuadro BLANCO con el QR + datos)
+   con <canvas> nativo y la devuelve como File JPG. Sin librerías nuevas. */
+async function buildInviteCard({ payload, name, dur, uses, expira }){
+  const W = 1080, H = 1350;
+  const cv = document.createElement('canvas');
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+  const cx = W / 2;
+
+  // Fondo: foto existente escalada "cover". Si falla, color sólido.
   try {
-    const blob = await (await fetch(dataUrl)).blob();
-    const file = new File([blob], 'acceso-la-marquesa.png', { type:'image/png' });
-    if (navigator.canShare && navigator.canShare({ files:[file] })){
-      await navigator.share({ files:[file], title:'Acceso Cerrada La Marquesa', text:`Código de acceso para ${name}` });
-    } else {
-      const a = document.createElement('a'); a.href = dataUrl; a.download = 'acceso-la-marquesa.png'; a.click();
+    const bg = await loadImage('assets/marquesa-mobile.webp');
+    const s = Math.max(W / bg.width, H / bg.height);
+    const bw = bg.width * s, bh = bg.height * s;
+    ctx.drawImage(bg, (W - bw) / 2, (H - bh) / 2, bw, bh);
+  } catch(e){
+    ctx.fillStyle = '#0e1b2a'; ctx.fillRect(0, 0, W, H);
+  }
+  // Capa oscura para legibilidad del texto sobre la foto.
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0,   'rgba(8,15,26,0.74)');
+  g.addColorStop(0.5, 'rgba(8,15,26,0.58)');
+  g.addColorStop(1,   'rgba(8,15,26,0.84)');
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+  // Encabezado.
+  ctx.textAlign = 'center';
+  ctx.fillStyle = 'rgba(255,255,255,0.82)';
+  ctx.font = '600 30px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.fillText('A C C E S O   D E   V I S I T A', cx, 150);
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '700 58px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.fillText('Cerrada La Marquesa', cx, 226);
+
+  // Recuadro BLANCO sólido con el QR (obligatorio: un QR sobre fondo oscuro no escanea).
+  const boxW = 720, boxH = 720, boxX = (W - boxW) / 2, boxY = 300;
+  ctx.fillStyle = '#ffffff';
+  roundRectPath(ctx, boxX, boxY, boxW, boxH, 40); ctx.fill();
+  const pad = 70, qs = boxW - pad * 2;
+  // QR generado al tamaño exacto del recuadro → nítido y escaneable.
+  const qrUrl = await QRCode.toDataURL(payload, { margin: 1, width: qs, errorCorrectionLevel: 'M' });
+  const qr = await loadImage(qrUrl);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(qr, boxX + pad, boxY + pad, qs, qs);
+  ctx.imageSmoothingEnabled = true;
+
+  // Datos del visitante.
+  ctx.fillStyle = '#ffffff';
+  ctx.font = '700 52px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.fillText(fitText(ctx, name, W - 160), cx, 1110);
+  ctx.fillStyle = 'rgba(255,255,255,0.90)';
+  ctx.font = '400 36px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.fillText(`${fmtInviteVigencia(expira, dur)} · ${fmtInviteUses(uses)}`, cx, 1168);
+  ctx.fillStyle = 'rgba(255,255,255,0.72)';
+  ctx.font = '400 30px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.fillText('Muestra este código en la caseta de acceso', cx, 1222);
+
+  // Pie discreto.
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.font = '400 26px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+  ctx.fillText('Sistema por Diagonal Catorce', cx, 1300);
+
+  const blob = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.92));
+  return new File([blob], 'acceso-la-marquesa.jpg', { type: 'image/jpeg' });
+}
+
+/* Comparte la tarjeta + el texto. Web Share con archivos cuando el dispositivo lo soporta;
+   si no, descarga la tarjeta y copia el mensaje al portapapeles para pegarlo en WhatsApp. */
+async function shareQR({ payload, name, dur, uses, expira }){
+  const texto = buildInviteText(name, dur, uses, expira);
+  let file = null;
+  try { file = await buildInviteCard({ payload, name, dur, uses, expira }); }
+  catch(e){ console.error('buildInviteCard', e); }
+
+  // Camino principal: Web Share nivel 2 (imagen + texto en una sola hoja de compartir).
+  if (file && navigator.canShare && navigator.canShare({ files:[file] })){
+    try {
+      await navigator.share({ files:[file], title:'Acceso Cerrada La Marquesa', text: texto });
+      return;
+    } catch(e){
+      if (e && e.name === 'AbortError') return;   // el usuario canceló: no es error
+      // cualquier otro error → plan B
     }
-  } catch(e){}
+  }
+
+  // Plan B (sin soporte de compartir archivos): descarga la tarjeta + copia el mensaje.
+  let img = file;
+  if (!img){   // si la tarjeta falló, al menos el QR crudo
+    try {
+      const qrUrl = await QRCode.toDataURL(payload, { margin: 1, width: 560, errorCorrectionLevel: 'M' });
+      const b = await (await fetch(qrUrl)).blob();
+      img = new File([b], 'acceso-la-marquesa.png', { type: 'image/png' });
+    } catch(e){ toast('No se pudo generar la imagen', 'bad'); return; }
+  }
+  const objUrl = URL.createObjectURL(img);
+  const a = document.createElement('a'); a.href = objUrl; a.download = img.name; a.click();
+  setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+  try {
+    await navigator.clipboard.writeText(texto);
+    toast('Tarjeta descargada y mensaje copiado — pégalo en WhatsApp', 'ok');
+  } catch(e){
+    toast('Tarjeta descargada — compártela por WhatsApp', 'ok');
+  }
 }
 
 function watchInvites(){

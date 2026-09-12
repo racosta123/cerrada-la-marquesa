@@ -163,7 +163,9 @@ async function crearInvitacion(req, env) {
     .catch(()=>{});
 
   // El contenido del QR es SOLO el token opaco (se entrega una vez; no se persiste en claro).
-  return json({ ok:true, payload: qrToken, jti });
+  // `expira` (ISO 8601, mismo valor guardado en Firestore) permite al frontend mostrar la hora
+  // exacta de vencimiento; no revela nada nuevo (el residente ya eligió la vigencia).
+  return json({ ok:true, payload: qrToken, jti, expira: new Date(expira).toISOString() });
 }
 
 /* ============ /validar-qr — lo llama el LECTOR físico al escanear ============
