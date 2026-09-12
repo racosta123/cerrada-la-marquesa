@@ -1,5 +1,6 @@
-const CACHE = 'marquesa-v2';
+const CACHE = 'marquesa-v3';
 const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json',
+  './vendor/qrcode.min.js','./vendor/jspdf.umd.min.js','./vendor/jspdf.plugin.autotable.min.js','./vendor/chart.umd.min.js',
   './assets/marquesa-mobile.webp','./assets/marquesa-desktop.webp',
   './icons/icon-192.png','./icons/icon-512.png','./icons/icon-maskable-512.png','./icons/apple-touch-icon.png'];
 self.addEventListener('install', e => {
