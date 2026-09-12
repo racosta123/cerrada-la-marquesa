@@ -337,7 +337,7 @@ async function generateInvite(){
       usos: inviteUses,          // 0 = ilimitado dentro de la vigencia
       hogar: ME.rol==='residente' ? ME.uid : (ME.residenteUid || ME.uid),
     });
-    // r.payload = string que va dentro del QR (firmado por el Worker)
+    // r.payload = token opaco (cadena aleatoria sin datos) que va dentro del QR; los datos reales viven en Firestore
     const dataUrl = await QRCode.toDataURL(r.payload, { margin:1, width:460, errorCorrectionLevel:'M' });
     $('#qrImg').src = dataUrl;
     $('#qrMeta').textContent = `${name} · válido ${inviteDur} h`;

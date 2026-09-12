@@ -139,12 +139,14 @@ async function crearInvitacion(req, env) {
   const expira = ahora + (Math.max(1, +horas||1) * 3600 * 1000);
   const jti = crypto.randomUUID();
 
-  // Token firmado (HMAC) que viaja DENTRO del QR. El lector lo valida contra el Worker,
-  // y además queda PRE-SINCRONIZADO en el lector para funcionar SIN internet en la cerrada.
-  const payloadObj = { jti, exp: Math.floor(expira/1000), p:'visitantes', n: visitante };
-  const payload = await signQR(env, payloadObj);
+  // TOKEN OPACO de alta entropía (CSPRNG, 32 bytes → ~43 chars base64url) que viaja DENTRO
+  // del QR. NO contiene datos: ni nombre, ni permiso, ni jti, ni expiración. Solo una cadena
+  // aleatoria. Los datos reales viven en Firestore; el QR es solo una llave opaca.
+  const qrToken = bytesToB64url(crypto.getRandomValues(new Uint8Array(32)));
+  const tokenHash = await sha256b64url(qrToken);   // en Firestore se guarda SOLO el hash
 
-  // Guarda la invitación (fuente de verdad online)
+  // Guarda la invitación (fuente de verdad online). Se persiste el HASH del token, NUNCA el
+  // token en claro: quien lea el documento no puede reconstruir el QR.
   await firestoreSet(env, `invitaciones/${jti}`, {
     visitante: { stringValue: visitante },
     hogar: { stringValue: hogar || user.uid },
@@ -152,14 +154,16 @@ async function crearInvitacion(req, env) {
     expira: { timestampValue: new Date(expira).toISOString() },
     usosRestantes: usos===0 ? { nullValue:null } : { integerValue: String(usos||1) },
     activa: { booleanValue: true },
+    tokenHash: { stringValue: tokenHash },
   });
 
-  // PRE-SINCRONIZA al lector físico (resiliencia offline). Si el lector no responde,
-  // no bloquea: el QR sigue siendo válido online.
-  await presyncReader(env, { jti, payload, exp: Math.floor(expira/1000), usos: usos||1 })
+  // PRE-SINCRONIZA al lector físico (resiliencia offline). Emite SOLO el hash + metadatos,
+  // NUNCA el token en claro: el lector compara SHA-256(token escaneado) contra tokenHash.
+  await presyncReader(env, { tokenHash, exp: Math.floor(expira/1000), usos: usos||1 })
     .catch(()=>{});
 
-  return json({ ok:true, payload, jti });
+  // El contenido del QR es SOLO el token opaco (se entrega una vez; no se persiste en claro).
+  return json({ ok:true, payload: qrToken, jti });
 }
 
 /* ============ /validar-qr — lo llama el LECTOR físico al escanear ============
@@ -171,25 +175,28 @@ async function validarQR(req, env) {
   if (!env.READER_KEY || readerKey !== env.READER_KEY) throw httpErr(401, 'Lector no autorizado');
 
   const { payload } = await req.json();
-  const data = await verifyQR(env, payload);          // verifica firma + expiración
-  if (!data) throw httpErr(403, 'QR inválido o expirado');
-
-  // Consume un uso de forma atómica
-  const inv = await getInvitacion(env, data.jti);
-  if (!inv || !inv.activa) throw httpErr(403, 'Invitación cancelada');
+  // El payload es ahora el TOKEN OPACO (cadena aleatoria, sin datos). Se busca su hash en
+  // Firestore; TODOS los datos salen del documento, nunca del token.
+  if (!payload || typeof payload !== 'string') throw httpErr(400, 'Falta el token del QR');
+  const tokenHash = await sha256b64url(payload);
+  const inv = await getInvitacionPorTokenHash(env, tokenHash);
+  if (!inv || !inv.activa) throw httpErr(403, 'QR inválido o cancelado');
+  // Expiración: se compara contra el DOCUMENTO (el token ya no la lleva).
+  if (!inv.expira || new Date(inv.expira).getTime() < Date.now()) throw httpErr(403, 'QR expirado');
   // Si el residente del hogar está suspendido por mora, su QR no abre (sin gastar usos ni disparar la Shelly).
   const anfitrion = await getPerfil(env, inv.hogar);
   if (anfitrion && anfitrion.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
+  // Consume un uso
   if (inv.usosRestantes !== null) {
     if (inv.usosRestantes <= 0) throw httpErr(403, 'Sin usos disponibles');
-    await firestoreUpdate(env, `invitaciones/${data.jti}`, {
+    await firestoreUpdate(env, `invitaciones/${inv.id}`, {
       usosRestantes: { integerValue: String(inv.usosRestantes - 1) },
     }, ['usosRestantes']);
   }
 
   await triggerShelly(env, DEVICES.visitantes);
-  await logApertura(env, { uid:'qr', nombre:data.n, puerta:'visitantes', hogar:inv.hogar, tipo:'qr' });
-  await notificarResidente(env, inv.hogar, `Visita ${data.n} entró por visitantes`);
+  await logApertura(env, { uid:'qr', nombre: inv.visitante, puerta:'visitantes', hogar: inv.hogar, tipo:'qr' });
+  await notificarResidente(env, inv.hogar, `Visita ${inv.visitante} entró por visitantes`);
   return json({ ok:true });
 }
 
@@ -1804,6 +1811,25 @@ async function getInvitacion(env, jti) {
   const r = await fetch(`${fsBase(env)}/invitaciones/${jti}`, { headers:{ Authorization:'Bearer '+at } });
   if (!r.ok) return null;
   return readDoc((await r.json()).fields);
+}
+/* Busca una invitación de visita por el HASH de su token opaco (modelo QR sin datos).
+   Equality sobre un solo campo → Firestore lo indexa solo, sin índice compuesto. Devuelve
+   el doc con su id (jti) para poder actualizar usosRestantes, o null si no existe. */
+async function getInvitacionPorTokenHash(env, tokenHash) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const r = await fetch(`${fsBase(env)}:runQuery`, {
+    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({ structuredQuery: {
+      from: [{ collectionId: 'invitaciones' }],
+      where: { fieldFilter: { field: { fieldPath: 'tokenHash' }, op: 'EQUAL', value: { stringValue: tokenHash } } },
+      limit: 1,
+    }}),
+  });
+  if (!r.ok) throw httpErr(500, 'Firestore query falló');
+  const rows = await r.json();
+  const hit = (rows || []).find(x => x.document);
+  if (!hit) return null;
+  return { id: hit.document.name.split('/').pop(), ...readDoc(hit.document.fields) };
 }
 async function firestoreSet(env, path, fields, atOverride) {
   const at = atOverride || await saToken(env, 'https://www.googleapis.com/auth/datastore');
