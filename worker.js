@@ -135,6 +135,14 @@ async function crearInvitacion(req, env) {
   const { visitante, horas, usos, hogar } = await req.json();
   if (!visitante) throw httpErr(400, 'Falta el nombre del visitante');
 
+  // Usos: entero 1..8, sin excepciones. Se RECHAZA lo inválido (0 = ilimitado ya no existe,
+  // negativos/no-numéricos/fuera de rango tampoco) en vez de "corregirlo" en silencio — así
+  // alguien que llame al Worker directo, saltándose la UI, no puede colar una invitación
+  // ilimitada ni con más usos de los permitidos.
+  const USOS_MAX = 8;
+  if (!Number.isInteger(usos) || usos < 1 || usos > USOS_MAX)
+    throw httpErr(400, `usos debe ser un entero entre 1 y ${USOS_MAX}`);
+
   const ahora = Date.now();
   const expira = ahora + (Math.max(1, +horas||1) * 3600 * 1000);
   const jti = crypto.randomUUID();
@@ -152,7 +160,7 @@ async function crearInvitacion(req, env) {
     hogar: { stringValue: hogar || user.uid },
     creadaPor: { stringValue: user.uid },
     expira: { timestampValue: new Date(expira).toISOString() },
-    usosRestantes: usos===0 ? { nullValue:null } : { integerValue: String(usos||1) },
+    usosRestantes: { integerValue: String(usos) },   // ya validado: entero 1..8, nunca 0/ilimitado
     activa: { booleanValue: true },
     tokenHash: { stringValue: tokenHash },
   });
