@@ -145,6 +145,27 @@ function enterApp(){
   if (ME.rol==='residente' || ME.rol==='esclavo') watchInvites();
   setupMiFamilia();
   registerPush();
+  cargarLogoMarquesa();   // dispara la precarga del logo del recibo; no bloquea nada
+}
+
+/* Logo de la cerrada (assets/logo-marquesa.jpg, 662x300) para el banner del recibo PDF.
+   Se precarga en cuanto arranca la app y de nuevo al abrir un recibo (por si el primer intento
+   falló, p.ej. sin conexión antes de que el SW lo precacheara). construirReciboPDF() es
+   síncrona a propósito (ver su comentario) así que esto nunca puede bloquearla: si no está
+   lista a tiempo, el recibo se genera igual, solo que sin el banner. */
+let logoMarquesaDataUrl = null;
+async function cargarLogoMarquesa(){
+  if (logoMarquesaDataUrl) return logoMarquesaDataUrl;
+  try {
+    const blob = await fetch('assets/logo-marquesa.jpg').then(r => r.blob());
+    logoMarquesaDataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
+  } catch(e){ console.error('cargarLogoMarquesa', e); }
+  return logoMarquesaDataUrl;
 }
 
 function roleLabel(r){
@@ -2000,7 +2021,20 @@ function construirReciboPDF(mov){
   const fecha = tsADate(mov.ts).toLocaleString('es-MX', { day:'2-digit', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit' });
 
   doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
-  let y = M - 10;
+
+  // Banner del logo (assets/logo-marquesa.jpg, 662x300 original), centrado, proporción intacta
+  // (ancho fijo, alto derivado del ratio real — nunca se deforma). Si logoMarquesaDataUrl
+  // todavía no cargó, se omite y el encabezado cae al arranque de siempre (y = M - 10):
+  // el recibo nunca depende de que el logo esté listo.
+  const LOGO_W = 220, LOGO_H = LOGO_W * (300 / 662);
+  let y;
+  if (logoMarquesaDataUrl) {
+    const logoY = 4 + 16;
+    doc.addImage(logoMarquesaDataUrl, 'JPEG', (W - LOGO_W) / 2, logoY, LOGO_W, LOGO_H);
+    y = logoY + LOGO_H + 16;
+  } else {
+    y = M - 10;
+  }
   doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
   doc.text('R E C I B O   D E   P A G O', M, y + 14);
   doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
@@ -2048,6 +2082,7 @@ function construirReciboPDF(mov){
 let reciboActual = null;
 function abrirReciboSheet(mov){
   reciboActual = mov;
+  cargarLogoMarquesa();   // reintento silencioso por si la precarga de enterApp() falló
   $('#reciboTitle').textContent = `Recibo ${mov.folioRecibo}`;
   $('#reciboErr').textContent = '';
   $('#reciboDatos').innerHTML =
