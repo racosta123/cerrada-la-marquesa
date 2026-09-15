@@ -221,18 +221,33 @@ function switchTab(id, btn){
 }
 
 /* ====================== PUERTAS ====================== */
+/* Suspendido por mora (propio o del hogar, vía cascada de /personas/suspender que sincroniza
+   usuarios/{uid}.suspendido): solo cosmético — el Worker revalida y es quien realmente
+   bloquea/permite cada puerta (ver abrir() en worker.js). */
 function renderDoors(){
   const grid = $('#doorsGrid'); grid.innerHTML = '';
-  // El invitado (visitante con QR) no usa esta app; los esclavos sí abren las 4.
+  const susp = ME.suspendido === true;
+  if (susp){
+    grid.innerHTML = '<div class="empty" style="grid-column:1/-1;padding:14px 10px">'
+      + 'Suspendido por mora — solo acceso peatonal disponible.</div>';
+  }
+  // El invitado (visitante con QR) no usa esta app; los esclavos sí abren las 4 (si no hay suspensión).
   DOORS.forEach(d => {
+    const bloqueada = susp && d.id !== 'peatones';
     const el = document.createElement('div');
-    el.className = 'door';
+    el.className = 'door' + (bloqueada ? ' door-disabled' : '');
     el.innerHTML = `
       <div class="pulse"></div>
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="16" height="12" rx="2"/><path d="M8 9V6a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1.4"/></svg></div>
       <div class="dn">${d.name}</div>
-      <div class="ds">${d.sub}</div>`;
-    el.onclick = ()=> openDoor(d, el);
+      <div class="ds">${bloqueada ? 'No disponible (suspendido)' : d.sub}</div>`;
+    if (bloqueada){
+      el.style.opacity = '.45';
+      el.style.pointerEvents = 'none';
+      el.setAttribute('aria-disabled', 'true');
+    } else {
+      el.onclick = ()=> openDoor(d, el);
+    }
     grid.appendChild(el);
   });
 }

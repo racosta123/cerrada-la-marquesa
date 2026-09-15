@@ -105,11 +105,11 @@ async function abrir(req, env) {
 
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
-  // Un residente suspendido (por mora) no puede abrir; tampoco sus esclavos.
-  if (perfil.suspendido) throw httpErr(403, 'Residente suspendido por mora');
+  // Un residente suspendido (por mora) no puede abrir, salvo la puerta peatonal; tampoco sus esclavos.
+  if (perfil.suspendido && puerta !== 'peatones') throw httpErr(403, 'Residente suspendido por mora');
   if (perfil.rol === 'esclavo' && perfil.residenteUid) {
     const padre = await getPerfil(env, perfil.residenteUid);
-    if (padre && padre.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
+    if (padre && padre.suspendido && puerta !== 'peatones') throw httpErr(403, 'Residente del hogar suspendido por mora');
   }
   // master, admin, residente y esclavo pueden abrir las 4 puertas.
   await triggerShelly(env, DEVICES[puerta]);
