@@ -204,6 +204,9 @@ function buildTabs(){
   $$('.tabpane').forEach(p => p.classList.add('hidden'));
   $('#tab-'+tabs[0].id).classList.remove('hidden');
   if (isStaff) loadPersonas();
+  // Configuración de cobranza: SOLO master (ni admin puro ni jefe-admin la ven ni la tocan).
+  $('#cobranzaConfigSection').classList.toggle('hidden', ME.rol !== 'master');
+  if (ME.rol === 'master') cargarConfigCobranza();
 }
 
 /* Jefe de familia = residente sin jefeId (es la CASA). Los familiares (residente CON jefeId)
@@ -583,6 +586,69 @@ async function refrescarPersonas(){
   if (finMonths.length) cargarCobranza();
 }
 async function loadPersonas(){ await refrescarPersonas(); }
+
+/* ====================== CONFIGURACIÓN DE COBRANZA (SOLO master) ======================
+   Pantalla nueva en Gestión que solo LLAMA a /config/cobranza (leer) y
+   /config/cobranza-actualizar (escribir) — ambos ya existentes y ya validados en el Worker.
+   No agrega ninguna lógica de negocio nueva; solo la pinta y la envía. */
+let ccFechaOriginal = '';   // YYYY-MM-DD tal como llegó del servidor, para detectar cambios reales
+
+async function cargarConfigCobranza(){
+  $('#ccErr').textContent = '';
+  try {
+    const cfg = await authedFetch('/config/cobranza', {});
+    $('#ccCuota').value = cfg.cuotaMensual ?? '';
+    const iso = cfg.fechaInicioCobro || '';
+    ccFechaOriginal = iso ? iso.slice(0, 10) : '';
+    $('#ccFecha').value = ccFechaOriginal;
+    $('#ccFechaActual').textContent = iso
+      ? 'Actualmente: ' + new Date(iso).toLocaleDateString('es-MX', { day:'numeric', month:'long', year:'numeric' })
+      : '';
+    $('#ccLink').value = cfg.linkPago || '';
+    $('#ccWarnFecha').classList.add('hidden');
+  } catch(e){
+    $('#ccErr').textContent = votErr(e);
+  }
+}
+
+/* La advertencia (banner, no un confirm() del navegador) solo aparece cuando master REALMENTE
+   cambia la fecha respecto a la ya guardada — así no distrae si solo vino a tocar la cuota o
+   el link. Cambiar fechaInicioCobro mueve fechaEfectiva de TODAS las casas en
+   /finanzas/estado-cuenta y /finanzas/cobranza (ver calcularEstadoCuenta en worker.js). */
+$('#ccFecha')?.addEventListener('input', () => {
+  $('#ccWarnFecha').classList.toggle('hidden', $('#ccFecha').value === ccFechaOriginal);
+});
+
+$('#ccGuardarBtn')?.addEventListener('click', async () => {
+  const btn = $('#ccGuardarBtn');
+  $('#ccErr').textContent = '';
+  const cuota = $('#ccCuota').value;
+  const fecha = $('#ccFecha').value;
+  const link = $('#ccLink').value.trim();
+  if (cuota === '' || Number(cuota) < 0){ $('#ccErr').textContent = 'La cuota debe ser un número válido, mayor o igual a 0.'; return; }
+  if (!fecha){ $('#ccErr').textContent = 'Elige la fecha de inicio de cobro.'; return; }
+
+  const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    // linkPago debe empezar con "https://" — el Worker lo rechaza con 400 si no (o si sobra
+    // algo raro); aquí no se duplica esa validación, solo se muestra el error que regrese.
+    const cfg = await authedFetch('/config/cobranza-actualizar', {
+      cuotaMensual: Number(cuota),
+      fechaInicioCobro: fecha,
+      linkPago: link,
+    });
+    toast('Configuración de cobranza guardada', 'ok');
+    ccFechaOriginal = (cfg.fechaInicioCobro || '').slice(0, 10);
+    $('#ccFechaActual').textContent = cfg.fechaInicioCobro
+      ? 'Actualmente: ' + new Date(cfg.fechaInicioCobro).toLocaleDateString('es-MX', { day:'numeric', month:'long', year:'numeric' })
+      : '';
+    $('#ccWarnFecha').classList.add('hidden');
+  } catch(e){
+    $('#ccErr').textContent = votErr(e);
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+});
 
 /* -------- lista agrupada por casa: jefe + sus familiares anidados; admins aparte -------- */
 function renderPersonas(){

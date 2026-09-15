@@ -495,6 +495,29 @@
     </div>
     <div class="field"><input id="personaSearch" placeholder="Buscar por nombre, domicilio o teléfono…"></div>
     <div class="list" id="personasList"><div class="empty">Cargando…</div></div>
+
+    <!-- Configuración de cobranza — SOLO master (ni admin puro ni jefe-admin la ven) -->
+    <div id="cobranzaConfigSection" class="hidden">
+      <div class="section-title">Configuración de cobranza</div>
+      <div class="field">
+        <label>Cuota mensual (MXN)</label>
+        <input id="ccCuota" type="number" min="0" step="0.01" placeholder="350">
+      </div>
+      <div class="field">
+        <label>Fecha de inicio de cobro</label>
+        <input id="ccFecha" type="date">
+        <div class="vnote" id="ccFechaActual" style="margin-top:6px"></div>
+      </div>
+      <div id="ccWarnFecha" class="vbanner hidden" style="margin:10px 0 0">
+        ⚠️ Cambiar esta fecha resetea el conteo de adeudo de <b>TODAS</b> las casas. Úsalo solo al arrancar la cobranza real.
+      </div>
+      <div class="field" style="margin-top:14px">
+        <label>Link de pago (Prosepago)</label>
+        <input id="ccLink" type="url" placeholder="https://…">
+      </div>
+      <button class="btn-primary" id="ccGuardarBtn" style="margin-top:0">Guardar cambios</button>
+      <div id="ccErr" class="err"></div>
+    </div>
   </div>
 
   <!-- TAB BAR -->
