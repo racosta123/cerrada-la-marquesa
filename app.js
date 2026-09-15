@@ -1086,12 +1086,32 @@ async function loadResumenResidente(){
 async function cargarMiEstadoCuenta(){
   const el = $('#miEstadoCuentaBody');
   try {
-    const r = await authedFetch('/finanzas/estado-cuenta', {});
-    el.innerHTML = r.alCorriente
-      ? `<p class="vnote" style="margin:0;color:var(--ok);font-size:14px">✅ Estás al corriente.</p>
-         <p class="vnote" style="margin:6px 0 0">Cuota mensual: ${money(r.cuotaMensual)}</p>`
-      : `<div class="fin-val bad" style="font-size:22px">${money(r.adeudo)}</div>
-         <p class="vnote" style="margin:6px 0 0">Adeudo acumulado · cuota mensual ${money(r.cuotaMensual)} · ${r.mesesTranscurridos} ${r.mesesTranscurridos===1?'mes':'meses'}</p>`;
+    // /finanzas/estado-cuenta trae el adeudo (lógica intacta, no se toca); /config/cobranza
+    // trae linkPago aparte, porque el link es config global, no algo por-casa.
+    const [r, cfg] = await Promise.all([
+      authedFetch('/finanzas/estado-cuenta', {}),
+      authedFetch('/config/cobranza', {}),
+    ]);
+
+    if (r.alCorriente){
+      el.innerHTML = `<p class="vnote" style="margin:0;color:var(--ok);font-size:14px">✅ Estás al corriente.</p>
+         <p class="vnote" style="margin:6px 0 0">Cuota mensual: ${money(r.cuotaMensual)}</p>`;
+      return;
+    }
+
+    const linkPago = (cfg.linkPago || '').trim();
+    // El botón SOLO abre el link externo de Prosepago en una pestaña nueva (target="_blank" +
+    // rel="noopener"); la app NUNCA recibe, procesa ni guarda ningún dato de tarjeta. Cuando el
+    // residente pague, el abono en Finanzas lo sigue registrando el staff a mano (como ya
+    // funciona hoy) — esto todavía NO incluye confirmación automática del pago.
+    const pagoHtml = linkPago
+      ? `<p class="vnote" style="margin:10px 0 0">Tu adeudo es de <b style="color:var(--text)">${money(r.adeudo)}</b>. Al pagar, escribe exactamente ese monto en la página de pago.</p>
+         <a class="btn-primary" style="display:block;text-align:center;margin-top:10px;text-decoration:none" href="${esc(linkPago)}" target="_blank" rel="noopener">Pagar cuota</a>`
+      : `<p class="vnote" style="margin:10px 0 0">Pago en línea próximamente disponible. Mientras tanto, consulta con administración cómo ponerte al corriente.</p>`;
+
+    el.innerHTML = `<div class="fin-val bad" style="font-size:22px">${money(r.adeudo)}</div>
+         <p class="vnote" style="margin:6px 0 0">Adeudo acumulado · cuota mensual ${money(r.cuotaMensual)} · ${r.mesesTranscurridos} ${r.mesesTranscurridos===1?'mes':'meses'}</p>
+         ${pagoHtml}`;
   } catch(e){
     console.error('estado-cuenta', e);
     el.innerHTML = '<div class="empty">No se pudo cargar tu estado de cuenta.</div>';

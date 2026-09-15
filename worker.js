@@ -1333,14 +1333,15 @@ async function obtenerConfigCobranza(req, env) {
 }
 
 /* ============ /config/cobranza-actualizar — SOLO master ============
-   Permite mover cuotaMensual y/o fechaInicioCobro sin tocar código — p.ej. resetear
-   fechaInicioCobro a "hoy" el día que arranque la cobranza real con el cliente. */
+   Permite mover cuotaMensual, fechaInicioCobro y/o linkPago sin tocar código — p.ej. resetear
+   fechaInicioCobro a "hoy" el día que arranque la cobranza real con el cliente, o pegar el
+   link de Prosepago en cuanto exista. */
 async function actualizarConfigCobranza(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
   if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master edita la configuración de cobranza');
 
-  const { cuotaMensual, fechaInicioCobro } = await req.json();
+  const { cuotaMensual, fechaInicioCobro, linkPago } = await req.json();
   const fields = {};
   if (cuotaMensual !== undefined) {
     const c = Number(cuotaMensual);
@@ -1352,6 +1353,14 @@ async function actualizarConfigCobranza(req, env) {
     if (!Number.isFinite(t)) throw httpErr(400, 'fechaInicioCobro inválida');
     fields.fechaInicioCobro = { timestampValue: new Date(t).toISOString() };
   }
+  if (linkPago !== undefined) {
+    // '' (borrar el link) se permite explícitamente; cualquier otra cosa DEBE empezar con
+    // "https://" — nunca "http://" ni esquemas raros (javascript:, data:, etc.) que el
+    // frontend abriría en target="_blank" sin más validación.
+    const l = String(linkPago || '').trim();
+    if (l && !l.startsWith('https://')) throw httpErr(400, 'linkPago debe empezar con "https://"');
+    fields.linkPago = { stringValue: l };
+  }
   if (!Object.keys(fields).length) throw httpErr(400, 'Nada que actualizar');
 
   await leerConfigCobranza(env); // asegura que el doc ya exista (lo siembra si aún no)
@@ -1361,9 +1370,9 @@ async function actualizarConfigCobranza(req, env) {
 }
 
 /* Lee config/cobranza; si el doc no existe TODAVÍA (primera vez que se toca esta feature),
-   lo siembra con los defaults (cuota $350, fechaInicioCobro = ahora) y los devuelve. No usa
-   transacción: en la remotísima carrera de dos primeras-lecturas simultáneas, gana la última
-   escritura y la diferencia es de milisegundos — sin consecuencia real. */
+   lo siembra con los defaults (cuota $350, fechaInicioCobro = ahora, sin link de pago) y los
+   devuelve. No usa transacción: en la remotísima carrera de dos primeras-lecturas simultáneas,
+   gana la última escritura y la diferencia es de milisegundos — sin consecuencia real. */
 async function leerConfigCobranza(env) {
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const doc = await getDoc(env, at, 'config/cobranza');
@@ -1372,12 +1381,14 @@ async function leerConfigCobranza(env) {
     return {
       cuotaMensual: typeof d.cuotaMensual === 'number' ? d.cuotaMensual : 350,
       fechaInicioCobro: d.fechaInicioCobro || new Date().toISOString(),
+      linkPago: typeof d.linkPago === 'string' ? d.linkPago : '',
     };
   }
-  const defaults = { cuotaMensual: 350, fechaInicioCobro: new Date().toISOString() };
+  const defaults = { cuotaMensual: 350, fechaInicioCobro: new Date().toISOString(), linkPago: '' };
   await firestoreSet(env, 'config/cobranza', {
     cuotaMensual: { doubleValue: defaults.cuotaMensual },
     fechaInicioCobro: { timestampValue: defaults.fechaInicioCobro },
+    linkPago: { stringValue: defaults.linkPago },
   }, at);
   return defaults;
 }
