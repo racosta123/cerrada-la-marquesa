@@ -1040,6 +1040,9 @@ function watchFinanzas(){
   $('#finActionsShare').classList.toggle('hidden', !isStaff);
   $('#morososSection').classList.toggle('hidden', !isStaff);
   $('#finDetalle').classList.toggle('hidden', !isStaff);
+  // Estado de cuenta propio (cuota + adeudo acumulado): solo residente/familiar, nunca staff
+  // en modo admin (ese ve el padrón completo en Gestión/cobranza, no su propia casa aquí).
+  $('#miEstadoCuenta').classList.toggle('hidden', isStaff);
 
   finMonths = last6Months();
   const { label } = monthRange();
@@ -1060,6 +1063,7 @@ function watchFinanzas(){
       }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
   } else {
     loadResumenResidente();
+    cargarMiEstadoCuenta();
   }
 }
 
@@ -1074,6 +1078,23 @@ async function loadResumenResidente(){
   } catch(e){
     console.error(e);
     $('#thermText').textContent = 'No se pudo cargar la información financiera.';
+  }
+}
+
+/* -------- mi estado de cuenta (cuota mensual + adeudo acumulado) — vía Worker, siempre la
+   propia casa de quien llama (el Worker nunca confía en un parámetro del cliente). -------- */
+async function cargarMiEstadoCuenta(){
+  const el = $('#miEstadoCuentaBody');
+  try {
+    const r = await authedFetch('/finanzas/estado-cuenta', {});
+    el.innerHTML = r.alCorriente
+      ? `<p class="vnote" style="margin:0;color:var(--ok);font-size:14px">✅ Estás al corriente.</p>
+         <p class="vnote" style="margin:6px 0 0">Cuota mensual: ${money(r.cuotaMensual)}</p>`
+      : `<div class="fin-val bad" style="font-size:22px">${money(r.adeudo)}</div>
+         <p class="vnote" style="margin:6px 0 0">Adeudo acumulado · cuota mensual ${money(r.cuotaMensual)} · ${r.mesesTranscurridos} ${r.mesesTranscurridos===1?'mes':'meses'}</p>`;
+  } catch(e){
+    console.error('estado-cuenta', e);
+    el.innerHTML = '<div class="empty">No se pudo cargar tu estado de cuenta.</div>';
   }
 }
 
@@ -1128,8 +1149,10 @@ async function cargarCobranza(){
 /* una fila de casa: domicilio + nombre del jefe (+ etiqueta Suspendido si aplica) */
 function casaRowCobranza(c){
   const tag = c.suspendido ? '<span class="tag susp">Suspendido</span>' : '';
+  // Adeudo acumulado (cuota fija, PARTE 4): solo se etiqueta si hay algo pendiente.
+  const adeudoTag = c.adeudo > 0 ? `<span class="tag out">${money(c.adeudo)}</span>` : '';
   return `<div class="row"><div class="rt"><div class="a">${esc(c.domicilio)}</div>`
-    + `${c.nombre?`<div class="b">${esc(c.nombre)}</div>`:''}</div>${tag}</div>`;
+    + `${c.nombre?`<div class="b">${esc(c.nombre)}</div>`:''}</div>${adeudoTag}${tag}</div>`;
 }
 function renderCobranza(){
   poblarConsultaCasa();

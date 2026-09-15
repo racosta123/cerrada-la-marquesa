@@ -60,6 +60,9 @@ export default {
         case '/finanzas/cobranza': out = await cobranzaFinanzas(req, env); break;
         case '/finanzas/marcar-recibo': out = await marcarRecibo(req, env); break;
         case '/finanzas/borrar':   out = await borrarFinanza(req, env); break;
+        case '/finanzas/estado-cuenta': out = await estadoCuentaFinanzas(req, env); break;
+        case '/config/cobranza':            out = await obtenerConfigCobranza(req, env); break;
+        case '/config/cobranza-actualizar': out = await actualizarConfigCobranza(req, env); break;
         case '/vecinos/crear':     out = await crearVecino(req, env); break;
         case '/vecinos/actualizar': out = await actualizarVecino(req, env); break;
         case '/vecinos/borrar':    out = await borrarVecino(req, env); break;
@@ -1221,8 +1224,9 @@ async function resumenFinanzas(req, env) {
 /* ============ /finanzas/cobranza — SOLO staff ============
    Dos listas de casas (JEFES de familia, ACTIVAS y SUSPENDIDAS) para cobrar sin adivinar:
    las que ya pagaron Cuota este mes y las que no. Cada casa lleva su domicilio, el nombre
-   del jefe y si está suspendida (para etiquetarla). TODO el conteo se hace aquí, no en el
-   cliente. Las suspendidas SÍ aparecen (suelen estarlo justo por mora). */
+   del jefe, si está suspendida (para etiquetarla) y su adeudo acumulado (cuota fija, ver
+   calcularEstadoCuenta). TODO el conteo se hace aquí, no en el cliente. Las suspendidas SÍ
+   aparecen (suelen estarlo justo por mora). */
 async function cobranzaFinanzas(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
@@ -1232,26 +1236,150 @@ async function cobranzaFinanzas(req, env) {
   const inicioMes = new Date(now.getFullYear(), now.getMonth(), 1);
   const finMes = new Date(now.getFullYear(), now.getMonth()+1, 1);
 
-  // Domicilios que pagaron Cuota este mes (normalizados para casar con el padrón).
+  // Un solo recorrido de "finanzas" arma a la vez: (a) qué domicilios pagaron Cuota ESTE MES
+  // (termómetro/listas, igual que antes) y (b) el historial COMPLETO de pagos de Cuota por
+  // domicilio (para el adeudo acumulado, PARTE 2/4 del plan maestro de cobranza).
   const pagadas = new Set();
+  const pagosPorCasa = new Map(); // domicilioNorm -> [{ts, monto}, ...] (todo el tiempo)
   for (const doc of await firestoreList(env, 'finanzas')) {
     const d = readDoc(doc.fields);
+    if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
+    const dn = normDomicilio(d.casa);
     const ts = new Date(d.ts);
-    if (!(ts >= inicioMes && ts < finMes)) continue;
-    if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa) pagadas.add(normDomicilio(d.casa));
+    if (ts >= inicioMes && ts < finMes) pagadas.add(dn);
+    if (!pagosPorCasa.has(dn)) pagosPorCasa.set(dn, []);
+    pagosPorCasa.get(dn).push({ ts: d.ts, monto: d.monto || 0 });
   }
+
+  const cfg = await leerConfigCobranza(env);
 
   // TODAS las casas (jefes), activas y suspendidas.
   const casas = (await personasList(env)).filter(p => esJefe(p));
   const pagaron = [], sinPago = [];
   for (const c of casas) {
-    const item = { domicilio: c.domicilio || '', nombre: c.nombre || '', suspendido: (c.estado || 'activo') === 'suspendido' };
+    const estado = calcularEstadoCuenta({ altaCasa: c.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(c.domicilioNorm) });
+    const item = {
+      domicilio: c.domicilio || '', nombre: c.nombre || '',
+      suspendido: (c.estado || 'activo') === 'suspendido',
+      adeudo: estado.adeudo,
+    };
     (pagadas.has(c.domicilioNorm) ? pagaron : sinPago).push(item);
   }
   const cmp = (a, b) => (a.domicilio || '').localeCompare(b.domicilio || '', 'es', { numeric: true });
   pagaron.sort(cmp); sinPago.sort(cmp);
 
   return json({ pagaron, sinPago, totalCasas: casas.length });
+}
+
+/* ============ /finanzas/estado-cuenta — cualquier residente/familiar, SOLO su propia casa ============
+   Cuota mensual fija + adeudo acumulado (PARTE 1/2 del plan de cobranza). La casa la determina
+   el Worker a partir del perfil de quien llama (perfil.casa, sincronizado por syncUsuarioIndex);
+   NUNCA de un parámetro del cliente, para que nadie pueda consultar el adeudo de otra casa. */
+async function estadoCuentaFinanzas(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'residente' || !perfil.casa) throw httpErr(403, 'Solo residentes con casa consultan su estado de cuenta');
+
+  const domNorm = normDomicilio(perfil.casa);
+  const jefe = (await personasList(env)).find(p => esJefe(p) && p.domicilioNorm === domNorm);
+  if (!jefe) throw httpErr(404, 'Tu casa no está en el padrón');
+
+  const cfg = await leerConfigCobranza(env);
+  const pagos = [];
+  for (const doc of await firestoreList(env, 'finanzas')) {
+    const d = readDoc(doc.fields);
+    if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa && normDomicilio(d.casa) === domNorm) {
+      pagos.push({ ts: d.ts, monto: d.monto || 0 });
+    }
+  }
+
+  const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagos });
+  return json({ ok:true, ...estado });
+}
+
+/* ---- Núcleo del cálculo de adeudo acumulado (cuota mensual fija) — compartido por
+   /finanzas/estado-cuenta (una casa) y /finanzas/cobranza (todas). No migra ni toca
+   finanzas/{id}; solo agrega sobre lo que ya existe. ----
+   fechaEfectiva = la MÁS TARDÍA entre fechaInicioCobro (config) y el alta de la casa
+   (creadoEn del jefe) — así nadie paga meses de antes de que su ficha existiera.
+   mesesTranscurridos = meses calendario COMPLETOS entre fechaEfectiva y hoy (si el día del
+   mes de "hoy" aún no alcanza al de fechaEfectiva, ese mes en curso no cuenta como completo).
+   Si fechaEfectiva cae en el futuro, meses da negativo y se recorta a 0 (nunca error, nunca
+   adeudo negativo). */
+function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa }) {
+  const inicioCobro = new Date(cfg.fechaInicioCobro);
+  const alta = altaCasa ? new Date(altaCasa) : inicioCobro;
+  const fechaEfectiva = (alta instanceof Date && !isNaN(alta) && alta > inicioCobro) ? alta : inicioCobro;
+
+  const ahora = new Date();
+  let meses = (ahora.getFullYear() - fechaEfectiva.getFullYear()) * 12 + (ahora.getMonth() - fechaEfectiva.getMonth());
+  if (ahora.getDate() < fechaEfectiva.getDate()) meses -= 1;
+  const mesesTranscurridos = Math.max(0, meses);
+
+  const montoEsperado = mesesTranscurridos * cfg.cuotaMensual;
+  const montoPagado = (pagosCuotaPorCasa || [])
+    .filter(m => new Date(m.ts) >= fechaEfectiva)
+    .reduce((s, m) => s + (m.monto || 0), 0);
+  const adeudo = Math.max(0, montoEsperado - montoPagado);
+
+  return { cuotaMensual: cfg.cuotaMensual, mesesTranscurridos, montoEsperado, montoPagado, adeudo, alCorriente: adeudo === 0 };
+}
+
+/* ============ /config/cobranza — cualquier usuario autenticado lee la cuota vigente ============ */
+async function obtenerConfigCobranza(req, env) {
+  await requireAuth(req, env);
+  const cfg = await leerConfigCobranza(env);
+  return json({ ok:true, ...cfg });
+}
+
+/* ============ /config/cobranza-actualizar — SOLO master ============
+   Permite mover cuotaMensual y/o fechaInicioCobro sin tocar código — p.ej. resetear
+   fechaInicioCobro a "hoy" el día que arranque la cobranza real con el cliente. */
+async function actualizarConfigCobranza(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master edita la configuración de cobranza');
+
+  const { cuotaMensual, fechaInicioCobro } = await req.json();
+  const fields = {};
+  if (cuotaMensual !== undefined) {
+    const c = Number(cuotaMensual);
+    if (!(c >= 0)) throw httpErr(400, 'cuotaMensual debe ser un número >= 0');
+    fields.cuotaMensual = { doubleValue: c };
+  }
+  if (fechaInicioCobro !== undefined) {
+    const t = Date.parse(fechaInicioCobro);
+    if (!Number.isFinite(t)) throw httpErr(400, 'fechaInicioCobro inválida');
+    fields.fechaInicioCobro = { timestampValue: new Date(t).toISOString() };
+  }
+  if (!Object.keys(fields).length) throw httpErr(400, 'Nada que actualizar');
+
+  await leerConfigCobranza(env); // asegura que el doc ya exista (lo siembra si aún no)
+  await firestoreActualizarCampos(env, 'config/cobranza', fields, 'Configuración de cobranza');
+  const cfg = await leerConfigCobranza(env);
+  return json({ ok:true, ...cfg });
+}
+
+/* Lee config/cobranza; si el doc no existe TODAVÍA (primera vez que se toca esta feature),
+   lo siembra con los defaults (cuota $350, fechaInicioCobro = ahora) y los devuelve. No usa
+   transacción: en la remotísima carrera de dos primeras-lecturas simultáneas, gana la última
+   escritura y la diferencia es de milisegundos — sin consecuencia real. */
+async function leerConfigCobranza(env) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const doc = await getDoc(env, at, 'config/cobranza');
+  if (doc) {
+    const d = readDoc(doc.fields);
+    return {
+      cuotaMensual: typeof d.cuotaMensual === 'number' ? d.cuotaMensual : 350,
+      fechaInicioCobro: d.fechaInicioCobro || new Date().toISOString(),
+    };
+  }
+  const defaults = { cuotaMensual: 350, fechaInicioCobro: new Date().toISOString() };
+  await firestoreSet(env, 'config/cobranza', {
+    cuotaMensual: { doubleValue: defaults.cuotaMensual },
+    fechaInicioCobro: { timestampValue: defaults.fechaInicioCobro },
+  }, at);
+  return defaults;
 }
 
 /* ============ /usuarios/crear — solo staff, vía Admin ============ */
