@@ -997,6 +997,15 @@ async function actualizarPersona(req, env) {
   return json({ ok:true, id });
 }
 
+/* CAMPO RESERVADO (aún no implementado en ningún lado): motivoSuspension.
+   Cuando se construya la auto-suspensión por mora (Cron Trigger), esa función escribirá
+   motivoSuspension:'mora' en las personas que suspenda automáticamente.
+   Este campo NUNCA debe escribirse aquí en /personas/suspender (suspensión manual de staff),
+   ni en /personas/reactivar, ni en crearPersona/crearInvitacionFamiliar.
+   La AUSENCIA de este campo (undefined/null) es la señal de "esta persona fue suspendida
+   o está activa por decisión manual de un humano — el cron nunca debe tocarla".
+   Solo el cron, en el futuro, leerá y escribirá este campo. */
+
 /* /personas/suspender — SOLO staff. Suspender jefe hace CASCADA a sus familiares activos
    (suspendidoPor='cascada'). Suspender familiar es individual. Todo en el Worker. */
 async function suspenderPersona(req, env) {
