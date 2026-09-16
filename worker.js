@@ -1183,6 +1183,26 @@ async function misFamiliares(req, env) {
   });
 }
 
+/* Hermosillo/Sonora usa UTC-7 fijo todo el año (no aplica horario de verano), pero
+   Cloudflare Workers corre siempre en UTC — por eso new Date().getFullYear()/getMonth()/
+   getDate() daba el calendario en UTC, no en Hermosillo, al calcular "hoy" para cortes de
+   mes o meses transcurridos. Estos helpers NO cambian cómo se guardan los timestamps
+   (siguen en UTC absoluto vía toISOString()); solo ajustan cómo se leen sus componentes
+   de calendario (año/mes/día) para que representen la hora de pared en Hermosillo. */
+const HERMOSILLO_OFFSET_MS = 7 * 60 * 60 * 1000;
+
+function aHermosillo(instante) {
+  return new Date(new Date(instante).getTime() - HERMOSILLO_OFFSET_MS);
+}
+function ahoraHermosillo() {
+  return aHermosillo(Date.now());
+}
+// Instante UTC absoluto de las 00:00 hora Hermosillo de (year, month, day) — para construir
+// cortes de mes que coincidan con la medianoche real en Hermosillo, no con la de UTC.
+function inicioDiaHermosilloUTC(year, month, day) {
+  return new Date(Date.UTC(year, month, day, 0, 0, 0, 0) + HERMOSILLO_OFFSET_MS);
+}
+
 /* ============ /finanzas/resumen — cualquier usuario autenticado ============
    Devuelve SOLO agregados del mes en curso (cobrado, gastos, balance, y el
    termómetro X de Y casas pagaron) — nunca el detalle de movimientos ni qué
@@ -1193,9 +1213,9 @@ async function resumenFinanzas(req, env) {
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
 
-  const now = new Date();
-  const inicioMes = new Date(now.getFullYear(), now.getMonth(), 1);
-  const finMes = new Date(now.getFullYear(), now.getMonth()+1, 1);
+  const now = ahoraHermosillo();
+  const inicioMes = inicioDiaHermosilloUTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const finMes = inicioDiaHermosilloUTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
 
   const docs = await firestoreList(env, 'finanzas');
   let ingreso = 0, egreso = 0;
@@ -1232,9 +1252,9 @@ async function cobranzaFinanzas(req, env) {
   const perfil = await getPerfil(env, user.uid);
   if (!esStaff(perfil)) throw httpErr(403, 'Solo staff consulta la cobranza');
 
-  const now = new Date();
-  const inicioMes = new Date(now.getFullYear(), now.getMonth(), 1);
-  const finMes = new Date(now.getFullYear(), now.getMonth()+1, 1);
+  const now = ahoraHermosillo();
+  const inicioMes = inicioDiaHermosilloUTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
+  const finMes = inicioDiaHermosilloUTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
 
   // Un solo recorrido de "finanzas" arma a la vez: (a) qué domicilios pagaron Cuota ESTE MES
   // (termómetro/listas, igual que antes) y (b) el historial COMPLETO de pagos de Cuota por
@@ -1311,9 +1331,11 @@ function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa }) {
   const alta = altaCasa ? new Date(altaCasa) : inicioCobro;
   const fechaEfectiva = (alta instanceof Date && !isNaN(alta) && alta > inicioCobro) ? alta : inicioCobro;
 
-  const ahora = new Date();
-  let meses = (ahora.getFullYear() - fechaEfectiva.getFullYear()) * 12 + (ahora.getMonth() - fechaEfectiva.getMonth());
-  if (ahora.getDate() < fechaEfectiva.getDate()) meses -= 1;
+  const ahora = ahoraHermosillo();
+  const fechaEfectivaHermosillo = aHermosillo(fechaEfectiva);
+  let meses = (ahora.getUTCFullYear() - fechaEfectivaHermosillo.getUTCFullYear()) * 12
+            + (ahora.getUTCMonth() - fechaEfectivaHermosillo.getUTCMonth());
+  if (ahora.getUTCDate() < fechaEfectivaHermosillo.getUTCDate()) meses -= 1;
   const mesesTranscurridos = Math.max(0, meses);
 
   const montoEsperado = mesesTranscurridos * cfg.cuotaMensual;
