@@ -21,6 +21,19 @@ const DEVICES = {
   peatones:   "PENDIENTE_peatones",    // puerta peatonal
   salida:     "PENDIENTE_salida",      // puerta de salida
 };
+
+// Lectores físicos (QR + PIN) de invitaciones de visita — 4 lectores, cada uno atado a UNA
+// puerta de DEVICES y a una dirección. Dos lectores pueden compartir la misma puerta (peatonal
+// entrada/salida son el mismo Shelly, distinto lector físico) — por eso este mapeo vive aparte
+// de DEVICES, no lo reemplaza. readerId lo manda el lector físico en el body (mismo READER_KEY
+// compartido para los 4, igual que hoy — ver validarQR/validarPin).
+const READERS = {
+  'visitantes-entrada': { puerta: 'visitantes', direccion: 'entrada' },
+  'peatonal-entrada':   { puerta: 'peatones',   direccion: 'entrada' },
+  'peatonal-salida':    { puerta: 'peatones',   direccion: 'salida'  },
+  'salida-vehicular':   { puerta: 'salida',     direccion: 'salida'  },
+};
+
 const STAFF = new Set(['master','admin']);
 
 /* FASE 7 — esAdmin: un JEFE de familia (rol 'residente' sin jefeId) puede tener además
@@ -55,6 +68,7 @@ export default {
         case '/abrir':             out = await abrir(req, env); break;
         case '/invitacion/crear':  out = await crearInvitacion(req, env); break;
         case '/validar-qr':        out = await validarQR(req, env); break;  // lo llama el lector físico
+        case '/validar-pin':       out = await validarPin(req, env); break; // idem, código de respaldo
         case '/finanzas/registrar': out = await registrarFinanza(req, env); break;
         case '/finanzas/resumen':  out = await resumenFinanzas(req, env); break;
         case '/finanzas/cobranza': out = await cobranzaFinanzas(req, env); break;
@@ -164,8 +178,14 @@ async function crearInvitacion(req, env) {
   const qrToken = bytesToB64url(crypto.getRandomValues(new Uint8Array(32)));
   const tokenHash = await sha256b64url(qrToken);   // en Firestore se guarda SOLO el hash
 
-  // Guarda la invitación (fuente de verdad online). Se persiste el HASH del token, NUNCA el
-  // token en claro: quien lea el documento no puede reconstruir el QR.
+  // PIN de respaldo de 6 dígitos (CSPRNG, no Math.random) — funciona EN PARALELO al QR para la
+  // misma invitación (mismos usos, misma vigencia). Solo se guarda pinHash, nunca el PIN en
+  // claro; se entrega una sola vez en la respuesta, igual que el token del QR.
+  const pin = String(crypto.getRandomValues(new Uint32Array(1))[0] % 1000000).padStart(6, '0');
+  const pinHash = await sha256b64url(pin);
+
+  // Guarda la invitación (fuente de verdad online). Se persiste el HASH del token/PIN, NUNCA
+  // el valor en claro: quien lea el documento no puede reconstruir el QR ni el PIN.
   await firestoreSet(env, `invitaciones/${jti}`, {
     visitante: { stringValue: visitante },
     hogar: { stringValue: hogar || user.uid },
@@ -174,6 +194,8 @@ async function crearInvitacion(req, env) {
     usosRestantes: { integerValue: String(usos) },   // ya validado: entero 1..8, nunca 0/ilimitado
     activa: { booleanValue: true },
     tokenHash: { stringValue: tokenHash },
+    pinHash: { stringValue: pinHash },
+    dentro: { booleanValue: false },   // aún no ha registrado ninguna entrada (ver consumirInvitacion)
   });
 
   // PRE-SINCRONIZA al lector físico (resiliencia offline). Emite SOLO el hash + metadatos,
@@ -182,9 +204,53 @@ async function crearInvitacion(req, env) {
     .catch(()=>{});
 
   // El contenido del QR es SOLO el token opaco (se entrega una vez; no se persiste en claro).
+  // Igual el PIN: se entrega en claro aquí y nunca más se puede leer.
   // `expira` (ISO 8601, mismo valor guardado en Firestore) permite al frontend mostrar la hora
   // exacta de vencimiento; no revela nada nuevo (el residente ya eligió la vigencia).
-  return json({ ok:true, payload: qrToken, jti, expira: new Date(expira).toISOString() });
+  return json({ ok:true, payload: qrToken, pin, jti, expira: new Date(expira).toISOString() });
+}
+
+/* ---- Núcleo compartido: valida y CONSUME una invitación ya encontrada (por QR o por PIN) en
+   un lector concreto. No busca nada — eso lo hace cada camino de entrada (validarQR/validarPin)
+   con su propio método — solo decide si procede, actualiza usosRestantes/dentro según la
+   dirección del lector, dispara la Shelly y registra.
+
+   entrada: exige usosRestantes > 0 y lo descuenta; marca dentro:true. Si ya estaba dentro:true
+   (entrada duplicada sin salida de por medio), NO se bloquea — se deja pasar igual (podría ser
+   un familiar más llegando con el mismo QR/PIN) pero el texto de logApertura lo marca "revisar".
+   salida: NO descuenta usosRestantes (salir es gratis); marca dentro:false. Si ya estaba
+   dentro:false, mismo criterio: se deja pasar, pero se marca "revisar". */
+async function consumirInvitacion(env, inv, readerId, metodo) {
+  const reader = READERS[readerId];
+  if (!reader) throw httpErr(400, 'Lector desconocido');
+
+  if (!inv.activa) throw httpErr(403, 'Invitación inválida o cancelada');
+  // Expiración: se compara contra el DOCUMENTO (el token/PIN ya no la llevan).
+  if (!inv.expira || new Date(inv.expira).getTime() < Date.now()) throw httpErr(403, 'Invitación expirada');
+  // Si el residente del hogar está suspendido por mora, no abre (sin gastar usos ni disparar la Shelly).
+  const anfitrion = await getPerfil(env, inv.hogar);
+  if (anfitrion && anfitrion.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
+
+  let nombreLog = inv.visitante;
+  if (reader.direccion === 'entrada') {
+    if (inv.usosRestantes !== null && inv.usosRestantes <= 0) throw httpErr(403, 'Sin usos disponibles');
+    if (inv.dentro === true) nombreLog = `${inv.visitante} volvió a entrar sin salida previa registrada — revisar`;
+    const fields = { dentro: { booleanValue: true } };
+    const mask = ['dentro'];
+    if (inv.usosRestantes !== null) {
+      fields.usosRestantes = { integerValue: String(inv.usosRestantes - 1) };
+      mask.push('usosRestantes');
+    }
+    await firestoreUpdate(env, `invitaciones/${inv.id}`, fields, mask);
+  } else {
+    if (inv.dentro === false) nombreLog = `${inv.visitante} salió sin entrada previa registrada — revisar`;
+    await firestoreUpdate(env, `invitaciones/${inv.id}`, { dentro: { booleanValue: false } }, ['dentro']);
+  }
+
+  await triggerShelly(env, DEVICES[reader.puerta]);
+  await logApertura(env, { uid: metodo, nombre: nombreLog, puerta: reader.puerta, hogar: inv.hogar, tipo: reader.direccion });
+  await notificarResidente(env, inv.hogar,
+    `Visita ${inv.visitante} ${reader.direccion === 'entrada' ? 'entró' : 'salió'} por ${reader.puerta}`);
 }
 
 /* ============ /validar-qr — lo llama el LECTOR físico al escanear ============
@@ -195,29 +261,47 @@ async function validarQR(req, env) {
   const readerKey = req.headers.get('X-Reader-Key');
   if (!env.READER_KEY || readerKey !== env.READER_KEY) throw httpErr(401, 'Lector no autorizado');
 
-  const { payload } = await req.json();
+  const { payload, readerId } = await req.json();
   // El payload es ahora el TOKEN OPACO (cadena aleatoria, sin datos). Se busca su hash en
   // Firestore; TODOS los datos salen del documento, nunca del token.
   if (!payload || typeof payload !== 'string') throw httpErr(400, 'Falta el token del QR');
   const tokenHash = await sha256b64url(payload);
   const inv = await getInvitacionPorTokenHash(env, tokenHash);
-  if (!inv || !inv.activa) throw httpErr(403, 'QR inválido o cancelado');
-  // Expiración: se compara contra el DOCUMENTO (el token ya no la lleva).
-  if (!inv.expira || new Date(inv.expira).getTime() < Date.now()) throw httpErr(403, 'QR expirado');
-  // Si el residente del hogar está suspendido por mora, su QR no abre (sin gastar usos ni disparar la Shelly).
-  const anfitrion = await getPerfil(env, inv.hogar);
-  if (anfitrion && anfitrion.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
-  // Consume un uso
-  if (inv.usosRestantes !== null) {
-    if (inv.usosRestantes <= 0) throw httpErr(403, 'Sin usos disponibles');
-    await firestoreUpdate(env, `invitaciones/${inv.id}`, {
-      usosRestantes: { integerValue: String(inv.usosRestantes - 1) },
-    }, ['usosRestantes']);
+  if (!inv) throw httpErr(403, 'QR inválido o cancelado');
+
+  await consumirInvitacion(env, inv, readerId, 'qr');
+  return json({ ok:true });
+}
+
+/* ============ /validar-pin — camino de respaldo si el QR no se puede escanear ============
+   Mismo patrón de auth que /validar-qr (X-Reader-Key compartido entre los 4 lectores). Un PIN
+   de 6 dígitos es 10^6 combinaciones — lo que lo hace seguro NO es su longitud, es el candado
+   de fuerza bruta (checarCandadoPin/registrarFalloPin, por lector) que se revisa ANTES de
+   buscar nada. */
+async function validarPin(req, env) {
+  const readerKey = req.headers.get('X-Reader-Key');
+  if (!env.READER_KEY || readerKey !== env.READER_KEY) throw httpErr(401, 'Lector no autorizado');
+
+  const { pin, readerId } = await req.json();
+  if (!pin || typeof pin !== 'string') throw httpErr(400, 'Falta el PIN');
+  // Se valida el lector ANTES de tocar controlPin/{readerId}: un readerId desconocido no debe
+  // crear ni leer ningún documento de candado.
+  if (!READERS[readerId]) throw httpErr(400, 'Lector desconocido');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+
+  // Candado ANTES de tocar cualquier otra cosa: si ya está bloqueado, ni se calcula el hash.
+  await checarCandadoPin(env, at, readerId);
+
+  const pinHash = await sha256b64url(pin);
+  const inv = await getInvitacionPorPinHash(env, pinHash);
+  if (!inv) {
+    await registrarFalloPin(env, at, readerId);
+    throw httpErr(403, 'PIN inválido');
   }
 
-  await triggerShelly(env, DEVICES.visitantes);
-  await logApertura(env, { uid:'qr', nombre: inv.visitante, puerta:'visitantes', hogar: inv.hogar, tipo:'qr' });
-  await notificarResidente(env, inv.hogar, `Visita ${inv.visitante} entró por visitantes`);
+  await resetearCandadoPin(env, at, readerId);
+  await consumirInvitacion(env, inv, readerId, 'pin');
   return json({ ok:true });
 }
 
@@ -2191,6 +2275,76 @@ async function getInvitacionPorTokenHash(env, tokenHash) {
   if (!hit) return null;
   return { id: hit.document.name.split('/').pop(), ...readDoc(hit.document.fields) };
 }
+/* Igual que getInvitacionPorTokenHash pero por el PIN de respaldo — mismo patrón de query
+   de igualdad sobre un solo campo, sin índice compuesto. */
+async function getInvitacionPorPinHash(env, pinHash) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const r = await fetch(`${fsBase(env)}:runQuery`, {
+    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({ structuredQuery: {
+      from: [{ collectionId: 'invitaciones' }],
+      where: { fieldFilter: { field: { fieldPath: 'pinHash' }, op: 'EQUAL', value: { stringValue: pinHash } } },
+      limit: 1,
+    }}),
+  });
+  if (!r.ok) throw httpErr(500, 'Firestore query falló');
+  const rows = await r.json();
+  const hit = (rows || []).find(x => x.document);
+  if (!hit) return null;
+  return { id: hit.document.name.split('/').pop(), ...readDoc(hit.document.fields) };
+}
+
+/* ---- Candado de fuerza bruta del PIN, por LECTOR (controlPin/{readerId}) ----
+   Un PIN incorrecto no pertenece a ninguna invitación (no se sabe cuál intentaba abrir quien
+   lo tecleó mal), así que el candado vive en su propia colección, no colgado de invitaciones/
+   {jti}. Mismo mecanismo de incremento atómico que siguienteFolioRecibo (updateTransforms,
+   sin transacción explícita, sin condición de carrera entre intentos casi simultáneos del
+   mismo lector). controlPin NUNCA es legible/escribible desde el cliente (ver firestore.rules)
+   — solo el Worker, vía service account. */
+const PIN_LOCK_MAX_FALLOS = 5;
+const PIN_LOCK_MS = 5 * 60 * 1000;
+
+async function checarCandadoPin(env, at, readerId) {
+  const doc = await getDoc(env, at, `controlPin/${readerId}`);
+  const bloqueadoHasta = doc?.fields?.bloqueadoHasta?.timestampValue
+    ? Date.parse(doc.fields.bloqueadoHasta.timestampValue) : 0;
+  if (bloqueadoHasta > Date.now()) {
+    const segundos = Math.ceil((bloqueadoHasta - Date.now()) / 1000);
+    throw httpErr(403, `Demasiados intentos fallidos. Intenta de nuevo en ${segundos} segundos.`);
+  }
+}
+async function registrarFalloPin(env, at, readerId) {
+  const base = `projects/${env.FIREBASE_PROJECT}/databases/(default)`;
+  const r = await fetch(`https://firestore.googleapis.com/v1/${base}/documents:commit`, {
+    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+    body: JSON.stringify({
+      writes: [{
+        // update con máscara vacía = merge que crea el doc si no existe; el increment va
+        // aparte en updateTransforms (atómico, mismo patrón que siguienteFolioRecibo).
+        update: { name: `${base}/documents/controlPin/${readerId}`, fields: {} },
+        updateMask: { fieldPaths: [] },
+        updateTransforms: [{ fieldPath: 'fallidos', increment: { integerValue: '1' } }],
+      }],
+    }),
+  });
+  if (!r.ok) return;   // best-effort: si el conteo falla, igual responde 'PIN inválido' arriba
+  const d = await r.json();
+  const n = Number(d.writeResults?.[0]?.transformResults?.[0]?.integerValue);
+  if (n >= PIN_LOCK_MAX_FALLOS) {
+    // firestoreSet REEMPLAZA el documento completo: deja fallidos:0 y bloqueadoHasta como
+    // ÚNICOS campos, sin necesidad de borrar nada aparte.
+    await firestoreSet(env, `controlPin/${readerId}`, {
+      fallidos: { integerValue: '0' },
+      bloqueadoHasta: { timestampValue: new Date(Date.now() + PIN_LOCK_MS).toISOString() },
+    }, at);
+  }
+}
+async function resetearCandadoPin(env, at, readerId) {
+  // firestoreSet REEMPLAZA el documento completo: dejar solo fallidos:0 también borra
+  // bloqueadoHasta si existía.
+  await firestoreSet(env, `controlPin/${readerId}`, { fallidos: { integerValue: '0' } }, at);
+}
+
 async function firestoreSet(env, path, fields, atOverride) {
   const at = atOverride || await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const r = await fetch(`${fsBase(env)}/${path}`, {

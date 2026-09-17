@@ -49,6 +49,12 @@ service cloud.firestore {
       // creación/consumo de usos: SOLO el Worker
       allow write: if false;
     }
+    // ---- controlPin (candado de fuerza bruta del PIN de respaldo, por LECTOR) ----
+    // No cuelga de ninguna invitación (un PIN incorrecto no pertenece a ninguna) — colección
+    // aparte, únicamente Worker (service account, ignora estas reglas).
+    match /controlPin/{readerId} {
+      allow read, write: if false;
+    }
     // ---- finanzas ----
     match /finanzas/{id} {
       // Solo staff lee el detalle de movimientos (incluye el campo "casa" por cuota).

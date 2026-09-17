@@ -386,8 +386,8 @@ async function generateInvite(){
     $('#inviteForm').classList.add('hidden');
     $('#inviteResult').classList.remove('hidden');
     // Captura los parámetros de ESTA invitación (las globales pueden cambiar si se reabre la hoja).
-    const dur = inviteDur, uses = inviteUses, payload = r.payload, expira = r.expira;
-    $('#shareQrBtn').onclick = ()=> shareQR({ payload, name, dur, uses, expira });
+    const dur = inviteDur, uses = inviteUses, payload = r.payload, expira = r.expira, pin = r.pin;
+    $('#shareQrBtn').onclick = ()=> shareQR({ payload, name, dur, uses, expira, pin });
   } catch(e){
     toast(e.message || 'No se pudo generar', 'bad');
   } finally {
@@ -418,13 +418,15 @@ function fmtInviteVigencia(expira, dur){
     : 'el ' + d.toLocaleDateString('es-MX', { day:'numeric', month:'long' }));
   return `Vence ${cuando} ${hora}`;
 }
-/* Texto que acompaña al QR en Web Share / WhatsApp. */
-function buildInviteText(name, dur, uses, expira){
+/* Texto que acompaña al QR en Web Share / WhatsApp. `pin` es opcional (compatibilidad si
+   alguna vez falta en la respuesta) — código de respaldo por si el QR no se puede escanear. */
+function buildInviteText(name, dur, uses, expira, pin){
   return `¡Hola, ${name}! 👋\n`
     + `Tienes acceso a *Cerrada La Marquesa*.\n`
     + `🕐 ${fmtInviteVigencia(expira, dur)} · ${fmtInviteUses(uses)}\n`
     + `📍 Cómo llegar: https://www.google.com/maps/dir/?api=1&destination=29.1209415,-111.054941\n\n`
-    + `Muestra el código QR adjunto al llegar a la caseta de acceso.`;
+    + `Muestra el código QR adjunto al llegar a la caseta de acceso.`
+    + (pin ? `\n🔢 Código de respaldo (si el QR no funciona): ${pin}` : '');
 }
 
 /* Carga una imagen y resuelve cuando está lista (para componer en canvas). */
@@ -456,8 +458,8 @@ function fitText(ctx, text, maxW){
 
 /* Compone una tarjeta vertical (foto + capa oscura + recuadro BLANCO con el QR + datos)
    con <canvas> nativo y la devuelve como File JPG. Sin librerías nuevas. */
-async function buildInviteCard({ payload, name, dur, uses, expira }){
-  const W = 1080, H = 1350;
+async function buildInviteCard({ payload, name, dur, uses, expira, pin }){
+  const W = 1080, H = 1460;   // +110 vs antes: espacio nuevo para el PIN de respaldo, abajo
   const cv = document.createElement('canvas');
   cv.width = W; cv.height = H;
   const ctx = cv.getContext('2d');
@@ -509,12 +511,22 @@ async function buildInviteCard({ payload, name, dur, uses, expira }){
   ctx.fillText(`${fmtInviteVigencia(expira, dur)} · ${fmtInviteUses(uses)}`, cx, 1168);
   ctx.fillStyle = 'rgba(255,255,255,0.72)';
   ctx.font = '400 30px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
-  ctx.fillText('Muestra este código en la caseta de acceso', cx, 1222);
+  ctx.fillText('Muestra este código en la caseta de acceso', cx, 1216);
+
+  // Código de respaldo (PIN): grande y legible, por si el QR no se puede escanear.
+  if (pin) {
+    ctx.fillStyle = 'rgba(255,255,255,0.72)';
+    ctx.font = '600 28px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.fillText('CÓDIGO DE RESPALDO (SI EL QR NO FUNCIONA)', cx, 1268);
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '700 66px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
+    ctx.fillText(pin, cx, 1340);
+  }
 
   // Pie discreto.
   ctx.fillStyle = 'rgba(255,255,255,0.55)';
   ctx.font = '400 26px system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
-  ctx.fillText('Sistema por Diagonal Catorce', cx, 1300);
+  ctx.fillText('Sistema por Diagonal Catorce', cx, 1410);
 
   const blob = await new Promise(res => cv.toBlob(res, 'image/jpeg', 0.92));
   return new File([blob], 'acceso-la-marquesa.jpg', { type: 'image/jpeg' });
@@ -522,10 +534,10 @@ async function buildInviteCard({ payload, name, dur, uses, expira }){
 
 /* Comparte la tarjeta + el texto. Web Share con archivos cuando el dispositivo lo soporta;
    si no, descarga la tarjeta y copia el mensaje al portapapeles para pegarlo en WhatsApp. */
-async function shareQR({ payload, name, dur, uses, expira }){
-  const texto = buildInviteText(name, dur, uses, expira);
+async function shareQR({ payload, name, dur, uses, expira, pin }){
+  const texto = buildInviteText(name, dur, uses, expira, pin);
   let file = null;
-  try { file = await buildInviteCard({ payload, name, dur, uses, expira }); }
+  try { file = await buildInviteCard({ payload, name, dur, uses, expira, pin }); }
   catch(e){ console.error('buildInviteCard', e); }
 
   // Camino principal: Web Share nivel 2 (imagen + texto en una sola hoja de compartir).
