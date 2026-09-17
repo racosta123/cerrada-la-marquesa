@@ -607,6 +607,19 @@
   </div>
 </div>
 
+<!-- ============ MOTIVO DE SUSPENSIÓN (manual, staff) — modal, no prompt nativo ============ -->
+<div class="overlay" id="personaSuspenderOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3>Suspender</h3>
+    <div class="recibo-datos" id="personaSuspenderInfo"></div>
+    <div class="field"><label>Motivo (obligatorio — lo verá cualquier staff)</label><input id="personaSuspenderMotivo" maxlength="200" placeholder="Ej. Adeudo acumulado, conducta, etc."></div>
+    <button class="btn-primary" id="personaSuspenderConfirm" style="background:linear-gradient(145deg,#b91c1c,#7f1d1d);color:#fff">Sí, suspender</button>
+    <button class="btn-ghost" id="personaSuspenderCancel" style="width:100%;margin-top:10px">Cancelar</button>
+    <div id="personaSuspenderErr" class="err"></div>
+  </div>
+</div>
+
 <!-- ============ INVITAR FAMILIAR (FASE 6.5): el jefe invita a un familiar ============ -->
 <div class="overlay" id="familiarOverlay">
   <div class="sheet" id="familiarSheet">

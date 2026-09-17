@@ -130,11 +130,12 @@ async function abrir(req, env) {
 
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
-  // Un residente suspendido (por mora) no puede abrir, salvo la puerta peatonal; tampoco sus esclavos.
-  if (perfil.suspendido && puerta !== 'peatones') throw httpErr(403, 'Residente suspendido por mora');
+  // Un residente suspendido (por mora) no puede abrir, salvo peatonal y salida (nadie debe
+  // quedar atrapado sin poder salir, ni en coche ni a pie); tampoco sus esclavos.
+  if (perfil.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw httpErr(403, 'Residente suspendido por mora');
   if (perfil.rol === 'esclavo' && perfil.residenteUid) {
     const padre = await getPerfil(env, perfil.residenteUid);
-    if (padre && padre.suspendido && puerta !== 'peatones') throw httpErr(403, 'Residente del hogar suspendido por mora');
+    if (padre && padre.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw httpErr(403, 'Residente del hogar suspendido por mora');
   }
   // master, admin, residente y esclavo pueden abrir las 4 puertas.
   await triggerShelly(env, DEVICES[puerta]);
@@ -1103,17 +1104,25 @@ async function actualizarPersona(req, env) {
    ni en /personas/reactivar, ni en crearPersona/crearInvitacionFamiliar.
    La AUSENCIA de este campo (undefined/null) es la señal de "esta persona fue suspendida
    o está activa por decisión manual de un humano — el cron nunca debe tocarla".
-   Solo el cron, en el futuro, leerá y escribirá este campo. */
+   Solo el cron, en el futuro, leerá y escribirá este campo.
+   ACTUALIZACIÓN: ya implementado (ver aplicarSuspensionAutomatica/intentarReactivarPorPago).
+   NO CONFUNDIR con motivoManual (abajo) — son dos campos separados a propósito: motivoManual
+   es el texto libre que el staff escribe al suspender a mano (por qué), motivoSuspension es
+   la marca fija 'mora' que solo pone el cron (para qué NO debe tocarla el cron). */
 
 /* /personas/suspender — SOLO staff. Suspender jefe hace CASCADA a sus familiares activos
-   (suspendidoPor='cascada'). Suspender familiar es individual. Todo en el Worker. */
+   (suspendidoPor='cascada'). Suspender familiar es individual. Todo en el Worker.
+   motivoManual (texto libre, requerido, máx 200) queda guardado en el jefe y en cada familiar
+   de la cascada, visible para cualquier staff — para que nadie tenga que preguntar por qué. */
 async function suspenderPersona(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
   if (!esStaff(perfil)) throw httpErr(403, 'Solo staff suspende personas');
 
-  const { id } = await req.json();
+  const { id, motivo } = await req.json();
   if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const motivoManual = String(motivo || '').trim().slice(0, 200);
+  if (!motivoManual) throw httpErr(400, 'Falta el motivo de la suspensión');
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
@@ -1121,14 +1130,14 @@ async function suspenderPersona(req, env) {
   if (p.rol === 'master') throw httpErr(403, 'No se puede suspender un master');
   if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede suspender a un administrador');
 
-  await firestoreActualizarCampos(env, `personas/${id}`, { estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'individual'} }, 'Persona');
+  await firestoreActualizarCampos(env, `personas/${id}`, { estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'individual'}, motivoManual:{stringValue:motivoManual} }, 'Persona');
   if (esJefe(p)) {
     for (const f of all.filter(x => x.jefeId === id && x.estado === 'activo')) {
-      await firestoreActualizarCampos(env, `personas/${f.id}`, { estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'cascada'} }, 'Persona');
+      await firestoreActualizarCampos(env, `personas/${f.id}`, { estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'cascada'}, motivoManual:{stringValue:motivoManual} }, 'Persona');
     }
   }
   await resyncFamilia(env, at, id, esJefe(p));
-  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Staff'} suspendió a ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''}` });
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Staff'} suspendió a ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''} — motivo: ${motivoManual}` });
   return json({ ok:true, id });
 }
 
@@ -1151,10 +1160,10 @@ async function reactivarPersona(req, env) {
     if (jefe && jefe.estado === 'suspendido') throw httpErr(409, 'Reactiva primero al jefe de familia (la casa está suspendida).');
   }
 
-  await firestoreActualizarCampos(env, `personas/${id}`, { estado:{stringValue:'activo'}, suspendidoPor:{nullValue:null} }, 'Persona');
+  await firestoreActualizarCampos(env, `personas/${id}`, { estado:{stringValue:'activo'}, suspendidoPor:{nullValue:null}, motivoManual:{nullValue:null} }, 'Persona');
   if (esJefe(p)) {
     for (const f of all.filter(x => x.jefeId === id && x.estado === 'suspendido' && x.suspendidoPor === 'cascada')) {
-      await firestoreActualizarCampos(env, `personas/${f.id}`, { estado:{stringValue:'activo'}, suspendidoPor:{nullValue:null} }, 'Persona');
+      await firestoreActualizarCampos(env, `personas/${f.id}`, { estado:{stringValue:'activo'}, suspendidoPor:{nullValue:null}, motivoManual:{nullValue:null} }, 'Persona');
     }
   }
   await resyncFamilia(env, at, id, esJefe(p));
@@ -1262,6 +1271,7 @@ async function listarPersonas(req, env) {
     id: p.id, nombre: p.nombre || '', telefono: p.telefono || '', correo: p.correo ?? null,
     rol: p.rol || 'residente', estado: p.estado || 'activo', uid: p.uid ?? null,
     jefeId: p.jefeId ?? null, suspendidoPor: p.suspendidoPor ?? null,
+    motivoManual: p.motivoManual ?? null,   // texto libre del staff al suspender a mano
     domicilio: domicilioDe(p, byId), domicilioNorm: p.domicilioNorm || '',
     registrado: !!p.uid,
     esAdmin: p.esAdmin === true,   // FASE 7: para la etiqueta y el botón de master en Gestión

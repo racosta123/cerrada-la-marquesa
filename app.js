@@ -255,11 +255,11 @@ function renderDoors(){
   const susp = ME.suspendido === true;
   if (susp){
     grid.innerHTML = '<div class="empty" style="grid-column:1/-1;padding:14px 10px">'
-      + 'Suspendido por mora — solo acceso peatonal disponible.</div>';
+      + 'Suspendido por mora — solo puedes usar Peatones y Salida.</div>';
   }
   // El invitado (visitante con QR) no usa esta app; los esclavos sí abren las 4 (si no hay suspensión).
   DOORS.forEach(d => {
-    const bloqueada = susp && d.id !== 'peatones';
+    const bloqueada = susp && d.id !== 'peatones' && d.id !== 'salida';
     const el = document.createElement('div');
     el.className = 'door' + (bloqueada ? ' door-disabled' : '');
     el.innerHTML = `
@@ -798,11 +798,16 @@ function personaRow(p){
       acts += `<button class="row-act danger" data-act="borrar" data-id="${p.id}">Borrar</button>`;
   }
 
+  // Motivo de la suspensión MANUAL, visible sin tener que preguntar (ausente si la suspendió
+  // el cron de mora — motivoManual es exclusivo de /personas/suspender, staff).
+  const motivoLine = (susp && p.motivoManual)
+    ? `<div class="vnote" style="padding:0 2px 8px">📝 Motivo: ${esc(p.motivoManual)}</div>` : '';
+
   return `<div class="row">`
       + `<div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
       + `<div class="rt"><div class="a">${titulo}</div>${sub?`<div class="b">${sub}</div>`:''}</div>`
       + `<div class="tags">${tagEstado}${tagAdmin}${tagCuenta}</div>`
-    + `</div>` + (acts ? `<div class="persona-acts">${acts}</div>` : '');
+    + `</div>` + motivoLine + (acts ? `<div class="persona-acts">${acts}</div>` : '');
 }
 
 $('#personaSearch')?.addEventListener('input', renderPersonas);
@@ -813,7 +818,7 @@ $('#personasList')?.addEventListener('click', e => {
   switch (b.dataset.act){
     case 'editar':    abrirPersonaSheet(p); break;
     case 'invitar':   invitarPersona(p, b); break;
-    case 'suspender': cambiarEstadoPersona(p, 'suspender', b); break;
+    case 'suspender': abrirPersonaSuspenderSheet(p); break;
     case 'reactivar': cambiarEstadoPersona(p, 'reactivar', b); break;
     case 'admin':     cambiarAdminPersona(p, b); break;
     case 'borrar':    abrirPersonaDelSheet(p); break;
@@ -908,7 +913,40 @@ async function guardarPersona(){
   }
 }
 
-/* -------- suspender / reactivar (staff). Suspender un jefe hace cascada a su familia. -------- */
+/* -------- suspender (staff), con motivo obligatorio por MODAL (no prompt nativo) — mismo
+   patrón visual que abrirPersonaDelSheet. El Worker rechaza con 400 si el motivo viene vacío;
+   aquí solo se valida antes para no hacer el viaje al servidor en vano. -------- */
+let personaSuspenderId = null;
+function abrirPersonaSuspenderSheet(p){
+  personaSuspenderId = p.id;
+  $('#personaSuspenderInfo').innerHTML = esJefeP(p)
+    ? `<b>${esc(p.domicilio||'')}</b> · ${esc(p.nombre||'')}`
+    : `<b>${esc(p.nombre||'')}</b>${p.domicilio?' · '+esc(p.domicilio):''}`;
+  $('#personaSuspenderMotivo').value = '';
+  $('#personaSuspenderErr').textContent = '';
+  openSheet('#personaSuspenderOverlay');
+}
+$('#personaSuspenderCancel')?.addEventListener('click', () => closeSheet('#personaSuspenderOverlay'));
+$('#personaSuspenderOverlay')?.addEventListener('click', e => { if(e.target.id==='personaSuspenderOverlay') closeSheet('#personaSuspenderOverlay'); });
+$('#personaSuspenderConfirm')?.addEventListener('click', async () => {
+  if (!personaSuspenderId) return;
+  const motivo = $('#personaSuspenderMotivo').value.trim();
+  $('#personaSuspenderErr').textContent = '';
+  if (!motivo){ $('#personaSuspenderErr').textContent = 'Escribe el motivo de la suspensión'; return; }
+  const btn = $('#personaSuspenderConfirm'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/personas/suspender', { id: personaSuspenderId, motivo });
+    const p = personasCache.find(x => x.id === personaSuspenderId);
+    const cascada = p && esJefeP(p) ? ' (y su familia)' : '';
+    toast('Suspendido'+cascada+' · no podrá abrir puertas', 'bad');
+    closeSheet('#personaSuspenderOverlay');
+    await refrescarPersonas();
+  } catch(e){
+    $('#personaSuspenderErr').textContent = e.message || 'No se pudo suspender';
+  } finally { btn.disabled = false; btn.textContent = 'Sí, suspender'; }
+});
+
+/* -------- reactivar (staff). Reactivar un jefe hace cascada a su familia. -------- */
 async function cambiarEstadoPersona(p, accion, btn){
   const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
