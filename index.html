@@ -369,6 +369,10 @@
     </div>
   </div>
 
+  <!-- AVISO DE CORTE POR MORA — global, fuera de las tabpanes: visible en cualquier pestaña.
+       Lo llena/oculta renderAvisoCorte() (app.js), recalculado cada vez que carga la app. -->
+  <div id="avisoCorteBanner" class="vbanner hidden" style="margin:0 0 14px"></div>
+
   <!-- TAB: PUERTAS -->
   <div id="tab-doors" class="tabpane">
     <div class="section-title">Abrir puertas</div>
@@ -517,6 +521,22 @@
       </div>
       <button class="btn-primary" id="ccGuardarBtn" style="margin-top:0">Guardar cambios</button>
       <div id="ccErr" class="err"></div>
+    </div>
+
+    <!-- Suspensión automática por mora — SOLO master. Botón de prueba/emergencia aparte del
+         Cron Trigger real: "Simular" nunca escribe nada; "Aplicar de verdad" hace lo mismo que
+         el cron (con el mismo tope de una vez por mes). -->
+    <div id="susAutoSection" class="hidden" style="margin-top:22px">
+      <div class="section-title">Suspensión automática por mora</div>
+      <p class="vnote" style="margin:0 0 10px">Revisa o fuerza la misma revisión que hace el Cron Trigger diario (actúa desde el día 5 del mes, hora Hermosillo).</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn-primary" id="susSimularBtn" style="margin-top:0;flex:1">Simular (sin cambios)</button>
+        <button class="btn-ghost" id="susAplicarBtn" style="color:var(--bad);border-color:rgba(248,113,113,.4)">Aplicar de verdad</button>
+      </div>
+      <div class="vbanner" style="margin:10px 0 0">
+        ⚠️ "Aplicar de verdad" suspende personas REALES ahora mismo (bloquea sus puertas) si tienen adeudo — no es una prueba. Usa "Simular" primero para ver a quién afectaría.
+      </div>
+      <div id="susResultado" class="list" style="margin-top:10px"></div>
     </div>
   </div>
 

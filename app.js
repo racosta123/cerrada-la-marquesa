@@ -225,8 +225,10 @@ function buildTabs(){
   $$('.tabpane').forEach(p => p.classList.add('hidden'));
   $('#tab-'+tabs[0].id).classList.remove('hidden');
   if (isStaff) loadPersonas();
-  // Configuración de cobranza: SOLO master (ni admin puro ni jefe-admin la ven ni la tocan).
+  // Configuración de cobranza y suspensión automática: SOLO master (ni admin puro ni
+  // jefe-admin las ven ni las tocan).
   $('#cobranzaConfigSection').classList.toggle('hidden', ME.rol !== 'master');
+  $('#susAutoSection').classList.toggle('hidden', ME.rol !== 'master');
   if (ME.rol === 'master') cargarConfigCobranza();
 }
 
@@ -670,6 +672,45 @@ $('#ccGuardarBtn')?.addEventListener('click', async () => {
     btn.disabled = false; btn.textContent = orig;
   }
 });
+
+/* ====================== SUSPENSIÓN AUTOMÁTICA POR MORA (SOLO master) ======================
+   "Simular" y "Aplicar de verdad" llaman al MISMO endpoint (/admin/probar-suspension-
+   automatica) con distinto `modo` — el Worker decide qué escribe o no; aquí solo se pinta
+   el resumen que regresa. Nunca se llama sola: siempre es un clic del master. */
+function renderResumenSuspension(r){
+  const el = $('#susResultado');
+  if (!r.suspendidas || !r.suspendidas.length){
+    const motivo = r.modo === 'aplicar' && !r.aplico
+      ? (r.ultimoMesProcesado === r.mesActual ? 'Este mes ya se procesó.' : 'Todavía no toca (antes del día 5 en Hermosillo).')
+      : 'Ninguna casa activa tiene adeudo.';
+    el.innerHTML = `<div class="empty">${motivo}</div>`;
+    return;
+  }
+  el.innerHTML = r.suspendidas.map(c =>
+    `<div class="row"><div class="rt"><div class="a">${esc(c.domicilio || '')}</div>`
+    + `${c.nombre?`<div class="b">${esc(c.nombre)}</div>`:''}</div><span class="tag out">${money(c.adeudo)}</span></div>`
+  ).join('');
+}
+async function ejecutarSuspensionAutomatica(modo){
+  const btn = modo === 'aplicar' ? $('#susAplicarBtn') : $('#susSimularBtn');
+  const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/admin/probar-suspension-automatica', { modo });
+    renderResumenSuspension(r);
+    if (modo === 'aplicar'){
+      toast(r.aplico ? `${r.suspendidas.length} casa(s) suspendida(s) por mora` : 'No se aplicó (ver detalle abajo)', r.aplico ? 'bad' : 'ok');
+      if (r.aplico) refrescarPersonas();   // el padrón cambió: refleja los nuevos suspendidos
+    } else {
+      toast(`Simulación: ${r.suspendidas.length} casa(s) se suspenderían hoy`, 'ok');
+    }
+  } catch(e){
+    toast(e.message || 'No se pudo ejecutar', 'bad');
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+}
+$('#susSimularBtn')?.addEventListener('click', () => ejecutarSuspensionAutomatica('simular'));
+$('#susAplicarBtn')?.addEventListener('click', () => ejecutarSuspensionAutomatica('aplicar'));
 
 /* -------- lista agrupada por casa: jefe + sus familiares anidados; admins aparte -------- */
 function renderPersonas(){
@@ -1117,6 +1158,10 @@ const monthKey = ts => { const d = ts.toDate ? ts.toDate() : new Date(ts); retur
 function watchFinanzas(){
   if (unsubFin) unsubFin();
   const isStaff = enModoStaff();
+  // El aviso de corte es de la propia casa: en modo staff se oculta siempre (abajo se vuelve a
+  // mostrar si aplica, vía cargarMiEstadoCuenta) — evita que quede un aviso viejo pegado al
+  // cambiar de modo residente a admin con el botón modoBtn (no recarga la app).
+  renderAvisoCorte(null);
 
   // Detalle de movimientos, gráficas y morosos: solo staff. Residentes/esclavos ya no
   // leen "finanzas" directo (bloqueado por Firestore rules) — reciben solo el agregado
@@ -1180,6 +1225,8 @@ async function cargarMiEstadoCuenta(){
       authedFetch('/config/cobranza', {}),
     ]);
 
+    renderAvisoCorte(r.avisoCorte);
+
     if (r.alCorriente){
       el.innerHTML = `<p class="vnote" style="margin:0;color:var(--ok);font-size:14px">✅ Estás al corriente.</p>
          <p class="vnote" style="margin:6px 0 0">Cuota mensual: ${money(r.cuotaMensual)}</p>`;
@@ -1202,7 +1249,21 @@ async function cargarMiEstadoCuenta(){
   } catch(e){
     console.error('estado-cuenta', e);
     el.innerHTML = '<div class="empty">No se pudo cargar tu estado de cuenta.</div>';
+    renderAvisoCorte(null);
   }
+}
+
+/* Aviso global de corte por mora (banner fuera de las tabpanes, visible en cualquier pestaña
+   — ver #avisoCorteBanner en index.html). avisoCorte llega en la respuesta de
+   /finanzas/estado-cuenta, recalculado por el Worker en cada carga; null lo oculta. */
+function renderAvisoCorte(avisoCorte){
+  const el = $('#avisoCorteBanner');
+  if (!avisoCorte){ el.classList.add('hidden'); el.innerHTML = ''; return; }
+  const texto = avisoCorte.horasRestantes > 0
+    ? `⚠️ No te quedes sin servicio. Tus permisos se cancelarán en ${avisoCorte.horasRestantes} horas por falta de pago.`
+    : `⚠️ No te quedes sin servicio. Tus permisos se cancelarán hoy por falta de pago.`;
+  el.innerHTML = `<b>${texto}</b>`;
+  el.classList.remove('hidden');
 }
 
 /* -------- termómetro "X de Y casas pagaron" (compartido staff/residente) -------- */

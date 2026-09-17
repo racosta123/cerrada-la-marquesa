@@ -91,13 +91,21 @@ export default {
         case '/votaciones/participacion': out = await participacionVotacion(req, env); break;
         case '/votaciones/historial':     out = await historialVotaciones(req, env); break;
         case '/votaciones/participantes':  out = await participantesVotacion(req, env); break;
+        case '/admin/probar-suspension-automatica': out = await probarSuspensionAutomatica(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
     } catch (e) {
       return cors(json({ error: e.message || 'Error interno' }, e.status || 500), origin);
     }
-  }
+  },
+
+  // Cron Trigger (wrangler.toml [triggers]) — corre todos los días; aplicarSuspensionAutomatica
+  // decide internamente si le toca actuar (día >= 5 Hermosillo, una vez por mes). ctx.waitUntil
+  // evita que el Worker se corte antes de terminar el recorrido de personas/finanzas.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(aplicarSuspensionAutomatica(env));
+  },
 };
 
 /* ============ /abrir — usuario autenticado abre una puerta ============ */
@@ -336,6 +344,13 @@ async function registrarFinanza(req, env) {
     creadoNombre:{stringValue:perfil.nombre||''},
     ts:{timestampValue:new Date().toISOString()},
   });
+
+  // Reactivación automática: solo cuando el ingreso es una Cuota con casa válida. No bloquea
+  // ni puede fallar la respuesta (ver comentario de intentarReactivarPorPago) — el ingreso ya
+  // quedó escrito arriba pase lo que pase aquí.
+  if (tipo === 'ingreso' && cat === 'Cuota' && casaCanon) {
+    await intentarReactivarPorPago(env, casaCanon);
+  }
 
   // FASE 7 — autocobro: un jefe-admin puede registrar el pago de SU PROPIA casa (es admin y
   // es casa a la vez). Es legítimo, pero no debe ser invisible: queda en la bitácora. Borrar
@@ -1323,7 +1338,22 @@ async function estadoCuentaFinanzas(req, env) {
   }
 
   const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagos });
-  return json({ ok:true, ...estado });
+
+  // avisoCorte: cuenta regresiva al corte automático por mora del día 5 (Hermosillo). null si
+  // ya está al corriente, ya está suspendida (avisar de algo que ya pasó no tiene caso), o
+  // faltan más de 72h. Si el corte ya pasó pero el cron todavía no corrió, horasRestantes:0
+  // (nunca negativo) — el aviso sigue siendo válido: puede pasar en cualquier momento.
+  let avisoCorte = null;
+  if (estado.adeudo > 0 && (jefe.estado || 'activo') !== 'suspendido') {
+    const ahora = ahoraHermosillo();
+    const corte = inicioDiaHermosilloUTC(ahora.getUTCFullYear(), ahora.getUTCMonth(), 5);
+    const horasHastaCorte = (corte.getTime() - Date.now()) / 3600000;
+    if (horasHastaCorte <= 72) {
+      avisoCorte = { horasRestantes: Math.max(0, Math.floor(horasHastaCorte)) };
+    }
+  }
+
+  return json({ ok:true, ...estado, avisoCorte });
 }
 
 /* ---- Núcleo del cálculo de adeudo acumulado (cuota mensual fija) — compartido por
@@ -1354,6 +1384,156 @@ function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa }) {
   const adeudo = Math.max(0, montoEsperado - montoPagado);
 
   return { cuotaMensual: cfg.cuotaMensual, mesesTranscurridos, montoEsperado, montoPagado, adeudo, alCorriente: adeudo === 0 };
+}
+
+/* ============ Suspensión automática por mora ============
+   aplicarSuspensionAutomatica(env, modo) — función interna, sin req/HTTP. La llaman DOS
+   caminos: el Cron Trigger diario (scheduled(), más abajo, siempre modo:'aplicar') y
+   /admin/probar-suspension-automatica (botón de prueba/emergencia para master, modo lo
+   decide quien llama). Ambos comparten exactamente esta lógica de cálculo.
+
+   modo:'simular' (default más seguro desde HTTP, ver probarSuspensionAutomatica) — recorre
+   el MISMO cálculo pero NO escribe absolutamente nada: ni suspende, ni resyncFamilia, ni
+   bitácora, ni ultimoMesProcesado. Es una foto de "quién se suspendería si corriera ahora",
+   consultable en cualquier momento del mes (no espera al día 5).
+
+   modo:'aplicar' — el comportamiento real. Corre TODOS los días pero solo actúa desde el
+   día 5 del mes en adelante (hora Hermosillo, ver ahoraHermosillo) y como máximo UNA VEZ
+   por mes: config/cobranza.ultimoMesProcesado ("YYYY-MM" en Hermosillo) lo marca. Así, si el
+   cron falla un día, se recupera solo al siguiente sin perder el mes ni volver a suspender
+   lo ya suspendido. ultimoMesProcesado NUNCA se expone via /config/cobranza (esa ruta solo
+   devuelve lo que da leerConfigCobranza, que no lo incluye) ni se toca desde la pantalla de
+   configuración existente.
+
+   Para cada jefe ACTIVO con adeudo > 0, reutiliza el MISMO núcleo de escritura que
+   /personas/suspender (estado:'suspendido', cascada a familiares activos con
+   suspendidoPor:'cascada', resyncFamilia) sumando motivoSuspension:'mora' — el campo
+   reservado (ver comentario junto a suspenderPersona) que distingue esta suspensión
+   automática de una manual de staff. Una suspensión manual (motivoSuspension ausente)
+   jamás se toca aquí: solo se suspende a quien está 'activo' hoy. */
+async function aplicarSuspensionAutomatica(env, modo = 'aplicar') {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const ahora = ahoraHermosillo();
+  const mesActual = `${ahora.getUTCFullYear()}-${String(ahora.getUTCMonth() + 1).padStart(2, '0')}`;
+
+  const rawCfgDoc = await getDoc(env, at, 'config/cobranza');
+  const ultimoMesProcesado = rawCfgDoc ? (readDoc(rawCfgDoc.fields).ultimoMesProcesado || null) : null;
+
+  // El tope de "una vez por mes, solo desde el día 5" es del comportamiento REAL. 'simular'
+  // es una consulta de solo lectura: siempre calcula, sin importar la fecha ni lo ya procesado.
+  if (modo === 'aplicar' && (ahora.getUTCDate() < 5 || ultimoMesProcesado === mesActual)) {
+    return { ok:true, modo, aplico:false, mesActual, ultimoMesProcesado, suspendidas:[] };
+  }
+
+  let cfg;
+  if (modo === 'aplicar') {
+    cfg = await leerConfigCobranza(env); // asegura que config/cobranza exista antes de actualizarlo
+  } else {
+    // 'simular' NUNCA escribe — ni siquiera sembrar config/cobranza si no existiera todavía.
+    // Arma cfg en memoria desde rawCfgDoc (ya leído arriba, un solo GET), con los mismos
+    // defaults que usa leerConfigCobranza, pero sin llamarla (esa sí siembra el doc si falta).
+    const raw = rawCfgDoc ? readDoc(rawCfgDoc.fields) : {};
+    cfg = {
+      cuotaMensual: typeof raw.cuotaMensual === 'number' ? raw.cuotaMensual : 350,
+      fechaInicioCobro: raw.fechaInicioCobro || new Date().toISOString(),
+    };
+  }
+
+  // Mismo recorrido único de "finanzas" que ya usa cobranzaFinanzas para armar el historial
+  // completo de pagos de Cuota por casa, en vez de repetirlo casa por casa.
+  const pagosPorCasa = new Map();
+  for (const doc of await firestoreList(env, 'finanzas')) {
+    const d = readDoc(doc.fields);
+    if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
+    const dn = normDomicilio(d.casa);
+    if (!pagosPorCasa.has(dn)) pagosPorCasa.set(dn, []);
+    pagosPorCasa.get(dn).push({ ts: d.ts, monto: d.monto || 0 });
+  }
+
+  const all = await personasList(env, at);
+  const suspendidas = [];
+  for (const jefe of all.filter(p => esJefe(p) && p.estado === 'activo')) {
+    const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(jefe.domicilioNorm) });
+    if (estado.adeudo <= 0) continue;
+
+    if (modo === 'aplicar') {
+      await firestoreActualizarCampos(env, `personas/${jefe.id}`, {
+        estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'individual'}, motivoSuspension:{stringValue:'mora'},
+      }, 'Persona');
+      for (const f of all.filter(x => x.jefeId === jefe.id && x.estado === 'activo')) {
+        await firestoreActualizarCampos(env, `personas/${f.id}`, {
+          estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'cascada'}, motivoSuspension:{stringValue:'mora'},
+        }, 'Persona');
+      }
+      await resyncFamilia(env, at, jefe.id, true);
+      await logBitacora(env, at, { uid:'sistema', nombre:
+        `Sistema suspendió a ${jefe.nombre}${jefe.domicilio ? ' ('+jefe.domicilio+')' : ''} por falta de pago — adeudo $${estado.adeudo}` });
+    }
+    suspendidas.push({ id: jefe.id, nombre: jefe.nombre, domicilio: jefe.domicilio, adeudo: estado.adeudo });
+  }
+
+  if (modo === 'aplicar') {
+    await firestoreActualizarCampos(env, 'config/cobranza', { ultimoMesProcesado:{stringValue:mesActual} }, 'Configuración de cobranza');
+  }
+  return { ok:true, modo, aplico: modo === 'aplicar', mesActual, ultimoMesProcesado, suspendidas };
+}
+
+/* Reactivación automática al pagar — la llama registrarFinanza justo después de escribir un
+   ingreso de categoría Cuota. Recalcula el adeudo de la casa YA incluyendo ese pago; si queda
+   al corriente Y la suspensión actual es por mora (motivoSuspension:'mora'), reactiva con el
+   MISMO núcleo que /personas/reactivar (cascada solo a familiares suspendidoPor:'cascada' Y
+   motivoSuspension:'mora'). Si está suspendida por cualquier otra razón (motivoSuspension
+   ausente = decisión manual de staff), no toca nada — ajeno a este flujo. Nunca lanza: es un
+   efecto secundario de mejor esfuerzo sobre un pago que ya se registró con éxito (mismo
+   criterio que notificarResidente). */
+async function intentarReactivarPorPago(env, casaCanon) {
+  try {
+    const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+    const domNorm = normDomicilio(casaCanon);
+    const all = await personasList(env, at);
+    const jefe = all.find(p => esJefe(p) && p.domicilioNorm === domNorm);
+    if (!jefe || jefe.estado !== 'suspendido' || jefe.motivoSuspension !== 'mora') return;
+
+    const cfg = await leerConfigCobranza(env);
+    const pagos = [];
+    for (const doc of await firestoreList(env, 'finanzas')) {
+      const d = readDoc(doc.fields);
+      if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa && normDomicilio(d.casa) === domNorm) {
+        pagos.push({ ts: d.ts, monto: d.monto || 0 });
+      }
+    }
+    const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagos });
+    if (estado.adeudo > 0) return;
+
+    await firestoreActualizarCampos(env, `personas/${jefe.id}`, {
+      estado:{stringValue:'activo'}, suspendidoPor:{nullValue:null}, motivoSuspension:{nullValue:null},
+    }, 'Persona');
+    for (const f of all.filter(x => x.jefeId === jefe.id && x.estado === 'suspendido' && x.suspendidoPor === 'cascada' && x.motivoSuspension === 'mora')) {
+      await firestoreActualizarCampos(env, `personas/${f.id}`, {
+        estado:{stringValue:'activo'}, suspendidoPor:{nullValue:null}, motivoSuspension:{nullValue:null},
+      }, 'Persona');
+    }
+    await resyncFamilia(env, at, jefe.id, true);
+    await logBitacora(env, at, { uid:'sistema', nombre:
+      `Sistema reactivó a ${jefe.nombre}${jefe.domicilio ? ' ('+jefe.domicilio+')' : ''} tras registrar pago que salda su adeudo` });
+  } catch (e) {
+    console.error('intentarReactivarPorPago', e);
+  }
+}
+
+/* ============ /admin/probar-suspension-automatica — SOLO master ============
+   Ejecuta aplicarSuspensionAutomatica(env, modo) bajo demanda: sirve para probar la lógica
+   completa sin esperar al día 5 real ni depender del Cron Trigger, y queda permanente como
+   botón de emergencia si el cron real llegara a fallar un mes.
+   Seguridad por default: cualquier `modo` que NO sea exactamente 'aplicar' (ausente,
+   'simular', typo, lo que sea) se trata como 'simular' — nunca escribe nada por accidente. */
+async function probarSuspensionAutomatica(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master ejecuta esto');
+  const { modo } = await req.json();
+  const resumen = await aplicarSuspensionAutomatica(env, modo === 'aplicar' ? 'aplicar' : 'simular');
+  return json(resumen);
 }
 
 /* ============ /config/cobranza — cualquier usuario autenticado lee la cuota vigente ============ */
