@@ -1615,7 +1615,7 @@ async function intentarReactivarPorPago(env, casaCanon) {
   }
 }
 
-/* ============ /admin/probar-suspension-automatica — SOLO master ============
+/* ============ /admin/probar-suspension-automatica — staff (master/admin/jefe-admin) ============
    Ejecuta aplicarSuspensionAutomatica(env, modo) bajo demanda: sirve para probar la lógica
    completa sin esperar al día 5 real ni depender del Cron Trigger, y queda permanente como
    botón de emergencia si el cron real llegara a fallar un mes.
@@ -1624,7 +1624,7 @@ async function intentarReactivarPorPago(env, casaCanon) {
 async function probarSuspensionAutomatica(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master ejecuta esto');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff ejecuta esto');
   const { modo } = await req.json();
   const resumen = await aplicarSuspensionAutomatica(env, modo === 'aplicar' ? 'aplicar' : 'simular');
   return json(resumen);
@@ -1637,16 +1637,21 @@ async function obtenerConfigCobranza(req, env) {
   return json({ ok:true, ...cfg });
 }
 
-/* ============ /config/cobranza-actualizar — SOLO master ============
-   Permite mover cuotaMensual, fechaInicioCobro y/o linkPago sin tocar código — p.ej. resetear
-   fechaInicioCobro a "hoy" el día que arranque la cobranza real con el cliente, o pegar el
-   link de Prosepago en cuanto exista. */
+/* ============ /config/cobranza-actualizar — staff para cuota/fecha, SOLO master para linkPago
+   Gating POR CAMPO, no por endpoint: cuotaMensual y fechaInicioCobro son operación del día a
+   día (permite staff: master/admin/jefe-admin) — p.ej. resetear fechaInicioCobro a "hoy" el
+   día que arranque la cobranza real. linkPago (a dónde apunta el cobro de Prosepago) es lo más
+   sensible del endpoint, así que exige master explícitamente: si la petición INCLUYE linkPago
+   (aunque sea el mismo valor ya guardado) y quien llama no es master, se rechaza con 403 antes
+   de tocar nada — un admin no puede cambiarlo ni de rebote mandando el payload completo. */
 async function actualizarConfigCobranza(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master edita la configuración de cobranza');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff edita la configuración de cobranza');
 
   const { cuotaMensual, fechaInicioCobro, linkPago } = await req.json();
+  if (linkPago !== undefined && perfil.rol !== 'master') throw httpErr(403, 'Solo master edita el link de pago');
+
   const fields = {};
   if (cuotaMensual !== undefined) {
     const c = Number(cuotaMensual);

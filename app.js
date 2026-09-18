@@ -225,11 +225,14 @@ function buildTabs(){
   $$('.tabpane').forEach(p => p.classList.add('hidden'));
   $('#tab-'+tabs[0].id).classList.remove('hidden');
   if (isStaff) loadPersonas();
-  // Configuración de cobranza y suspensión automática: SOLO master (ni admin puro ni
-  // jefe-admin las ven ni las tocan).
-  $('#cobranzaConfigSection').classList.toggle('hidden', ME.rol !== 'master');
-  $('#susAutoSection').classList.toggle('hidden', ME.rol !== 'master');
-  if (ME.rol === 'master') cargarConfigCobranza();
+  // Configuración de cobranza (cuota/fecha) y suspensión automática: cualquier staff
+  // (master/admin/jefe-admin) — el Worker revalida esStaff() en ambos endpoints.
+  // El campo de link de pago dentro de cobranzaConfigSection sigue siendo SOLO master
+  // (ver #ccLinkField más abajo): el Worker rechaza linkPago si quien llama no es master.
+  $('#cobranzaConfigSection').classList.toggle('hidden', !isStaff);
+  $('#susAutoSection').classList.toggle('hidden', !isStaff);
+  $('#ccLinkField').classList.toggle('hidden', ME.rol !== 'master');
+  if (isStaff) cargarConfigCobranza();
 }
 
 /* Jefe de familia = residente sin jefeId (es la CASA). Los familiares (residente CON jefeId)
@@ -622,10 +625,11 @@ async function refrescarPersonas(){
 }
 async function loadPersonas(){ await refrescarPersonas(); }
 
-/* ====================== CONFIGURACIÓN DE COBRANZA (SOLO master) ======================
-   Pantalla nueva en Gestión que solo LLAMA a /config/cobranza (leer) y
-   /config/cobranza-actualizar (escribir) — ambos ya existentes y ya validados en el Worker.
-   No agrega ninguna lógica de negocio nueva; solo la pinta y la envía. */
+/* ====================== CONFIGURACIÓN DE COBRANZA (cuota/fecha: staff · link: SOLO master) ==
+   Pantalla en Gestión que solo LLAMA a /config/cobranza (leer) y /config/cobranza-actualizar
+   (escribir) — ambos ya existentes y ya validados en el Worker. No agrega ninguna lógica de
+   negocio nueva; solo la pinta y la envía. El campo de link de pago (#ccLinkField) se oculta
+   y se omite del payload para quien no sea master — el Worker lo rechaza de todos modos. */
 let ccFechaOriginal = '';   // YYYY-MM-DD tal como llegó del servidor, para detectar cambios reales
 
 async function cargarConfigCobranza(){
@@ -667,11 +671,12 @@ $('#ccGuardarBtn')?.addEventListener('click', async () => {
   try {
     // linkPago debe empezar con "https://" — el Worker lo rechaza con 400 si no (o si sobra
     // algo raro); aquí no se duplica esa validación, solo se muestra el error que regrese.
-    const cfg = await authedFetch('/config/cobranza-actualizar', {
-      cuotaMensual: Number(cuota),
-      fechaInicioCobro: fecha,
-      linkPago: link,
-    });
+    // linkPago SOLO se manda si eres master: el Worker rechaza con 403 cualquier payload que
+    // lo incluya viniendo de admin/jefe-admin, así que ni se intenta (evita un 403 al guardar
+    // cuota/fecha, que sí les toca).
+    const payload = { cuotaMensual: Number(cuota), fechaInicioCobro: fecha };
+    if (ME.rol === 'master') payload.linkPago = link;
+    const cfg = await authedFetch('/config/cobranza-actualizar', payload);
     toast('Configuración de cobranza guardada', 'ok');
     ccFechaOriginal = (cfg.fechaInicioCobro || '').slice(0, 10);
     $('#ccFechaActual').textContent = cfg.fechaInicioCobro
@@ -685,10 +690,10 @@ $('#ccGuardarBtn')?.addEventListener('click', async () => {
   }
 });
 
-/* ====================== SUSPENSIÓN AUTOMÁTICA POR MORA (SOLO master) ======================
+/* ====================== SUSPENSIÓN AUTOMÁTICA POR MORA (staff: master/admin/jefe-admin) ======
    "Simular" y "Aplicar de verdad" llaman al MISMO endpoint (/admin/probar-suspension-
    automatica) con distinto `modo` — el Worker decide qué escribe o no; aquí solo se pinta
-   el resumen que regresa. Nunca se llama sola: siempre es un clic del master. */
+   el resumen que regresa. Nunca se llama sola: siempre es un clic de staff. */
 function renderResumenSuspension(r){
   const el = $('#susResultado');
   if (!r.suspendidas || !r.suspendidas.length){

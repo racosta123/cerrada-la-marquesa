@@ -500,7 +500,7 @@
     <div class="field"><input id="personaSearch" placeholder="Buscar por nombre, domicilio o teléfono…"></div>
     <div class="list" id="personasList"><div class="empty">Cargando…</div></div>
 
-    <!-- Configuración de cobranza — SOLO master (ni admin puro ni jefe-admin la ven) -->
+    <!-- Configuración de cobranza — cuota/fecha: staff (master/admin/jefe-admin). Link de pago: SOLO master (#ccLinkField, oculto al resto) -->
     <div id="cobranzaConfigSection" class="hidden">
       <div class="section-title">Configuración de cobranza</div>
       <div class="field">
@@ -515,7 +515,7 @@
       <div id="ccWarnFecha" class="vbanner hidden" style="margin:10px 0 0">
         ⚠️ Cambiar esta fecha resetea el conteo de adeudo de <b>TODAS</b> las casas. Úsalo solo al arrancar la cobranza real.
       </div>
-      <div class="field" style="margin-top:14px">
+      <div class="field hidden" id="ccLinkField" style="margin-top:14px">
         <label>Link de pago (Prosepago)</label>
         <input id="ccLink" type="url" placeholder="https://…">
       </div>
