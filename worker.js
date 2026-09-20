@@ -160,7 +160,6 @@ async function crearInvitacion(req, env) {
   const perfil = await getPerfil(env, user.uid);
   if (!perfil || !['residente','esclavo'].includes(perfil.rol))
     throw httpErr(403, 'Solo residentes pueden invitar');
-
   // Un residente suspendido (por mora) no puede invitar; tampoco sus esclavos. Misma comprobación
   // que /abrir (titular y, si es esclavo, también el titular padre), sin excepción de puertas.
   if (perfil.suspendido) throw httpErr(403, 'Residente suspendido por mora');
@@ -249,14 +248,16 @@ async function consumirInvitacion(env, inv, readerId, metodo) {
   let nombreLog = inv.visitante;
   if (reader.direccion === 'entrada') {
     if (inv.usosRestantes !== null && inv.usosRestantes <= 0) throw httpErr(403, 'Sin usos disponibles');
-    if (inv.dentro === true) nombreLog = `${inv.visitante} volvió a entrar sin salida previa registrada — revisar`;
-    const fields = { dentro: { booleanValue: true } };
-    const mask = ['dentro'];
     if (inv.usosRestantes !== null) {
-      fields.usosRestantes = { integerValue: String(inv.usosRestantes - 1) };
-      mask.push('usosRestantes');
+      // Con usos limitados el descuento es ATÓMICO: se relee, se revalida y se descuenta 1 dentro de
+      // una transacción (bajo N consumos simultáneos de K usos entran exactamente K). `inv` pasa a
+      // llevar el valor de "dentro" leído en la transacción.
+      inv = await reservarUsoInvitacion(env, inv);
+      if (inv.dentro === true) nombreLog = `${inv.visitante} volvió a entrar sin salida previa registrada — revisar`;
+    } else {
+      if (inv.dentro === true) nombreLog = `${inv.visitante} volvió a entrar sin salida previa registrada — revisar`;
+      await firestoreUpdate(env, `invitaciones/${inv.id}`, { dentro: { booleanValue: true } }, ['dentro']);
     }
-    await firestoreUpdate(env, `invitaciones/${inv.id}`, fields, mask);
   } else {
     if (inv.dentro === false) nombreLog = `${inv.visitante} salió sin entrada previa registrada — revisar`;
     await firestoreUpdate(env, `invitaciones/${inv.id}`, { dentro: { booleanValue: false } }, ['dentro']);
@@ -274,6 +275,37 @@ async function consumirInvitacion(env, inv, readerId, metodo) {
   await logApertura(env, { uid: metodo, nombre: nombreLog, puerta: reader.puerta, hogar: inv.hogar, tipo: reader.direccion });
   await notificarResidente(env, inv.hogar,
     `Visita ${inv.visitante} ${reader.direccion === 'entrada' ? 'entró' : 'salió'} por ${reader.puerta}`);
+}
+
+/* Reserva ATÓMICA de un uso (entrada con usos limitados). Transacción de Firestore REST (los
+   mismos helpers conTx/txGet/txCommit de votaciones): lee la invitación y al anfitrión, revalida
+   (activa, vigente, anfitrión no suspendido, usos > 0 — mismos mensajes 403 de siempre), y descuenta
+   exactamente 1 uso + dentro:true en el mismo commit. Si otra petición modificó el documento entre
+   la lectura y el commit, Firestore aborta y se reintenta (relee y revalida): bajo N consumos
+   simultáneos de K usos entran exactamente K; el resto ve 0 y recibe 403 "Sin usos disponibles".
+   Devuelve la invitación con el "dentro" previo leído en la transacción (para logs y devolución). */
+async function reservarUsoInvitacion(env, inv) {
+  const docName = `projects/${env.FIREBASE_PROJECT}/databases/(default)/documents/invitaciones/${inv.id}`;
+  let intento = 0;
+  const fresca = await conTx(env, async (at, tx) => {
+    if (intento++ > 0) await new Promise(r => setTimeout(r, 20 + Math.random() * 60));   // jitter entre reintentos
+    const doc = await txGet(env, at, `invitaciones/${inv.id}`, tx);
+    const cur = doc ? readDoc(doc.fields) : null;
+    if (!cur || !cur.activa) throw httpErr(403, 'Invitación inválida o cancelada');
+    if (!cur.expira || new Date(cur.expira).getTime() < Date.now()) throw httpErr(403, 'Invitación expirada');
+    const ad = await txGet(env, at, `usuarios/${cur.hogar}`, tx);
+    if (ad && readDoc(ad.fields)?.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
+    if (cur.usosRestantes !== null && cur.usosRestantes <= 0) throw httpErr(403, 'Sin usos disponibles');
+    return {
+      value: cur,
+      writes: [{
+        update: { name: docName, fields: { dentro: { booleanValue: true } } },
+        updateMask: { fieldPaths: ['dentro'] },
+        updateTransforms: [{ fieldPath: 'usosRestantes', increment: { integerValue: '-1' } }],
+      }],
+    };
+  }, 10);   // 10 intentos: con ≤8 usos, un contendiente pierde como mucho 8 rondas antes de ver 0
+  return { ...inv, ...fresca, id: inv.id };
 }
 
 /* Deshace la reserva de consumirInvitacion cuando el pulso a Shelly falló. Cada petición
