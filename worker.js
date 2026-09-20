@@ -2468,14 +2468,22 @@ async function verifyIdTokenInterno(token, env) {
 
 async function getGooglePublicKey(kid) {
   if (!JWKS_CACHE.keys || Date.now() > JWKS_CACHE.exp) {
+    let motivo = 'error de red o JSON ilegible';
     try {
       const r = await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com');
+      // Solo se usa/cachea una respuesta EXITOSA con el formato esperado (objeto con al menos un
+      // certificado PEM). Si no, NO se cachea (la caché no se envenena) y el siguiente intento reintenta.
+      if (!r.ok) { motivo = `HTTP ${r.status}`; throw new Error(motivo); }
       const certs = await r.json();
-      const maxAge = +(r.headers.get('cache-control')||'').match(/max-age=(d+)/)?.[1] || 3600;
+      const esObjeto = certs !== null && typeof certs === 'object' && !Array.isArray(certs);
+      if (!esObjeto || !Object.values(certs).some(v => typeof v === 'string' && v.includes('BEGIN CERTIFICATE'))) {
+        motivo = 'formato inesperado (sin certificados)'; throw new Error(motivo);
+      }
+      const maxAge = +(r.headers.get('cache-control')||'').match(/max-age=(\d+)/)?.[1] || 3600;
       JWKS_CACHE = { keys: certs, exp: Date.now() + maxAge*1000 };
     } catch (e) {
-      // Falla de infraestructura (no del token): mensaje fijo, sin el texto de la excepción.
-      console.error('[auth] no se pudieron obtener los certificados de Google:', e && e.name);
+      // Falla de infraestructura (no del token): mensaje fijo al cliente; el detalle va al log.
+      console.error('[auth] no se pudieron obtener certificados válidos de Google:', motivo, e && e.name);
       throw httpErr(503, 'Autenticación no disponible, reintenta');
     }
   }
