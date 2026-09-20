@@ -11,6 +11,9 @@
      QR_SECRET            secreto para firmar/verificar tokens de QR
    Vars (wrangler.toml [vars]):
      ALLOWED_ORIGIN       https://racosta123.github.io
+     SHELLY_MIN_SPACING_MS / SHELLY_RETRY_DELAY_MS / SHELLY_MAX_QUEUE_WAIT_MS /
+     SHELLY_DEDUPE_WINDOW_MS / SHELLY_CALL_TIMEOUT_MS   ajustes del portero de fila (ver ShellyGate más abajo)
+   Durable Object: SHELLY_GATE (clase ShellyGate) — toda llamada a Shelly Cloud pasa por él.
    =========================================================== */
 
 // Cada acceso es un Shelly físico independiente, controlado por Shelly Cloud (internet).
@@ -126,7 +129,7 @@ export default {
 async function abrir(req, env) {
   const user = await requireAuth(req, env);
   const { puerta } = await req.json();
-  if (!(puerta in DEVICES)) throw httpErr(400, 'Puerta no válida');
+  if (!Object.hasOwn(DEVICES, puerta)) throw httpErr(400, 'Puerta no válida');   // hasOwn: 'constructor'/'toString' no pasan
 
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
@@ -222,8 +225,8 @@ async function crearInvitacion(req, env) {
    salida: NO descuenta usosRestantes (salir es gratis); marca dentro:false. Si ya estaba
    dentro:false, mismo criterio: se deja pasar, pero se marca "revisar". */
 async function consumirInvitacion(env, inv, readerId, metodo) {
+  if (!Object.hasOwn(READERS, readerId)) throw httpErr(400, 'Lector desconocido');
   const reader = READERS[readerId];
-  if (!reader) throw httpErr(400, 'Lector desconocido');
 
   if (!inv.activa) throw httpErr(403, 'Invitación inválida o cancelada');
   // Expiración: se compara contra el DOCUMENTO (el token/PIN ya no la llevan).
@@ -248,10 +251,44 @@ async function consumirInvitacion(env, inv, readerId, metodo) {
     await firestoreUpdate(env, `invitaciones/${inv.id}`, { dentro: { booleanValue: false } }, ['dentro']);
   }
 
-  await triggerShelly(env, DEVICES[reader.puerta]);
+  // El uso y "dentro" arriba son una RESERVA: si el pulso falla (502 Shelly/red, 503 fila llena…)
+  // se deshace para ESTA petición, así un acceso fallido nunca quema un uso ni deja una
+  // entrada/salida fantasma. El error original se relanza intacto (mismo contrato).
+  try {
+    await triggerShelly(env, DEVICES[reader.puerta]);
+  } catch (e) {
+    await devolverReservaInvitacion(env, inv, reader.direccion === 'entrada' && inv.usosRestantes !== null);
+    throw e;
+  }
   await logApertura(env, { uid: metodo, nombre: nombreLog, puerta: reader.puerta, hogar: inv.hogar, tipo: reader.direccion });
   await notificarResidente(env, inv.hogar,
     `Visita ${inv.visitante} ${reader.direccion === 'entrada' ? 'entró' : 'salió'} por ${reader.puerta}`);
+}
+
+/* Deshace la reserva de consumirInvitacion cuando el pulso a Shelly falló. Cada petición
+   devuelve SU propio uso con un incremento ATÓMICO (+1, updateTransforms) — no reescribe un
+   valor absoluto, así no pisa el descuento de otra petición concurrente sobre la misma
+   invitación. `dentro` vuelve a su valor previo (si se conocía). Best-effort: si la devolución
+   misma falla se deja registro (sin datos sensibles) y el error original del pulso se conserva. */
+async function devolverReservaInvitacion(env, inv, devolverUso) {
+  try {
+    const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+    const base = `projects/${env.FIREBASE_PROJECT}/databases/(default)`;
+    const write = { update: { name: `${base}/documents/invitaciones/${inv.id}`, fields: {} }, updateMask: { fieldPaths: [] } };
+    if (typeof inv.dentro === 'boolean') {
+      write.update.fields.dentro = { booleanValue: inv.dentro };
+      write.updateMask.fieldPaths.push('dentro');
+    }
+    if (devolverUso) write.updateTransforms = [{ fieldPath: 'usosRestantes', increment: { integerValue: '1' } }];
+    if (!write.updateMask.fieldPaths.length && !write.updateTransforms) return;
+    const r = await fetch(`https://firestore.googleapis.com/v1/${base}/documents:commit`, {
+      method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ writes: [write] }),
+    });
+    if (!r.ok) console.error(`[shelly-gate] no se pudo devolver la reserva de la invitación (HTTP ${r.status})`);
+  } catch (e) {
+    console.error('[shelly-gate] no se pudo devolver la reserva de la invitación');
+  }
 }
 
 /* ============ /validar-qr — lo llama el LECTOR físico al escanear ============
@@ -287,7 +324,7 @@ async function validarPin(req, env) {
   if (!pin || typeof pin !== 'string') throw httpErr(400, 'Falta el PIN');
   // Se valida el lector ANTES de tocar controlPin/{readerId}: un readerId desconocido no debe
   // crear ni leer ningún documento de candado.
-  if (!READERS[readerId]) throw httpErr(400, 'Lector desconocido');
+  if (!Object.hasOwn(READERS, readerId)) throw httpErr(400, 'Lector desconocido');
 
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
 
@@ -1735,23 +1772,176 @@ async function crearUsuario(req, env) {
 /* ===========================================================
    SHELLY
    =========================================================== */
+/* Único punto de salida hacia Shelly Cloud (lo usan /abrir y consumirInvitacion). NO llama a
+   Shelly directamente: entrega la orden al Durable Object "shelly-gate" (una sola instancia
+   global), que serializa y espacia TODAS las llamadas de la cuenta (el límite de Shelly Cloud
+   es ~1 req/s por Cloud Key, compartido por todas las puertas). Mismo contrato de errores que
+   antes: falla => httpErr(status, mensaje) => {error} con ese status. */
 async function triggerShelly(env, deviceId) {
-  // Shelly CLOUD Control API (por internet, no IP local).
-  // Cada acceso es un dispositivo Shelly propio (deviceId), no un canal compartido.
-  // Un solo "turn=on": igual que antes, sin apagado explícito desde el Worker —
-  // el pulso lo maneja el auto-off configurado en el propio Shelly.
-  const body = new URLSearchParams({
-    id: deviceId,
-    channel: '0',
-    turn: 'on',
-    auth_key: env.SHELLY_AUTH_KEY,
-  });
-  const r = await fetch(`${env.SHELLY_HOST}/device/relay/control`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body,
-  });
-  if (!r.ok) throw httpErr(502, 'La cerradura no respondió');
+  if (!env.SHELLY_GATE) throw httpErr(500, 'Portero de fila no configurado');
+  const label = Object.keys(DEVICES).find(k => DEVICES[k] === deviceId) || 'desconocida'; // solo para logs
+  let out = null;
+  try {
+    const stub = env.SHELLY_GATE.get(env.SHELLY_GATE.idFromName(SHELLY_GATE_NAME));
+    const r = await stub.fetch('https://shelly-gate/abrir', {
+      method: 'POST',
+      body: JSON.stringify({ deviceId, label }),
+    });
+    out = await r.json();
+  } catch (e) { /* DO inalcanzable o respuesta ilegible => mismo error que "no respondió" */ }
+  if (!out || out.ok !== true) throw httpErr(out?.status || 502, out?.error || 'La cerradura no respondió');
+}
+
+/* ===========================================================
+   ShellyGate — Durable Object "portero de fila" (UNA instancia global, nombre fijo).
+   - Cola FIFO en memoria; UNA llamada real a Shelly a la vez.
+   - Espaciado mínimo entre llamadas reales (SHELLY_MIN_SPACING_MS, contado desde que TERMINA la llamada
+     anterior hasta que EMPIEZA la siguiente, así la llegada a Shelly siempre queda espaciada).
+   - Si Shelly responde max_req / 429 => UN reintento tras SHELLY_RETRY_DELAY_MS; si falla otra
+     vez => 502 "La cerradura no respondió" (igual que antes).
+   - Tope de espera en fila (SHELLY_MAX_QUEUE_WAIT_MS): pasado ese tiempo sin llegarle el turno
+     se responde 503 controlado (la app muestra el mensaje) y NO se llama a Shelly.
+   - Dedupe: misma puerta dentro de SHELLY_DEDUPE_WINDOW_MS Y mientras la primera petición siga
+     EN COLA (pulso aún no enviado) => se junta con ella (comparten resultado, una sola llamada
+     real). Si el pulso ya salió, la petición nueva genera su propio pulso.
+   - Lee SHELLY_HOST / SHELLY_AUTH_KEY de SU env (secrets del Worker). Jamás los devuelve ni los
+     escribe en logs; los logs solo llevan el nombre de la puerta ("residentes"…), nunca el
+     deviceId, ni la llave, ni el cuerpo de la respuesta de Shelly.
+   Los valores se ajustan en wrangler.toml [vars]; los números de abajo son solo el respaldo.
+   =========================================================== */
+const SHELLY_GATE_NAME = 'shelly-gate';
+const SHELLY_DEFAULTS = {
+  SHELLY_MIN_SPACING_MS:    1200,   // separación mínima entre llamadas reales a Shelly
+  SHELLY_RETRY_DELAY_MS:    1500,   // pausa antes del único reintento por max_req / 429
+  SHELLY_CALL_TIMEOUT_MS:   8000,   // tope de UNA llamada a Shelly; al vencer se aborta => 502
+  SHELLY_MAX_QUEUE_WAIT_MS: 20000,  // tope de espera en fila antes de responder "reintenta"
+  SHELLY_DEDUPE_WINDOW_MS:  2000,   // ventana para juntar el mismo "abrir" a la misma puerta
+};
+const shellySleep = ms => new Promise(r => setTimeout(r, ms));
+
+export class ShellyGate {
+  constructor(state, env) {
+    this.env = env;
+    this.queue = [];          // trabajos esperando turno (FIFO)
+    this.running = false;     // hay un drain() activo
+    this.lastCallAt = 0;      // FIN de la última llamada real a Shelly
+    this.recent = new Map();  // deviceId -> { at, job } (dedupe; solo une jobs aún en cola)
+  }
+
+  cfg(name) {
+    const v = Number(this.env[name]);
+    return Number.isFinite(v) && v >= 0 ? v : SHELLY_DEFAULTS[name];
+  }
+
+  async fetch(req) {
+    let deviceId, label;
+    try { ({ deviceId, label } = await req.json()); } catch (e) {}
+    if (typeof deviceId !== 'string' || !deviceId) return json({ ok:false, status:400, error:'Puerta no válida' });
+    return json(await this.enqueue(deviceId, String(label || 'desconocida')));
+  }
+
+  enqueue(deviceId, label) {
+    const now = Date.now();
+    const dedupeMs = this.cfg('SHELLY_DEDUPE_WINDOW_MS');
+    for (const [k, v] of this.recent) if (now - v.at >= dedupeMs) this.recent.delete(k);
+    // Solo se une a un pulso que AÚN NO sale (job en cola). Si ya se disparó, esta petición
+    // genera su propio pulso, espaciado como cualquier otro.
+    const dup = this.recent.get(deviceId);
+    if (dup && !dup.job.started) { console.log(`[shelly-gate] dedupe puerta=${label}`); return dup.job.promise; }
+
+    const job = { deviceId, label, at: now, started: false };
+    job.promise = new Promise(resolve => { job.resolve = resolve; });
+    this.recent.set(deviceId, { at: now, job });
+
+    job.timer = setTimeout(() => {
+      if (job.started) return;
+      const i = this.queue.indexOf(job);
+      if (i >= 0) this.queue.splice(i, 1);
+      console.warn(`[shelly-gate] TIMEOUT en fila puerta=${label} esperó>=${this.cfg('SHELLY_MAX_QUEUE_WAIT_MS')}ms en_fila=${this.queue.length}`);
+      this.finish(job, { ok:false, status:503, error:'La cerradura está muy ocupada en este momento, reintenta en unos segundos' });
+    }, this.cfg('SHELLY_MAX_QUEUE_WAIT_MS'));
+
+    this.queue.push(job);
+    if (!this.running) { this.running = true; this.drain(); }
+    return job.promise;
+  }
+
+  finish(job, result) {
+    // Un fallo no se junta con reintentos posteriores: el siguiente intento es una llamada nueva.
+    if (!result.ok && this.recent.get(job.deviceId)?.job === job) this.recent.delete(job.deviceId);
+    job.resolve(result);
+  }
+
+  async drain() {
+    try {
+      while (this.queue.length) {
+        const wait = this.lastCallAt + this.cfg('SHELLY_MIN_SPACING_MS') - Date.now();
+        if (wait > 0) { await shellySleep(wait); continue; }  // re-evalúa: la cola pudo cambiar (timeouts)
+        const job = this.queue.shift();
+        job.started = true;
+        clearTimeout(job.timer);
+        console.log(`[shelly-gate] llamada puerta=${job.label} espera_en_fila=${Date.now() - job.at}ms restantes=${this.queue.length}`);
+        let result;
+        try { result = await this.callShelly(job); }
+        catch (e) { result = { ok:false, status:502, error:'La cerradura no respondió' }; }
+        this.finish(job, result);
+      }
+    } finally {
+      this.running = false;
+    }
+  }
+
+  async callShelly(job) {
+    // Shelly CLOUD Control API (por internet, no IP local).
+    // Cada acceso es un dispositivo Shelly propio (deviceId), no un canal compartido.
+    // Un solo "turn=on": igual que antes, sin apagado explícito desde el Worker —
+    // el pulso lo maneja el auto-off configurado en el propio Shelly.
+    const fail = { ok:false, status:502, error:'La cerradura no respondió' };
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      if (attempt === 2) await shellySleep(this.cfg('SHELLY_RETRY_DELAY_MS'));
+      const body = new URLSearchParams({
+        id: job.deviceId,
+        channel: '0',
+        turn: 'on',
+        auth_key: this.env.SHELLY_AUTH_KEY,
+      });
+      // Timeout de la llamada (respuesta completa incluida): una llamada colgada se ABORTA y cuenta
+      // como fallo normal (502, sin reintento — el pulso pudo haber llegado, reintentar arriesga un
+      // doble pulso), así la fila nunca queda trabada. 0 = sin timeout.
+      const ctrl = new AbortController();
+      const timeoutMs = this.cfg('SHELLY_CALL_TIMEOUT_MS');
+      const timer = timeoutMs > 0 ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
+      let r, txt = '';
+      try {
+        r = await fetch(`${this.env.SHELLY_HOST}/device/relay/control`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body,
+          signal: ctrl.signal,
+        });
+        txt = await r.text().catch(() => '');
+      } catch (e) {
+        if (ctrl.signal.aborted) console.warn(`[shelly-gate] TIMEOUT de llamada a Shelly puerta=${job.label} intento=${attempt} tras ${timeoutMs}ms`);
+        else console.warn(`[shelly-gate] error de red puerta=${job.label} intento=${attempt}`);
+        return fail;
+      } finally {
+        clearTimeout(timer);
+        // El espaciado corre desde que TERMINA esta llamada (fin -> inicio de la siguiente): la
+        // petición llegó a Shelly antes de que respondiera, así que la siguiente llegará al menos
+        // SHELLY_MIN_SPACING_MS después, sin importar latencia ni conexión fría.
+        this.lastCallAt = Date.now();
+      }
+      const limitado = r.status === 429 || /max_req/i.test(txt);
+      if (r.ok && !limitado) return { ok:true };
+      if (limitado && attempt === 1) {
+        console.warn(`[shelly-gate] max_req/429 de Shelly puerta=${job.label} status=${r.status}; reintento en ${this.cfg('SHELLY_RETRY_DELAY_MS')}ms`);
+        continue;
+      }
+      console.warn(`[shelly-gate] Shelly falló puerta=${job.label} status=${r.status} intento=${attempt}`);
+      return fail;
+    }
+    return fail;
+  }
 }
 
 /* ===========================================================
