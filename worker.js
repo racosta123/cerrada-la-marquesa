@@ -161,7 +161,18 @@ async function crearInvitacion(req, env) {
   if (!perfil || !['residente','esclavo'].includes(perfil.rol))
     throw httpErr(403, 'Solo residentes pueden invitar');
 
-  const { visitante, horas, usos, hogar } = await req.json();
+  // Un residente suspendido (por mora) no puede invitar; tampoco sus esclavos. Misma comprobación
+  // que /abrir (titular y, si es esclavo, también el titular padre), sin excepción de puertas.
+  if (perfil.suspendido) throw httpErr(403, 'Residente suspendido por mora');
+  if (perfil.rol === 'esclavo' && perfil.residenteUid) {
+    const padre = await getPerfil(env, perfil.residenteUid);
+    if (padre && padre.suspendido) throw httpErr(403, 'Residente del hogar suspendido por mora');
+  }
+
+  // El hogar SIEMPRE sale del perfil verificado en el servidor (mismo cálculo que /abrir): el de
+  // un esclavo es el de su titular. Se IGNORA cualquier "hogar" que mande el cliente en el cuerpo.
+  const hogar = perfil.rol === 'residente' ? user.uid : (perfil.residenteUid || user.uid);
+  const { visitante, horas, usos } = await req.json();
   if (!visitante) throw httpErr(400, 'Falta el nombre del visitante');
 
   // Usos: entero 1..8, sin excepciones. Se RECHAZA lo inválido (0 = ilimitado ya no existe,
@@ -192,7 +203,7 @@ async function crearInvitacion(req, env) {
   // el valor en claro: quien lea el documento no puede reconstruir el QR ni el PIN.
   await firestoreSet(env, `invitaciones/${jti}`, {
     visitante: { stringValue: visitante },
-    hogar: { stringValue: hogar || user.uid },
+    hogar: { stringValue: hogar },
     creadaPor: { stringValue: user.uid },
     expira: { timestampValue: new Date(expira).toISOString() },
     usosRestantes: { integerValue: String(usos) },   // ya validado: entero 1..8, nunca 0/ilimitado
