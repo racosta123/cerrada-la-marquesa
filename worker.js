@@ -2415,35 +2415,74 @@ async function requireAuth(req, env) {
   return verifyIdToken(token, env);
 }
 
+/* Validación del ID token. Contrato de errores: TODO token inválido responde 401 con un mensaje
+   fijo y genérico — nunca un 500 ni el texto de una excepción interna. Las excepciones inesperadas
+   se registran (solo el nombre, sin token ni secretos) y se responden 401 "No autorizado". */
 async function verifyIdToken(token, env) {
-  const [h, p, s] = token.split('.');
-  if (!h || !p || !s) throw httpErr(401, 'Token malformado');
-  const header = JSON.parse(b64urlToStr(h));
-  const claims = JSON.parse(b64urlToStr(p));
+  try {
+    return await verifyIdTokenInterno(token, env);
+  } catch (e) {
+    if (e && e.status) throw e;   // httpErr controlado: ya lleva su mensaje fijo
+    console.error('[auth] excepción inesperada al validar el token:', e && e.name);
+    throw httpErr(401, 'No autorizado');
+  }
+}
+
+async function verifyIdTokenInterno(token, env) {
+  // Parseo defensivo: 3 partes, base64url válido y JSON de objeto; si no, 401 (no una excepción => 500).
+  let h, p, s, header, claims;
+  try {
+    const partes = token.split('.');
+    if (partes.length !== 3) throw new Error('partes');
+    [h, p, s] = partes;
+    if (!h || !p || !s) throw new Error('vacío');
+    header = JSON.parse(b64urlToStr(h));
+    claims = JSON.parse(b64urlToStr(p));
+    const esObjeto = o => o !== null && typeof o === 'object' && !Array.isArray(o);
+    if (!esObjeto(header) || !esObjeto(claims)) throw new Error('no-objeto');
+  } catch (e) {
+    throw httpErr(401, 'Token malformado');
+  }
 
   const proj = env.FIREBASE_PROJECT;
   if (claims.aud !== proj) throw httpErr(401, 'aud inválido');
   if (claims.iss !== `https://securetoken.google.com/${proj}`) throw httpErr(401, 'iss inválido');
-  if (claims.exp * 1000 < Date.now()) throw httpErr(401, 'Token expirado');
+  // exp OBLIGATORIO y numérico: válido solo si exp*1000 > ahora (sin exp => NaN => rechazado).
+  if (typeof claims.exp !== 'number' || !Number.isFinite(claims.exp)) throw httpErr(401, 'No autorizado');
+  if (!(claims.exp * 1000 > Date.now())) throw httpErr(401, 'Token expirado');
 
   const key = await getGooglePublicKey(header.kid);
-  const ok = await crypto.subtle.verify(
-    'RSASSA-PKCS1-v1_5', key,
-    b64urlToBytes(s), new TextEncoder().encode(`${h}.${p}`)
-  );
+  let ok = false;
+  try {
+    ok = await crypto.subtle.verify(
+      'RSASSA-PKCS1-v1_5', key,
+      b64urlToBytes(s), new TextEncoder().encode(`${h}.${p}`)
+    );
+  } catch (e) { ok = false; }   // firma con base64 inválido o longitud rara => firma inválida, no 500
   if (!ok) throw httpErr(401, 'Firma inválida');
-  return { uid: claims.user_id || claims.sub, email: claims.email };
+
+  const uid = claims.user_id || claims.sub;
+  if (typeof uid !== 'string' || !uid) throw httpErr(401, 'No autorizado');   // sub obligatorio
+  return { uid, email: claims.email };
 }
 
 async function getGooglePublicKey(kid) {
   if (!JWKS_CACHE.keys || Date.now() > JWKS_CACHE.exp) {
-    const r = await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com');
-    const certs = await r.json();
-    const maxAge = +(r.headers.get('cache-control')||'').match(/max-age=(\d+)/)?.[1] || 3600;
-    JWKS_CACHE = { keys: certs, exp: Date.now() + maxAge*1000 };
+    try {
+      const r = await fetch('https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com');
+      const certs = await r.json();
+      const maxAge = +(r.headers.get('cache-control')||'').match(/max-age=(d+)/)?.[1] || 3600;
+      JWKS_CACHE = { keys: certs, exp: Date.now() + maxAge*1000 };
+    } catch (e) {
+      // Falla de infraestructura (no del token): mensaje fijo, sin el texto de la excepción.
+      console.error('[auth] no se pudieron obtener los certificados de Google:', e && e.name);
+      throw httpErr(503, 'Autenticación no disponible, reintenta');
+    }
   }
+  // kid a prueba de prototipo: solo claves PROPIAS del mapa ('constructor', 'toString'… no cuentan).
+  if (typeof kid !== 'string' || !Object.hasOwn(JWKS_CACHE.keys, kid)) throw httpErr(401, 'No autorizado');
   const pem = JWKS_CACHE.keys[kid];
-  if (!pem) throw httpErr(401, 'kid desconocido');
+  if (typeof pem !== 'string' || !pem) throw httpErr(401, 'No autorizado');
   return importX509(pem);
 }
 
