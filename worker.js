@@ -3,8 +3,11 @@
    El ÚNICO que toca la Shelly. El cliente jamás ve la IP ni la llave.
    -----------------------------------------------------------
    Secrets (wrangler secret put ...):
-     SHELLY_HOST          ej. http://192.168.1.50  (o túnel/IP pública segura)
-     SHELLY_AUTH_KEY      auth key de Shelly (Gen2 RPC) o user:pass
+     SHELLY_HOST          server URI de Shelly Cloud, https://...
+     SHELLY_AUTH_KEY      Authorization cloud key de Shelly Cloud
+     SHELLY_DEVICES       JSON {"residentes":"<deviceId>","visitantes":"<deviceId>",...} —
+                          repo público: los IDs de cada Shelly NUNCA van en el código, solo aquí.
+                          Puerta sin entrada en el JSON = sin hardware asignado todavía.
      FIREBASE_PROJECT     cerrada-la-marquesa
      SA_EMAIL             service account email (Admin)
      SA_PRIVATE_KEY       service account private key (PEM, con \n escapados)
@@ -16,19 +19,21 @@
    Durable Object: SHELLY_GATE (clase ShellyGate) — toda llamada a Shelly Cloud pasa por él.
    =========================================================== */
 
-// Cada acceso es un Shelly físico independiente, controlado por Shelly Cloud (internet).
-// IDs reales PENDIENTES hasta elegir/instalar el hardware — no inventar valores.
-const DEVICES = {
-  residentes: "PENDIENTE_residentes",  // barrera vehicular de residentes
-  visitantes: "PENDIENTE_visitantes",  // barrera vehicular de visitas/morosos
-  peatones:   "PENDIENTE_peatones",    // puerta peatonal
-  salida:     "PENDIENTE_salida",      // puerta de salida
-};
+// Nombres de puerta válidos. Los IDs reales de cada Shelly YA NO viven en el código (repo
+// público): se leen en tiempo de petición del secret SHELLY_DEVICES vía resolveShellyDeviceId()
+// (más abajo, junto a triggerShelly). Una puerta sin entrada en ese JSON (peatones/salida hoy,
+// sin hardware instalado) responde error claro en vez de intentar hablarle a un Shelly que no existe.
+const PUERTAS = new Set([
+  'residentes',  // barrera vehicular de residentes
+  'visitantes',  // barrera vehicular de visitas/morosos
+  'peatones',    // puerta peatonal
+  'salida',      // puerta de salida
+]);
 
 // Lectores físicos (QR + PIN) de invitaciones de visita — 4 lectores, cada uno atado a UNA
-// puerta de DEVICES y a una dirección. Dos lectores pueden compartir la misma puerta (peatonal
+// puerta de PUERTAS y a una dirección. Dos lectores pueden compartir la misma puerta (peatonal
 // entrada/salida son el mismo Shelly, distinto lector físico) — por eso este mapeo vive aparte
-// de DEVICES, no lo reemplaza. readerId lo manda el lector físico en el body (mismo READER_KEY
+// de PUERTAS, no lo reemplaza. readerId lo manda el lector físico en el body (mismo READER_KEY
 // compartido para los 4, igual que hoy — ver validarQR/validarPin).
 const READERS = {
   'visitantes-entrada': { puerta: 'visitantes', direccion: 'entrada' },
@@ -129,7 +134,7 @@ export default {
 async function abrir(req, env) {
   const user = await requireAuth(req, env);
   const { puerta } = await req.json();
-  if (!Object.hasOwn(DEVICES, puerta)) throw httpErr(400, 'Puerta no válida');   // hasOwn: 'constructor'/'toString' no pasan
+  if (!PUERTAS.has(puerta)) throw httpErr(400, 'Puerta no válida');
 
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
@@ -141,7 +146,7 @@ async function abrir(req, env) {
     if (padre && padre.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw httpErr(403, 'Residente del hogar suspendido por mora');
   }
   // master, admin, residente y esclavo pueden abrir las 4 puertas.
-  await triggerShelly(env, DEVICES[puerta]);
+  await triggerShelly(env, puerta);
 
   const hogar = perfil.rol === 'residente' ? user.uid : (perfil.residenteUid || user.uid);
   await logApertura(env, {
@@ -267,7 +272,7 @@ async function consumirInvitacion(env, inv, readerId, metodo) {
   // se deshace para ESTA petición, así un acceso fallido nunca quema un uso ni deja una
   // entrada/salida fantasma. El error original se relanza intacto (mismo contrato).
   try {
-    await triggerShelly(env, DEVICES[reader.puerta]);
+    await triggerShelly(env, reader.puerta);
   } catch (e) {
     await devolverReservaInvitacion(env, inv, reader.direccion === 'entrada' && inv.usosRestantes !== null);
     throw e;
@@ -1820,15 +1825,33 @@ async function crearUsuario(req, env) {
    global), que serializa y espacia TODAS las llamadas de la cuenta (el límite de Shelly Cloud
    es ~1 req/s por Cloud Key, compartido por todas las puertas). Mismo contrato de errores que
    antes: falla => httpErr(status, mensaje) => {error} con ese status. */
-async function triggerShelly(env, deviceId) {
+/* Lee el secret SHELLY_DEVICES (JSON {"puerta":"deviceId",...}) y devuelve el deviceId de esa
+   puerta, o null si el secret falta, está mal formado, o esa puerta no tiene entrada (sin
+   hardware asignado todavía — hoy: peatones, salida). Nunca lanza ni loguea el contenido del
+   secret ni el motivo exacto de un JSON roto: solo null, para que triggerShelly responda el
+   mismo error genérico en ambos casos ("puerta sin dispositivo configurado"). */
+function resolveShellyDeviceId(env, puerta) {
+  if (!env.SHELLY_DEVICES) return null;
+  let mapa;
+  try { mapa = JSON.parse(env.SHELLY_DEVICES); } catch (e) { return null; }
+  if (!mapa || typeof mapa !== 'object' || Array.isArray(mapa)) return null;
+  const id = mapa[puerta];
+  return (typeof id === 'string' && id) ? id : null;
+}
+
+async function triggerShelly(env, puerta) {
+  // Resuelto y validado ANTES de tocar el portero de fila: una puerta sin Shelly asignado (o un
+  // secret SHELLY_DEVICES roto) falla YA, rápido y con mensaje genérico — nunca entra a la cola
+  // del Durable Object ni intenta una llamada real a Shelly.
+  const deviceId = resolveShellyDeviceId(env, puerta);
+  if (!deviceId) throw httpErr(503, 'Puerta sin dispositivo configurado');
   if (!env.SHELLY_GATE) throw httpErr(500, 'Portero de fila no configurado');
-  const label = Object.keys(DEVICES).find(k => DEVICES[k] === deviceId) || 'desconocida'; // solo para logs
   let out = null;
   try {
     const stub = env.SHELLY_GATE.get(env.SHELLY_GATE.idFromName(SHELLY_GATE_NAME));
     const r = await stub.fetch('https://shelly-gate/abrir', {
       method: 'POST',
-      body: JSON.stringify({ deviceId, label }),
+      body: JSON.stringify({ deviceId, label: puerta }),
     });
     out = await r.json();
   } catch (e) { /* DO inalcanzable o respuesta ilegible => mismo error que "no respondió" */ }
