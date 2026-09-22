@@ -266,7 +266,6 @@ function renderDoors(){
     const el = document.createElement('div');
     el.className = 'door' + (bloqueada ? ' door-disabled' : '');
     el.innerHTML = `
-      <div class="hold-fill"></div>
       <div class="pulse"></div>
       <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="16" height="12" rx="2"/><path d="M8 9V6a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15" r="1.4"/></svg></div>
       <div class="dn">${d.name}</div>
@@ -276,76 +275,10 @@ function renderDoors(){
       el.style.pointerEvents = 'none';
       el.setAttribute('aria-disabled', 'true');
     } else {
-      bindHold(el, d);
+      el.onclick = ()=> openDoor(d, el);
     }
     grid.appendChild(el);
   });
-}
-
-/* ---- Mantener presionado 1s para abrir ----
-   Un solo toque/clic YA NO abre nada: hay que sostener HOLD_MS completos. El relleno verde
-   (.hold-fill) es 100% visual y lo maneja esta función con inline-styles (transition-duration
-   fijada por JS); quien decide si de verdad se abrió es el setTimeout(HOLD_MS) de abajo, no la
-   animación — así no hay forma de que un navegador lento/rápido dispare el pulso antes de tiempo.
-   Se cancela (sin llamar al Worker) si: se suelta antes, el dedo sale de los límites del botón
-   (chequeo manual por getBoundingClientRect — en touch el navegador captura el puntero al
-   elemento inicial aunque el dedo se mueva fuera, así que pointerleave NO es confiable ahí), o
-   el navegador toma el gesto como scroll (pointercancel, permitido por touch-action:pan-y). */
-const HOLD_MS = 1000;
-const HOLD_CANCEL_MS = 180;
-
-function bindHold(el, door){
-  const fill = el.querySelector('.hold-fill');
-  let timer = null;
-  let active = false;
-
-  function withinBounds(x, y){
-    const r = el.getBoundingClientRect();
-    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
-  }
-
-  function start(e){
-    if (opening || active) return;
-    if (e.pointerType === 'mouse' && e.button !== 0) return;
-    if (e.cancelable) e.preventDefault();   // evita lupa/selección de iOS sin bloquear el scroll (touch-action:pan-y)
-    active = true;
-    el.classList.add('holding');
-    fill.style.transitionDuration = '0ms';
-    fill.style.height = '0%';
-    void fill.offsetHeight;   // fuerza reflow para que la duración de abajo aplique limpio
-    fill.style.transitionDuration = HOLD_MS + 'ms';
-    fill.style.height = '100%';
-    timer = setTimeout(complete, HOLD_MS);
-  }
-
-  function cancel(){
-    if (!active) return;
-    active = false;
-    clearTimeout(timer); timer = null;
-    el.classList.remove('holding');
-    fill.style.transitionDuration = HOLD_CANCEL_MS + 'ms';
-    fill.style.height = '0%';
-  }
-
-  function complete(){
-    if (!active) return;
-    active = false;
-    el.classList.remove('holding');
-    if (navigator.vibrate) navigator.vibrate(30);
-    openDoor(door, el);   // el relleno queda en 100% (verde) hasta que openDoor lo resetee al terminar
-  }
-
-  function move(e){
-    if (!active) return;
-    if (!withinBounds(e.clientX, e.clientY)) cancel();
-  }
-
-  el.addEventListener('pointerdown', start);
-  el.addEventListener('pointermove', move);
-  el.addEventListener('pointerup', cancel);
-  el.addEventListener('pointercancel', cancel);
-  el.addEventListener('pointerleave', cancel);
-  el.addEventListener('contextmenu', e => e.preventDefault());
 }
 
 let opening = false;
@@ -358,12 +291,7 @@ async function openDoor(door, el){
   } catch(e){
     toast(e.message || 'No se pudo abrir', 'bad');
   } finally {
-    setTimeout(()=>{
-      el.classList.remove('opening');
-      const fill = el.querySelector('.hold-fill');
-      if (fill){ fill.style.transitionDuration = HOLD_CANCEL_MS + 'ms'; fill.style.height = '0%'; }
-      opening=false;
-    }, 1400);
+    setTimeout(()=>{ el.classList.remove('opening'); opening=false; }, 1400);
   }
 }
 

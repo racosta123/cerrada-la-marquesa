@@ -125,8 +125,6 @@
     position:relative;background:var(--surface);border:1px solid var(--line);
     border-radius:var(--r);padding:18px 16px 16px;overflow:hidden;
     transition:transform .12s,border-color .2s;
-    touch-action:pan-y;user-select:none;-webkit-user-select:none;
-    -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;
   }
   .door:active{transform:scale(.97)}
   .door .ic{
@@ -143,15 +141,6 @@
   }
   .door.opening .pulse{opacity:1}
   .door.opening{border-color:var(--ok)}
-  /* Relleno de "mantener presionado": crece de abajo hacia arriba, duración controlada por JS
-     (HOLD_MS al presionar, más corta al cancelar) para que el timer real y el visual coincidan. */
-  .door .hold-fill{
-    position:absolute;left:0;right:0;bottom:0;height:0%;border-radius:var(--r);
-    background:linear-gradient(180deg,rgba(52,211,153,.5),rgba(52,211,153,.85));
-    pointer-events:none;
-  }
-  .door.holding{border-color:var(--ok)}
-  .doors-hint{font-size:12px;color:var(--muted-2);text-align:center;margin-top:12px}
 
   /* ---------- LIST CARDS ---------- */
   .list{display:flex;flex-direction:column;gap:10px}
@@ -388,7 +377,6 @@
   <div id="tab-doors" class="tabpane">
     <div class="section-title">Abrir puertas</div>
     <div class="doors" id="doorsGrid"></div>
-    <div class="doors-hint">Mantén presionado para abrir</div>
   </div>
 
   <!-- TAB: INVITADOS -->
