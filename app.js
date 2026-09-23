@@ -2704,10 +2704,10 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v9';
+const APP_VERSION = 'v10';
 (function mostrarVersionInmediata(){
   const el = document.getElementById('appVersion');
-  if (el) el.textContent = APP_VERSION;
+  if (el) el.textContent = 'Versión ' + APP_VERSION;
 })();
 
 /* ====================== Service worker (PWA) — auto-actualización ======================
@@ -2750,7 +2750,7 @@ if ('serviceWorker' in navigator){
     const el = document.getElementById('appVersion');
     if (!el) return;
     const m = /-v(\d+)$/i.exec(cacheName || '');
-    el.textContent = m ? ('v' + m[1]) : (cacheName || '');
+    el.textContent = 'Versión ' + (m ? ('v' + m[1]) : (cacheName || ''));
   }
 
   navigator.serviceWorker.addEventListener('controllerchange', () => {
