@@ -2690,7 +2690,70 @@ $('#vcerrarConfirm')?.addEventListener('click', votCerrarConfirmar);
 $('#vcerrarCancel')?.addEventListener('click', () => closeSheet('#votCerrarOverlay'));
 $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votCerrarOverlay') closeSheet('#votCerrarOverlay'); });
 
-/* ====================== Service worker (PWA) ====================== */
+/* ====================== Service worker (PWA) — auto-actualización ======================
+   Objetivo: que un residente nunca tenga que borrar caché ni reinstalar para ver una mejora.
+   - updateViaCache:'none' — el navegador jamás sirve sw.js desde su caché HTTP al comparar
+     versiones: siempre revisa el archivo real del servidor.
+   - Se revisa si hay versión nueva al cargar la app y cada vez que vuelve a primer plano
+     (visibilitychange) — reg.update() fuerza esa comparación ya mismo, sin esperar lo que el
+     navegador revisa por su cuenta (hasta 24h).
+   - Cuando una versión nueva toma control (evento controllerchange) se recarga la página UNA
+     sola vez para que se vea sin que el residente haga nada — EXCEPTO: (a) si es la primerísima
+     vez que un service worker controla la página (nada que "actualizar" ahí, sería un reload
+     inútil en la primera visita), o (b) si está escribiendo en un campo, hay una hoja/modal
+     abierta, o se está abriendo una puerta — ahí se espera a que la app vuelva a primer plano.
+     `reloaded` evita que se dispare más de una vez por carga (sin ciclos). */
 if ('serviceWorker' in navigator){
-  window.addEventListener('load', ()=> navigator.serviceWorker.register('sw.js').catch(()=>{}));
+  const teniaControlAlCargar = !!navigator.serviceWorker.controller;
+  let swReg = null;
+  let reloaded = false;
+  let reloadPendiente = false;
+
+  function reloadInseguro(){
+    const enCampo = ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName);
+    const hayHojaAbierta = !!document.querySelector('.overlay.open');
+    return enCampo || hayHojaAbierta || opening;
+  }
+
+  function intentarRecargar(){
+    if (reloaded || !teniaControlAlCargar) return;
+    if (reloadInseguro()){ reloadPendiente = true; return; }
+    reloaded = true;
+    location.reload();
+  }
+
+  function pedirVersionSW(){
+    navigator.serviceWorker.controller?.postMessage({ type:'GET_VERSION' });
+  }
+
+  function mostrarVersionSW(cacheName){
+    const el = document.getElementById('appVersion');
+    if (!el) return;
+    const m = /-v(\d+)$/i.exec(cacheName || '');
+    el.textContent = m ? ('v' + m[1]) : (cacheName || '');
+  }
+
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    reloadPendiente = true;
+    intentarRecargar();
+    pedirVersionSW();
+  });
+
+  navigator.serviceWorker.addEventListener('message', e => {
+    if (e.data?.type === 'VERSION') mostrarVersionSW(e.data.version);
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    swReg?.update().catch(()=>{});
+    if (reloadPendiente) intentarRecargar();
+  });
+
+  window.addEventListener('load', async () => {
+    try {
+      swReg = await navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' });
+      swReg.update().catch(()=>{});
+      pedirVersionSW();
+    } catch(e){}
+  });
 }
