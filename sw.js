@@ -4,8 +4,13 @@ const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json',
   './assets/marquesa-mobile.webp','./assets/marquesa-desktop.webp','./assets/logo-marquesa.jpg',
   './icons/icon-192.png','./icons/icon-512.png','./icons/icon-maskable-512.png','./icons/apple-touch-icon.png'];
 
+// cache:'reload' — GitHub Pages manda Cache-Control max-age=600: con addAll(ASSETS) a secas el
+// precache de una versión NUEVA podía llenarse con el app.js/index.html VIEJO que el navegador
+// aún tenía en su caché HTTP (hasta 10 min). 'reload' obliga a traer cada archivo del servidor.
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(CACHE).then(c => c.addAll(ASSETS)).then(()=>self.skipWaiting()));
+  e.waitUntil(caches.open(CACHE)
+    .then(c => c.addAll(ASSETS.map(u => new Request(u, { cache:'reload' }))))
+    .then(()=>self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys().then(ks => Promise.all(ks.filter(k=>k!==CACHE).map(k=>caches.delete(k)))).then(()=>self.clients.claim()));
@@ -26,10 +31,15 @@ self.addEventListener('fetch', e => {
 
   if (esAppShell(e.request, url)){
     e.respondWith(
-      fetch(e.request)
+      // cache:'no-cache' — "primero la red" de verdad: revalida con el servidor en vez de
+      // aceptar lo que el navegador tenga en su caché HTTP (max-age=600 de GitHub Pages), que
+      // podía devolver el app.js viejo hasta 10 min después de publicar.
+      fetch(e.request, { cache:'no-cache' })
         .then(res => {
-          const copy = res.clone();
-          caches.open(CACHE).then(c => c.put(e.request, copy));
+          if (res.ok){
+            const copy = res.clone();
+            caches.open(CACHE).then(c => c.put(e.request, copy));
+          }
           return res;
         })
         .catch(() => caches.match(e.request).then(r => r || caches.match('./index.html')))

@@ -2388,7 +2388,23 @@ async function registerPush(){
     if (!('serviceWorker' in navigator) || !firebase.messaging.isSupported()) return;
     const perm = await Notification.requestPermission();
     if (perm !== 'granted') return;
-    const reg = await navigator.serviceWorker.register('firebase-messaging-sw.js');
+    // Scope PROPIO para el worker de push. Solo puede haber un service worker por scope: antes
+    // se registraba con el scope por defecto ('./', el mismo de sw.js) y, al aceptar
+    // notificaciones, REEMPLAZABA a sw.js — adiós caché offline y auto-actualización. Este es
+    // el mismo scope que usa el SDK de Firebase cuando lo registra él solo; ninguna página vive
+    // bajo esa ruta, así que este worker nunca controla la app, solo recibe los push.
+    const reg = await navigator.serviceWorker.register('firebase-messaging-sw.js',
+      { scope: './firebase-cloud-messaging-push-scope', updateViaCache: 'none' });
+    // Limpieza de la versión anterior: la suscripción push vieja quedó colgada del registro
+    // principal (el de sw.js, que no sabe mostrar notificaciones). Se da de baja para que FCM
+    // no siga mandando a un token que ya nadie atiende; el token nuevo se guarda abajo.
+    try {
+      const principal = await navigator.serviceWorker.getRegistration('./');
+      if (principal && principal !== reg){
+        const subVieja = await principal.pushManager.getSubscription();
+        if (subVieja) await subVieja.unsubscribe();
+      }
+    } catch(_){}
     const messaging = firebase.messaging();
     const token = await messaging.getToken({ vapidKey: CONFIG.vapidKey, serviceWorkerRegistration: reg });
     if (token){
@@ -2714,66 +2730,132 @@ const APP_VERSION = 'v10';
    Objetivo: que un residente nunca tenga que borrar caché ni reinstalar para ver una mejora.
    - updateViaCache:'none' — el navegador jamás sirve sw.js desde su caché HTTP al comparar
      versiones: siempre revisa el archivo real del servidor.
-   - Se revisa si hay versión nueva al cargar la app y cada vez que vuelve a primer plano
-     (visibilitychange) — reg.update() fuerza esa comparación ya mismo, sin esperar lo que el
-     navegador revisa por su cuenta (hasta 24h).
+   - Se revisa si hay versión nueva: al cargar, al volver a primer plano (visibilitychange), al
+     regresar el foco a la ventana (en PC cambiar de ventana NO dispara visibilitychange) y cada
+     30 min mientras la app está visible (una pestaña de PC abierta todo el día nunca se oculta).
+     reg.update() fuerza esa comparación ya mismo, sin esperar lo que el navegador revisa por su
+     cuenta (hasta 24h). Máximo una revisión por minuto.
    - Cuando una versión nueva toma control (evento controllerchange) se recarga la página UNA
      sola vez para que se vea sin que el residente haga nada — EXCEPTO: (a) si es la primerísima
      vez que un service worker controla la página (nada que "actualizar" ahí, sería un reload
-     inútil en la primera visita), o (b) si está escribiendo en un campo, hay una hoja/modal
-     abierta, o se está abriendo una puerta — ahí se espera a que la app vuelva a primer plano.
-     `reloaded` evita que se dispare más de una vez por carga (sin ciclos). */
+     inútil en la primera visita), o (b) si está ESCRIBIENDO en un campo de texto, hay una
+     hoja/modal abierta, o se está abriendo una puerta. En ese caso queda pendiente y se
+     reintenta al salir del campo, al volver a primer plano y cada 15 s — así nunca se queda
+     pendiente para siempre en una pestaña que no se oculta. Un <select>, casilla o botón con
+     foco NO bloquea: en PC conservan el foco después de usarlos y no hay texto que perder.
+     `reloaded` evita que se dispare más de una vez por carga (sin ciclos).
+   - Diagnóstico visible en Gestión (#appDiag): SW activo / en espera / última revisión /
+     recarga pendiente y por qué. */
 if ('serviceWorker' in navigator){
-  const teniaControlAlCargar = !!navigator.serviceWorker.controller;
+  // Primera visita: el primer controllerchange (el SW recién instalado toma control) no es una
+  // actualización y no recarga; cualquier controllerchange POSTERIOR en esta misma carga sí.
+  let yaHabiaControl = !!navigator.serviceWorker.controller;
   let swReg = null;
   let reloaded = false;
   let reloadPendiente = false;
+  let ultimaRevision = null;          // Date de la última reg.update() terminada
+  let ultimaRevisionFallo = false;
+  let revisandoDesde = 0;             // throttle: ms de la última revisión lanzada
+  const swVer = { activo: null, espera: null };   // lo que responde cada worker ('marquesa-vN')
 
-  function reloadInseguro(){
-    const enCampo = ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName);
-    const hayHojaAbierta = !!document.querySelector('.overlay.open');
-    return enCampo || hayHojaAbierta || opening;
+  const TIPOS_SIN_TEXTO = ['checkbox','radio','button','submit','reset','range','color','file','image'];
+  function motivoNoRecargar(){
+    const a = document.activeElement;
+    const escribiendo = !!a && !a.readOnly && !a.disabled && (
+      a.tagName === 'TEXTAREA' || a.isContentEditable ||
+      (a.tagName === 'INPUT' && !TIPOS_SIN_TEXTO.includes((a.type || '').toLowerCase())));
+    if (escribiendo) return 'escribiendo en un campo';
+    if (document.querySelector('.overlay.open')) return 'hay una hoja abierta';
+    if (opening) return 'abriendo una puerta';
+    return '';
   }
 
   function intentarRecargar(){
-    if (reloaded || !teniaControlAlCargar) return;
-    if (reloadInseguro()){ reloadPendiente = true; return; }
+    if (reloaded || !reloadPendiente) return;
+    if (motivoNoRecargar()){ pintarDiag(); return; }
     reloaded = true;
     location.reload();
   }
 
-  function pedirVersionSW(){
+  function pedirVersiones(){
     navigator.serviceWorker.controller?.postMessage({ type:'GET_VERSION' });
+    swReg?.waiting?.postMessage({ type:'GET_VERSION' });
   }
 
+  const verCorta = n => { const m = /-v(\d+)$/i.exec(n || ''); return m ? ('v' + m[1]) : (n || ''); };
   function mostrarVersionSW(cacheName){
     const el = document.getElementById('appVersion');
     if (!el) return;
-    const m = /-v(\d+)$/i.exec(cacheName || '');
-    el.textContent = 'Versión ' + (m ? ('v' + m[1]) : (cacheName || ''));
+    el.textContent = 'Versión ' + verCorta(cacheName);
+  }
+
+  function pintarDiag(){
+    const el = document.getElementById('appDiag');
+    if (!el) return;
+    const ctrl = navigator.serviceWorker.controller;
+    let activo = ctrl ? (swVer.activo ? verCorta(swVer.activo) : '…') : 'ninguno';
+    // Salvaguarda: la página SIEMPRE debe estar controlada por sw.js; si otro worker se
+    // quedara con el scope (el bug del push), se ve aquí de inmediato.
+    if (ctrl && !/\/sw\.js$/.test(new URL(ctrl.scriptURL).pathname)) activo += ' ⚠ (no es sw.js)';
+    const espera = swReg?.waiting ? (swVer.espera ? verCorta(swVer.espera) : '…')
+                 : swReg?.installing ? 'instalando…' : 'ninguno';
+    const revision = ultimaRevision
+      ? ultimaRevision.toLocaleTimeString('es-MX', { hour:'2-digit', minute:'2-digit', second:'2-digit' }) + (ultimaRevisionFallo ? ' (sin conexión)' : '')
+      : (ultimaRevisionFallo ? 'falló' : '—');
+    const motivo = reloadPendiente ? (motivoNoRecargar() || 'en cuanto se pueda') : '';
+    el.textContent = `SW activo: ${activo} · SW en espera: ${espera} · Última revisión: ${revision} · `
+      + `Recarga pendiente: ${reloadPendiente ? 'sí (' + motivo + ')' : 'no'}`;
+  }
+
+  async function revisar(forzar){
+    if (!swReg) return;
+    const ahora = Date.now();
+    if (!forzar && ahora - revisandoDesde < 60 * 1000) return;
+    revisandoDesde = ahora;
+    try { await swReg.update(); ultimaRevisionFallo = false; }
+    catch(_){ ultimaRevisionFallo = true; }
+    ultimaRevision = new Date();
+    pedirVersiones();
+    pintarDiag();
   }
 
   navigator.serviceWorker.addEventListener('controllerchange', () => {
-    reloadPendiente = true;
+    swVer.activo = null;
+    if (yaHabiaControl) reloadPendiente = true;
+    yaHabiaControl = true;
     intentarRecargar();
-    pedirVersionSW();
+    pedirVersiones();
+    pintarDiag();
   });
 
   navigator.serviceWorker.addEventListener('message', e => {
-    if (e.data?.type === 'VERSION') mostrarVersionSW(e.data.version);
+    if (e.data?.type !== 'VERSION') return;
+    if (e.source && e.source === swReg?.waiting) swVer.espera = e.data.version;
+    else { swVer.activo = e.data.version; mostrarVersionSW(e.data.version); }
+    pintarDiag();
   });
 
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible') return;
-    swReg?.update().catch(()=>{});
-    if (reloadPendiente) intentarRecargar();
+    revisar();
+    intentarRecargar();
   });
+  window.addEventListener('focus', () => { revisar(); intentarRecargar(); });
+  // Al salir de un campo se reintenta ya; el setTimeout deja que el foco llegue a su destino.
+  document.addEventListener('focusout', () => setTimeout(intentarRecargar, 300));
+  setInterval(() => { intentarRecargar(); pintarDiag(); }, 15 * 1000);
+  setInterval(() => { if (document.visibilityState === 'visible') revisar(); }, 30 * 60 * 1000);
 
   window.addEventListener('load', async () => {
     try {
       swReg = await navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' });
-      swReg.update().catch(()=>{});
-      pedirVersionSW();
-    } catch(e){}
+      swReg.addEventListener('updatefound', () => {
+        swVer.espera = null;
+        swReg.installing?.addEventListener('statechange', () => { pedirVersiones(); pintarDiag(); });
+        pintarDiag();
+      });
+      await revisar(true);
+    } catch(e){ ultimaRevisionFallo = true; pintarDiag(); }
   });
+  pintarDiag();
 }
