@@ -1,4 +1,4 @@
-const CACHE = 'marquesa-v7';
+const CACHE = 'marquesa-v8';
 const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json',
   './vendor/qrcode.min.js','./vendor/jspdf.umd.min.js','./vendor/jspdf.plugin.autotable.min.js','./vendor/chart.umd.min.js',
   './assets/marquesa-mobile.webp','./assets/marquesa-desktop.webp','./assets/logo-marquesa.jpg',

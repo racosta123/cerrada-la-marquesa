@@ -2690,6 +2690,22 @@ $('#vcerrarConfirm')?.addEventListener('click', votCerrarConfirmar);
 $('#vcerrarCancel')?.addEventListener('click', () => closeSheet('#votCerrarOverlay'));
 $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votCerrarOverlay') closeSheet('#votCerrarOverlay'); });
 
+/* ====================== Versión visible (Gestión) ======================
+   MANTENER EN SYNC con el número de sw.js (const CACHE = 'marquesa-vN') cada vez que se
+   publique una versión — es un literal a propósito, no se calcula solo.
+   Se muestra YA, de forma síncrona, sin esperar nada del service worker: si dependiera solo
+   del postMessage de abajo, en la carga que hace la transición de una versión a otra el primer
+   intento le pregunta al worker VIEJO (que en versiones anteriores a v8 ni siquiera entendía
+   "GET_VERSION") y el segundo intento compite contra el location.reload() de la misma función
+   — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
+   Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
+   abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
+const APP_VERSION = 'v8';
+(function mostrarVersionInmediata(){
+  const el = document.getElementById('appVersion');
+  if (el) el.textContent = APP_VERSION;
+})();
+
 /* ====================== Service worker (PWA) — auto-actualización ======================
    Objetivo: que un residente nunca tenga que borrar caché ni reinstalar para ver una mejora.
    - updateViaCache:'none' — el navegador jamás sirve sw.js desde su caché HTTP al comparar
