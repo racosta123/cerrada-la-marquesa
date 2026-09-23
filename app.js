@@ -25,6 +25,7 @@ const DOORS = [
 
 let ME = null;          // { uid, nombre, rol, casa, residenteUid? }
 let unsubLog = null;
+let unsubAlertas = null;   // alertas_bitacora (solo staff)
 let unsubInvites = null;
 let unsubFin = null;
 let personasCache = [];       // padrón unificado (FASE 6.5): jefes (casas) + familiares + admins
@@ -125,6 +126,7 @@ function showLogin(){
   $('#password').value = '';
   $('#loginBtn').disabled = false; $('#loginBtn').textContent = 'Entrar';
   if (unsubLog) unsubLog();
+  if (unsubAlertas){ unsubAlertas(); unsubAlertas = null; }
   if (unsubInvites) unsubInvites();
   if (unsubFin) unsubFin();
 }
@@ -300,45 +302,125 @@ async function openDoor(door, el){
 }
 
 /* ====================== BITÁCORA / HISTORIAL ====================== */
+/* Bitácora. Residente: su hogar + todas las visitas de su casa (jefe y familiares, por casaId);
+   esclavo: el hogar de su titular (lo imponen las reglas; aquí solo se consulta eso). Staff: todo, más las ALERTAS ("⚠️ Posible residente suspendido") que viven aparte en
+   alertas_bitacora — colección que solo el staff puede leer — y se cruzan por id de registro. */
+let logDocsCache = null;                              // [{id, data}] de aperturas, más reciente primero
+let alertasBitacora = { porId: new Map(), lista: [] };
+let logSoloAlertas = false;
+/* Casa = persona del JEFE (jefe: su personaId; familiar: su jefeId). Misma cuenta que miCasaId()
+   en las reglas. '' si no es residente (esclavo/admin/master). */
+function miCasaId(){
+  if (ME.rol !== 'residente') return '';
+  return ME.jefeId || ME.personaId || '';
+}
 function watchLog(){
   if (unsubLog) unsubLog();
+  if (unsubAlertas){ unsubAlertas(); unsubAlertas = null; }
+  alertasBitacora = { porId: new Map(), lista: [] };
+  logDocsCache = null;
   const isStaff = enModoStaff();
-  let q = db.collection('aperturas').orderBy('ts','desc').limit(60);
-  if (!isStaff){
-    // residente ve lo suyo + sus esclavos/visitantes; esclavo ve lo suyo
+  const qs = [];
+  if (isStaff){
+    qs.push(db.collection('aperturas').orderBy('ts','desc').limit(60));
+  } else {
+    // Su hogar (lo suyo + sus esclavos/visitantes; el esclavo, lo de su titular) y, si es
+    // residente, TODAS las visitas de su casa (jefe y familiares). Las reglas no dejan ver otra casa.
     const scope = ME.rol==='residente' ? ME.uid : (ME.residenteUid || ME.uid);
-    q = db.collection('aperturas').where('hogar','==',scope).orderBy('ts','desc').limit(60);
+    qs.push(db.collection('aperturas').where('hogar','==',scope).orderBy('ts','desc').limit(60));
+    const casaId = miCasaId();
+    if (casaId) qs.push(db.collection('aperturas').where('casaId','==',casaId).orderBy('ts','desc').limit(60));
+    logSoloAlertas = false;
   }
   $('#logTitle').textContent = isStaff ? 'Bitácora general' : 'Historial';
-  unsubLog = q.onSnapshot(snap => renderLog(snap), err => {
-    console.error(err); $('#logList').innerHTML = '<div class="empty">Sin acceso al historial</div>';
-  });
+  $('#logAlertasBtn').classList.toggle('hidden', !isStaff);
+  $('#logAlertasBtn').classList.toggle('sel', logSoloAlertas);
+  // Une los resultados por id (una visita propia sale en las dos consultas) y ordena por hora.
+  const partes = qs.map(() => null);
+  const unir = () => {
+    const porId = new Map();
+    partes.forEach(p => (p || []).forEach(d => porId.set(d.id, d)));
+    const ms = d => { const t = d.data.ts; return t ? (t.toMillis ? t.toMillis() : +new Date(t)) : 0; };
+    logDocsCache = [...porId.values()].sort((a, b) => ms(b) - ms(a)).slice(0, 60);
+    renderLog();
+  };
+  const unsubs = qs.map((q, i) => q.onSnapshot(snap => {
+    partes[i] = snap.docs.map(d => ({ id: d.id, data: d.data() }));
+    unir();
+  }, err => {
+    console.error(err);
+    if (i === 0) $('#logList').innerHTML = '<div class="empty">Sin acceso al historial</div>';
+  }));
+  unsubLog = () => unsubs.forEach(u => u());
+  if (isStaff){
+    unsubAlertas = db.collection('alertas_bitacora').orderBy('ts','desc').limit(100)
+      .onSnapshot(snap => {
+        const lista = []; const porId = new Map();
+        snap.forEach(d => { const a = { id: d.id, ...d.data() }; lista.push(a); porId.set(d.id, a); });
+        alertasBitacora = { porId, lista };
+        renderLog();
+      }, err => console.error('alertas_bitacora', err));
+  }
+}
+$('#logAlertasBtn')?.addEventListener('click', () => {
+  logSoloAlertas = !logSoloAlertas;
+  $('#logAlertasBtn').classList.toggle('sel', logSoloAlertas);
+  renderLog();
+});
+
+const SVG_ENGRANE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
+const SVG_CANDADO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="16" height="12" rx="2"/><path d="M8 9V6a4 4 0 0 1 8 0v3"/></svg>';
+
+/* Una fila de apertura/visita. `alerta` (solo staff) = doc de alertas_bitacora de ese registro. */
+function filaBitacora(a, alerta){
+  const row = document.createElement('div');
+  row.className = 'row' + (alerta ? ' alerta' : '');
+  if (a.tipo === 'gestion'){
+    // Acción administrativa (FASE 5), no una apertura de puerta: ícono de engrane,
+    // el texto ya describe la acción, sin etiqueta Entrada/Salida.
+    row.innerHTML = `
+      <div class="ri">${SVG_ENGRANE}</div>
+      <div class="rt"><div class="a">${esc(a.nombre || 'Gestión')}</div><div class="b">Gestión · ${fmtTime(a.ts)}</div></div>
+      <span class="tag">Gestión</span>`;
+    return row;
+  }
+  // Sentido: las visitas guardan tipo 'entrada'/'salida' (el lector peatonal de salida usa la
+  // puerta 'peatones'); las aperturas desde la app, la puerta 'salida'.
+  const sentido = (a.tipo === 'salida' || a.puerta === 'salida') ? 'out' : 'in';
+  const metodo = a.metodo || ((a.uid === 'qr' || a.uid === 'pin') ? a.uid : '');
+  const esVisita = !!metodo;
+  const titulo = esVisita ? (a.visitante || a.nombre || 'Visita') : (a.nombre || 'Usuario');
+  // Si el registro trae la nota "— revisar" (entrada/salida sin su par), se conserva abajo.
+  const nota = (esVisita && a.nombre && a.visitante && a.nombre !== a.visitante) ? a.nombre : '';
+  const invito = (a.invitadoPor || a.casa)
+    ? `<div class="mov-liga">Invitado por ${esc(a.invitadoPor || '—')}${a.casa ? ' · ' + esc(a.casa) : ''}</div>` : '';
+  const alertaHtml = alerta
+    ? `<div class="mov-liga bad">⚠️ Posible residente suspendido · coincide con ${esc(alerta.coincideCon || '')}</div>` : '';
+  row.innerHTML = `
+    <div class="ri">${SVG_CANDADO}</div>
+    <div class="rt"><div class="a">${esc(titulo)}</div>`
+    + `<div class="b">${esc(puertaName(a.puerta))} · ${fmtTime(a.ts)}${metodo ? ' · ' + metodo.toUpperCase() : ''}</div>`
+    + `${invito}${nota ? `<div class="mov-liga">${esc(nota)}</div>` : ''}${alertaHtml}</div>
+    <span class="tag ${sentido}">${sentido==='out'?'Salida':'Entrada'}</span>`;
+  return row;
 }
 
-function renderLog(snap){
+function renderLog(){
   const list = $('#logList');
-  if (snap.empty){ list.innerHTML = '<div class="empty">Sin movimientos</div>'; return; }
+  const soloAlertas = logSoloAlertas && enModoStaff();
+  if (soloAlertas){
+    // Se pinta desde alertas_bitacora (trae visitante, puerta, hora, quién invitó y casa):
+    // así aparecen también alertas más viejas que las 60 aperturas recientes.
+    const al = alertasBitacora.lista;
+    if (!al.length){ list.innerHTML = '<div class="empty">Sin alertas</div>'; return; }
+    list.innerHTML = '';
+    al.forEach(a => list.appendChild(filaBitacora(a, a)));
+    return;
+  }
+  const docs = logDocsCache;
+  if (!docs || !docs.length){ list.innerHTML = '<div class="empty">Sin movimientos</div>'; return; }
   list.innerHTML = '';
-  snap.forEach(doc => {
-    const a = doc.data();
-    const row = document.createElement('div');
-    row.className = 'row';
-    if (a.tipo === 'gestion'){
-      // Acción administrativa (FASE 5), no una apertura de puerta: ícono de engrane,
-      // el texto ya describe la acción, sin etiqueta Entrada/Salida.
-      row.innerHTML = `
-        <div class="ri"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
-        <div class="rt"><div class="a">${esc(a.nombre || 'Gestión')}</div><div class="b">Gestión · ${fmtTime(a.ts)}</div></div>
-        <span class="tag">Gestión</span>`;
-      list.appendChild(row); return;
-    }
-    const sentido = a.puerta==='salida' ? 'out' : 'in';
-    row.innerHTML = `
-      <div class="ri"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="9" width="16" height="12" rx="2"/><path d="M8 9V6a4 4 0 0 1 8 0v3"/></svg></div>
-      <div class="rt"><div class="a">${esc(a.nombre || 'Usuario')}</div><div class="b">${puertaName(a.puerta)} · ${fmtTime(a.ts)}${a.tipo==='qr' ? ' · QR' : ''}</div></div>
-      <span class="tag ${sentido}">${sentido==='out'?'Salida':'Entrada'}</span>`;
-    list.appendChild(row);
-  });
+  docs.forEach(d => list.appendChild(filaBitacora(d.data, alertasBitacora.porId.get(d.id))));
 }
 
 function puertaName(id){ return (DOORS.find(d=>d.id===id)||{}).name || id; }
@@ -2913,7 +2995,7 @@ $('#vcerrarConfirm')?.addEventListener('click', votCerrarConfirmar);
 $('#vcerrarCancel')?.addEventListener('click', () => closeSheet('#votCerrarOverlay'));
 $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votCerrarOverlay') closeSheet('#votCerrarOverlay'); });
 
-/* ====================== Versión visible (Gestión) ======================
+/* ====================== Versión visible (Puertas y Gestión) ======================
    MANTENER EN SYNC con el número de sw.js (const CACHE = 'marquesa-vN') cada vez que se
    publique una versión — es un literal a propósito, no se calcula solo.
    Se muestra YA, de forma síncrona, sin esperar nada del service worker: si dependiera solo
@@ -2923,11 +3005,12 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v11';
-(function mostrarVersionInmediata(){
-  const el = document.getElementById('appVersion');
-  if (el) el.textContent = 'Versión ' + APP_VERSION;
-})();
+const APP_VERSION = 'v12';
+/* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
+function pintarVersion(v){
+  document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
+}
+pintarVersion(APP_VERSION);
 
 /* ====================== Service worker (PWA) — auto-actualización ======================
    Objetivo: que un residente nunca tenga que borrar caché ni reinstalar para ver una mejora.
@@ -2987,9 +3070,7 @@ if ('serviceWorker' in navigator){
 
   const verCorta = n => { const m = /-v(\d+)$/i.exec(n || ''); return m ? ('v' + m[1]) : (n || ''); };
   function mostrarVersionSW(cacheName){
-    const el = document.getElementById('appVersion');
-    if (!el) return;
-    el.textContent = 'Versión ' + verCorta(cacheName);
+    pintarVersion(verCorta(cacheName));
   }
 
   function pintarDiag(){

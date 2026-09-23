@@ -15,6 +15,14 @@ service cloud.firestore {
           || (perfil().get('esAdmin', false) == true && perfil().get('estado', 'activo') == 'activo');
     }
     function signedIn() { return request.auth != null; }
+    // Casa de quien consulta = persona del JEFE: el jefe usa su personaId, el familiar su jefeId.
+    // '' para quien no es residente (esclavo, admin, master) → nunca coincide con ninguna casa.
+    // personaId/jefeId los escribe SOLO el Worker (el cliente solo puede tocar fcmToken).
+    function miCasaId() {
+      let p = perfil();
+      return p.get('rol', '') != 'residente' ? ''
+           : (p.get('jefeId', '') != '' ? p.get('jefeId', '') : p.get('personaId', ''));
+    }
 
     // ---- usuarios ----
     match /usuarios/{uid} {
@@ -29,13 +37,24 @@ service cloud.firestore {
 
     // ---- aperturas (bitácora) ----
     match /aperturas/{id} {
-      // staff ve todo; residente/esclavo solo su hogar
+      // staff ve todo; residente/esclavo su hogar; y TODA la casa (jefe y familiares) ve las
+      // visitas de su casa (el Worker guarda casaId en cada visita). Una casa nunca ve otra.
       allow read: if signedIn() && (
         staff() ||
         resource.data.hogar == request.auth.uid ||
-        resource.data.hogar == get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.get('residenteUid','')
+        resource.data.hogar == get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.get('residenteUid','') ||
+        (miCasaId() != '' && resource.data.casaId == miCasaId())
       );
       // los registros SOLO los escribe el Worker (service account, ignora estas reglas)
+      allow write: if false;
+    }
+
+    // ---- alertas_bitacora ("⚠️ Posible residente suspendido") ----
+    // Mismo id que el registro de aperturas al que marcan. SOLO staff: el residente que invitó
+    // no debe poder saber (ni con devtools) que el nombre de su visita coincide con un vecino
+    // suspendido. Las escribe únicamente el Worker.
+    match /alertas_bitacora/{id} {
+      allow read: if signedIn() && staff();
       allow write: if false;
     }
 

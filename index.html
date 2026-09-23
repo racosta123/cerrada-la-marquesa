@@ -255,6 +255,11 @@
   .mov-folio{font-size:11px;color:var(--muted-2);letter-spacing:.4px}
   .row-act.recibo{white-space:nowrap}
   /* Finanzas protegidas: un cancelado sigue visible, atenuado y con el monto tachado */
+  /* Bitácora: alerta "Posible residente suspendido" (solo staff) y filtro "Solo alertas" */
+  .row.alerta{border-color:rgba(248,113,113,.45);background:rgba(248,113,113,.06)}
+  .log-head{display:flex;align-items:center;justify-content:space-between;gap:10px}
+  .log-head .section-title{flex:1}
+  #logAlertasBtn.sel{background:rgba(248,113,113,.14);border-color:rgba(248,113,113,.5);color:var(--bad)}
   .row.cancelado{opacity:.62}
   .row.cancelado .mov-amt{text-decoration:line-through}
   .mov-liga{font-size:11px;color:var(--muted-2);margin-top:2px;line-height:1.4}
@@ -388,6 +393,9 @@
   <div id="tab-doors" class="tabpane">
     <div class="section-title">Abrir puertas</div>
     <div class="doors" id="doorsGrid"></div>
+    <!-- Versión visible para TODOS (mismo estilo y misma fuente que la de Gestión; el diagnóstico
+         técnico #appDiag se queda solo en Gestión, para staff) -->
+    <div class="app-version" style="margin:26px 0 18px;text-align:center;color:var(--text);font-size:14px;line-height:1.5"></div>
   </div>
 
   <!-- TAB: INVITADOS -->
@@ -410,7 +418,11 @@
 
   <!-- TAB: BITÁCORA -->
   <div id="tab-log" class="tabpane hidden">
-    <div class="section-title" id="logTitle">Mi historial</div>
+    <div class="log-head">
+      <div class="section-title" id="logTitle">Mi historial</div>
+      <!-- Solo staff: filtra la bitácora a los registros con "⚠️ Posible residente suspendido" -->
+      <button type="button" class="row-act hidden" id="logAlertasBtn">⚠️ Solo alertas</button>
+    </div>
     <div class="list" id="logList"><div class="empty">Sin movimientos</div></div>
   </div>
 
@@ -553,7 +565,7 @@
       <div id="susResultado" class="list" style="margin-top:10px"></div>
     </div>
 
-    <div id="appVersion" style="margin:26px 0 4px;text-align:center;color:var(--text);font-size:14px;line-height:1.5"></div>
+    <div id="appVersion" class="app-version" style="margin:26px 0 4px;text-align:center;color:var(--text);font-size:14px;line-height:1.5"></div>
     <div id="appDiag" class="vnote" style="margin:0 0 18px;text-align:center;font-size:11px"></div>
   </div>
 

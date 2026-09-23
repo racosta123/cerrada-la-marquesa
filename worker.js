@@ -284,9 +284,85 @@ async function consumirInvitacion(env, inv, readerId, metodo) {
     await devolverReservaInvitacion(env, inv, reader.direccion === 'entrada' && inv.usosRestantes !== null);
     throw e;
   }
-  await logApertura(env, { uid: metodo, nombre: nombreLog, puerta: reader.puerta, hogar: inv.hogar, tipo: reader.direccion });
+  // Los datos de "quién invitó" y la alerta se calculan DESPUÉS del pulso: la puerta ya abrió,
+  // así estas lecturas extra nunca retrasan el acceso.
+  const extra = await datosBitacoraVisita(env, inv, anfitrion);
+  await logVisita(env, { metodo, nombre: nombreLog, visitante: inv.visitante, puerta: reader.puerta,
+    hogar: inv.hogar, tipo: reader.direccion, invitacionId: inv.id, ...extra });
   await notificarResidente(env, inv.hogar,
     `Visita ${inv.visitante} ${reader.direccion === 'entrada' ? 'entró' : 'salió'} por ${reader.puerta}`);
+}
+
+/* ---- Bitácora de visitas: "Invitado por <nombre> · <casa>" + alerta de posible suspendido ----
+   Todo sale del SERVIDOR: la invitación (creadaPor, hogar, visitante) y los perfiles/padrón en
+   Firestore — nada del cliente ni del lector. Nunca lanza: si algo falla, el registro se escribe
+   igual, solo sin estos datos extra (la puerta ya abrió). */
+function normNombre(s) {
+  return String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+async function datosBitacoraVisita(env, inv, anfitrion) {
+  // casaId = persona del JEFE de la casa (el jefe: su propio personaId; un familiar: su jefeId).
+  // Sale del anfitrión (dueño del hogar de la invitación; el de un esclavo es su titular) y es lo
+  // que usan las reglas para que TODA la casa —jefe y familiares— vea las visitas de la casa.
+  const casaId = anfitrion && anfitrion.rol === 'residente' ? (anfitrion.jefeId || anfitrion.personaId || '') : '';
+  const out = { invitadoPor: '', casa: anfitrion?.casa || '', casaId, coincideCon: [] };
+  try {
+    const [creador, personas] = await Promise.all([
+      !inv.creadaPor ? null : (inv.creadaPor === inv.hogar && anfitrion ? anfitrion : getPerfil(env, inv.creadaPor)),
+      personasList(env),
+    ]);
+    out.invitadoPor = creador?.nombre || '';
+    out.casa = creador?.casa || out.casa;
+    // Alerta (solo marca, NO bloquea): el nombre de la visita coincide —sin importar mayúsculas,
+    // acentos ni espacios extra— con un jefe o familiar SUSPENDIDO del padrón.
+    const n = normNombre(inv.visitante);
+    if (n) {
+      const byId = {}; personas.forEach(p => byId[p.id] = p);
+      out.coincideCon = personas
+        .filter(p => p.rol === 'residente' && p.estado === 'suspendido' && normNombre(p.nombre) === n)
+        .map(p => { const dom = domicilioDe(p, byId); return `${p.nombre}${dom ? ' (' + dom + ')' : ''}${p.jefeId ? ' · familiar' : ''}`; });
+    }
+  } catch (e) {
+    console.error('[bitacora] no se pudieron completar los datos de la visita:', e && e.name);
+  }
+  return out;
+}
+/* Registro de una visita por invitación. aperturas/{id} lo ven el staff, el propio hogar y toda
+   la casa (jefe y familiares, por casaId — ver reglas).
+   La ALERTA va aparte, en alertas_bitacora/{mismo id}, que SOLO lee el staff: si viviera dentro
+   del registro, el residente que invitó podría ver con las devtools que el nombre de su visita
+   coincide con un vecino suspendido. Ambos en el mismo commit. */
+async function logVisita(env, o) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const id = crypto.randomUUID();
+  const ts = { timestampValue: new Date().toISOString() };
+  const comun = {
+    visitante: { stringValue: o.visitante || '' },
+    puerta: { stringValue: o.puerta }, hogar: { stringValue: o.hogar }, tipo: { stringValue: o.tipo },
+    metodo: { stringValue: o.metodo }, invitacionId: { stringValue: o.invitacionId || '' },
+    invitadoPor: { stringValue: o.invitadoPor || '' }, casa: { stringValue: o.casa || '' },
+    casaId: { stringValue: o.casaId || '' }, ts,
+  };
+  const writes = [{
+    update: { name: docName(env, `aperturas/${id}`), fields: {
+      uid: { stringValue: o.metodo }, nombre: { stringValue: o.nombre || o.visitante || 'Visita' }, ...comun,
+    } },
+    currentDocument: { exists: false },
+  }];
+  if (o.coincideCon && o.coincideCon.length) {
+    writes.push({
+      update: { name: docName(env, `alertas_bitacora/${id}`), fields: {
+        aperturaId: { stringValue: id }, tipoAlerta: { stringValue: 'posible-suspendido' },
+        coincideCon: { stringValue: o.coincideCon.join('; ').slice(0, 300) }, ...comun,
+      } },
+      currentDocument: { exists: false },
+    });
+  }
+  const r = await fetch(`${fsBase(env)}:commit`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ writes }),
+  });
+  if (!r.ok) console.error(`[bitacora] no se pudo registrar la visita (HTTP ${r.status})`);
 }
 
 /* Reserva ATÓMICA de un uso (entrada con usos limitados). Transacción de Firestore REST (los
