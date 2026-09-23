@@ -125,13 +125,18 @@
     position:relative;background:var(--surface);border:1px solid var(--line);
     border-radius:var(--r);padding:18px 16px 16px;overflow:hidden;
     transition:transform .12s,border-color .2s;
+    /* Solo visual: al dejar el dedo quieto sobre el botón no debe seleccionarse el texto ni
+       salir el menú del sistema/lupa de iOS. El toque sigue abriendo de inmediato. */
+    user-select:none;-webkit-user-select:none;
+    -webkit-touch-callout:none;-webkit-tap-highlight-color:transparent;
   }
   .door:active{transform:scale(.97)}
   .door .ic{
     width:46px;height:46px;border-radius:14px;background:var(--gold-dim);
     display:flex;align-items:center;justify-content:center;margin-bottom:14px;
+    -webkit-user-drag:none;
   }
-  .door .ic svg{width:24px;height:24px;color:var(--gold-soft)}
+  .door .ic svg{width:24px;height:24px;color:var(--gold-soft);-webkit-user-drag:none}
   .door .dn{font-size:15px;font-weight:600}
   .door .ds{font-size:12px;color:var(--muted-2);margin-top:2px}
   .door .pulse{
