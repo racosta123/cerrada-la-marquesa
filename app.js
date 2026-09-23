@@ -608,10 +608,9 @@ function watchInvites(){
    un índice que sincroniza el Worker; aquí NO se lee/escribe esa colección directo. */
 const normDom = s => String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
 function esJefeP(p){ return p.rol === 'residente' && !p.jefeId; }
-/* jefes() = TODAS las casas (activas y suspendidas). casasActivas() = solo activas, para el
-   dropdown de registro de ingreso (el Worker solo acepta cobrar a casas activas). El
-   termómetro y las listas de cobranza usan el conteo del Worker (todas las casas). */
-function casasActivas(){ return personasCache.filter(p => esJefeP(p) && p.estado === 'activo'); }
+/* jefes() = TODAS las casas (activas y suspendidas) — también el dropdown de registro de
+   ingreso: se puede cobrar a una casa suspendida. El termómetro y las listas de cobranza
+   usan el conteo del Worker (todas las casas). */
 function jefes(){ return personasCache.filter(esJefeP); }
 
 async function cargarPersonas(){
@@ -1961,13 +1960,14 @@ $('#finLogToggle')?.addEventListener('click', () => {
 let movCorrigiendo = null;   // null = alta normal; movimiento original = modo corrección
 /* FASE 4.5: casa obligatoria en TODO ingreso — cada recibo queda amarrado a una casa. */
 function casaRequerida(){ return movType==='ingreso'; }
-/* FASE 6.5: el campo Domicilio es un dropdown con las casas ACTIVAS del padrón (jefes
-   activos; ya no números 1..N ni texto libre) — el Worker revalida contra el padrón.
-   En una CORRECCIÓN se listan también las suspendidas: el pago original pudo ser de una casa
-   que hoy está suspendida (el Worker lo acepta solo en /finanzas/corregir). */
+/* FASE 6.5: el campo Domicilio es un dropdown con TODAS las casas del padrón (jefes, activos
+   y suspendidos, marcados "(suspendido)"; ya no números 1..N ni texto libre) — el Worker
+   revalida contra el padrón. Las suspendidas van incluidas a propósito: un moroso que llega a
+   pagar tiene que poder pagar, y ese pago de Cuota dispara la reactivación automática (solo
+   si la suspensión fue por mora; una manual no se quita sola). */
 function poblarCasaSelect(){
   const sel = $('#movCasa');
-  const fuente = movCorrigiendo ? jefes() : casasActivas();
+  const fuente = jefes();
   const activos = fuente.slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
   const prev = sel.value;
   sel.innerHTML = '';

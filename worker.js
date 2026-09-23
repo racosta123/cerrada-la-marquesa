@@ -607,9 +607,10 @@ async function avisarLimiteFinanzas(env, req, user, perfil, movId) {
 
 /* Valida y normaliza los datos de un movimiento (alta o corrección). NO se confía en el front.
    En ingresos, casa DEBE ser un JEFE de familia del padrón (comparación normalizada) y se guarda
-   el domicilio canónico. El alta exige casa ACTIVA (igual que siempre); una corrección acepta
-   también una casa suspendida — el pago original pudo ser de una casa que hoy está suspendida. */
-async function validarDatosMovimiento(env, body, { aceptarSuspendidas = false } = {}) {
+   el domicilio canónico. Se acepta la casa ACTIVA o SUSPENDIDA (por mora o manual): un moroso que
+   llega a pagar tiene que poder pagar, y es justo ese pago el que dispara intentarReactivarPorPago
+   (que solo levanta suspensiones por mora; una manual NO se quita sola). */
+async function validarDatosMovimiento(env, body) {
   const { tipo, concepto, categoria, monto, casa } = body || {};
   if (!['ingreso','egreso'].includes(tipo)) throw httpErr(400, 'Tipo inválido');
   const m = Number(monto);
@@ -621,9 +622,9 @@ async function validarDatosMovimiento(env, body, { aceptarSuspendidas = false } 
     const dom = String(casa == null ? '' : casa).trim().replace(/\s+/g, ' ');
     if (!dom) throw httpErr(400, 'Falta el domicilio para un ingreso');
     const domNorm = normDomicilio(dom);
-    const jefes = (await personasList(env)).filter(p => esJefe(p) && (aceptarSuspendidas || (p.estado || 'activo') === 'activo'));
+    const jefes = (await personasList(env)).filter(p => esJefe(p));
     const match = jefes.find(j => j.domicilioNorm === domNorm);
-    if (!match) throw httpErr(400, aceptarSuspendidas ? `Domicilio no registrado: "${dom}"` : `Domicilio no registrado o suspendido: "${dom}"`);
+    if (!match) throw httpErr(400, `Domicilio no registrado: "${dom}"`);
     casaCanon = match.domicilio;
   }
   return { tipo, concepto: String(concepto).slice(0,120), cat, m, casaCanon };
@@ -804,7 +805,7 @@ async function corregirFinanza(req, env) {
   const { id } = body;
   if (!id || !ID_MOV_RE.test(id)) throw httpErr(400, 'id inválido');
   const mot = validarMotivo(body.motivo);
-  const nuevo = await validarDatosMovimiento(env, body, { aceptarSuspendidas: true });
+  const nuevo = await validarDatosMovimiento(env, body);
 
   const nuevoId = crypto.randomUUID();
   let folioRecibo = '';
