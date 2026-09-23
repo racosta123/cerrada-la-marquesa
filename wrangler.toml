@@ -4,6 +4,11 @@ compatibility_date = "2025-01-01"
 
 [vars]
 ALLOWED_ORIGIN = "https://racosta123.github.io"
+# "1" (default, seguro) = toda apertura pasa por el portero de fila (SHELLY_GATE). "0" = bypass:
+# llamada directa a Shelly Cloud, sin cola/espaciado/dedupe (mismo timeout, mismos secrets).
+# Cualquier valor raro o ausente = "1". Solo para comparar tiempos con/sin portero — ver
+# triggerShelly() en worker.js. Al terminar cualquier prueba, debe quedar en "1".
+SHELLY_GATE_ENABLED = "0"
 # Portero de fila de Shelly Cloud (límite ~1 req/s por cuenta). Ajustables sin tocar código:
 SHELLY_MIN_SPACING_MS = 1200      # separación mínima entre llamadas reales a Shelly
 SHELLY_RETRY_DELAY_MS = 1500      # pausa antes del único reintento por max_req / 429
