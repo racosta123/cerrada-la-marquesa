@@ -86,7 +86,9 @@ export default {
         case '/finanzas/resumen':  out = await resumenFinanzas(req, env); break;
         case '/finanzas/cobranza': out = await cobranzaFinanzas(req, env); break;
         case '/finanzas/marcar-recibo': out = await marcarRecibo(req, env); break;
-        case '/finanzas/borrar':   out = await borrarFinanza(req, env); break;
+        case '/finanzas/cancelar': out = await cancelarFinanza(req, env); break;
+        case '/finanzas/corregir': out = await corregirFinanza(req, env); break;
+        case '/finanzas/reactivar': out = await reactivarFinanza(req, env); break;
         case '/finanzas/estado-cuenta': out = await estadoCuentaFinanzas(req, env); break;
         case '/config/cobranza':            out = await obtenerConfigCobranza(req, env); break;
         case '/config/cobranza-actualizar': out = await actualizarConfigCobranza(req, env); break;
@@ -475,42 +477,174 @@ async function borrarUsuario(req, env) {
 
 // Trim + colapsa espacios dobles/múltiples a uno solo (no prohíbe espacios internos,
 // solo normaliza — así "casa  57" y "casa 57" terminan guardados igual).
+/* ===========================================================
+   FINANZAS PROTEGIDAS — un movimiento NUNCA se borra.
+   - Cancelar: estado:'cancelado' + motivo obligatorio. Sigue visible (tachado) pero ya no cuenta
+     en la caja, la cobranza, el adeudo ni la suspensión automática (todos filtran esCancelado).
+     El folio del recibo se conserva: la numeración nunca tiene huecos.
+   - Corregir: en UNA sola transacción cancela el original (con el motivo) y crea el corregido,
+     ligados (corregidoPorId ↔ corrigeAId). Si es ingreso, el corregido lleva folio NUEVO.
+   - Reactivar (solo master): deshace una cancelación, con motivo.
+   - Permisos: staff (master/admin/jefe-admin) cancela/corrige movimientos del mes actual y el
+     anterior (hora Hermosillo); más viejos, solo master. Límite: 5 cancelaciones+correcciones
+     por hora POR CUENTA (también el master: el riesgo es una cuenta robada) → 429 + aviso al master.
+   - Bitácora: cada alta/cambio escribe finanzas_log/{auto} EN EL MISMO commit que el cambio —
+     nunca queda un cambio sin su registro, ni un registro de algo que no pasó.
+   =========================================================== */
+const FIN_LIMITE_POR_HORA = 5;
+const esCancelado = d => !!d && d.estado === 'cancelado';
+const ID_MOV_RE = /^[A-Za-z0-9-]{10,64}$/;
+
+function mesIndexHermosillo(instante) {
+  const d = aHermosillo(instante);
+  return d.getUTCFullYear() * 12 + d.getUTCMonth();
+}
+// Admin/jefe-admin: mes actual y el anterior. Master: cualquiera.
+function checarVentanaMovimiento(perfil, mov) {
+  if (perfil.rol === 'master') return;
+  if (mesIndexHermosillo(Date.now()) - mesIndexHermosillo(mov.ts) > 1) {
+    throw httpErr(403, 'Ese movimiento es de hace más de un mes: solo el master puede cancelarlo o corregirlo');
+  }
+}
+function validarMotivo(motivo) {
+  const m = String(motivo == null ? '' : motivo).trim().replace(/\s+/g, ' ');
+  if (m.length < 5) throw httpErr(400, 'El motivo es obligatorio (mínimo 5 caracteres)');
+  return m.slice(0, 300);
+}
+function rolEtiqueta(perfil) {
+  if (!perfil) return '';
+  return perfil.rol === 'residente' && perfil.esAdmin === true ? 'jefe-admin' : (perfil.rol || '');
+}
+// Referencia humana de un movimiento: su folio de recibo o, si no tiene (gastos), #ABC123.
+function refMov(id, d) { return (d && d.folioRecibo) || ('#' + String(id).slice(0, 6).toUpperCase()); }
+function resumenMov(id, d) {
+  const signo = d.tipo === 'ingreso' ? '+' : '−';
+  return `${refMov(id, d)} · ${signo}$${d.monto} · ${d.categoria || 'Otro'} · ${d.concepto || ''}${d.casa ? ' · ' + d.casa : ''}`;
+}
+
+/* Commit NO transaccional de varias escrituras juntas (atómico: o todas o ninguna). */
+async function fsCommit(env, at, writes) {
+  const r = await fetch(`${fsBase(env)}:commit`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ writes }),
+  });
+  if (r.status === 404) throw httpErr(404, 'Movimiento no existe');
+  if (!r.ok) throw httpErr(500, 'Firestore commit falló');
+  return r.json();
+}
+
+/* Una entrada de finanzas_log como write de commit. antes/despues son mapas de fields de
+   Firestore tal cual (foto del movimiento). ip/ua salen de Cloudflare para rastrear una cuenta
+   robada. Solo el Worker escribe aquí; staff lo lee (reglas). */
+function writeLogFinanzas(env, req, { movId, accion, uid, perfil, resumen, motivo, relacionadoId, antes, despues }) {
+  const fields = {
+    movId: { stringValue: movId },
+    accion: { stringValue: accion },
+    uid: { stringValue: uid },
+    nombre: { stringValue: perfil?.nombre || (uid === 'sistema' ? 'Sistema' : '') },
+    rol: { stringValue: rolEtiqueta(perfil) },
+    ts: { timestampValue: new Date().toISOString() },
+    resumen: { stringValue: String(resumen || '').slice(0, 300) },
+  };
+  if (motivo) fields.motivo = { stringValue: motivo };
+  if (relacionadoId) fields.relacionadoId = { stringValue: relacionadoId };
+  if (antes) fields.antes = { mapValue: { fields: antes } };
+  if (despues) fields.despues = { mapValue: { fields: despues } };
+  if (req) {
+    fields.ip = { stringValue: req.headers.get('cf-connecting-ip') || '' };
+    fields.ua = { stringValue: (req.headers.get('user-agent') || '').slice(0, 200) };
+  }
+  return { update: { name: docName(env, `finanzas_log/${crypto.randomUUID()}`), fields }, currentDocument: { exists: false } };
+}
+
+/* Límite de cancelaciones+correcciones por hora, DENTRO de la transacción (dos pestañas a la vez
+   no se lo saltan). finanzas_limites/{uid}.marcas = timestamps de la última hora. Devuelve el
+   write que agrega la marca nueva; si ya hay FIN_LIMITE_POR_HORA, lanza 429. */
+async function limiteCancelacionTx(env, at, tx, uid) {
+  const doc = await txGet(env, at, `finanzas_limites/${uid}`, tx);
+  const hace1h = Date.now() - HORA_MS;
+  const marcas = (doc?.fields?.marcas?.arrayValue?.values || [])
+    .map(v => v.timestampValue).filter(t => t && new Date(t).getTime() > hace1h);
+  if (marcas.length >= FIN_LIMITE_POR_HORA) {
+    throw httpErr(429, `Límite alcanzado: máximo ${FIN_LIMITE_POR_HORA} cancelaciones o correcciones por hora. Se avisó al master.`);
+  }
+  marcas.push(new Date().toISOString());
+  return {
+    update: { name: docName(env, `finanzas_limites/${uid}`), fields: { marcas: { arrayValue: { values: marcas.map(t => ({ timestampValue: t })) } } } },
+    updateMask: { fieldPaths: ['marcas'] },
+  };
+}
+
+/* Aviso de límite: bitácora de finanzas + bitácora general + push a los master que tengan
+   notificaciones activas. Máximo un push por cuenta por hora (avisadoTs). Nunca lanza. */
+async function avisarLimiteFinanzas(env, req, user, perfil, movId) {
+  try {
+    const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+    const quien = `${perfil?.nombre || 'Alguien'} (${rolEtiqueta(perfil)})`;
+    const texto = `${quien} alcanzó el límite de ${FIN_LIMITE_POR_HORA} cancelaciones/correcciones por hora en Finanzas y fue bloqueado.`;
+    await fsCommit(env, at, [writeLogFinanzas(env, req, {
+      movId: movId || '', accion: 'limite', uid: user.uid, perfil, resumen: texto,
+    })]);
+    await logBitacora(env, at, { uid: user.uid, nombre: texto });
+
+    const lim = await getDoc(env, at, `finanzas_limites/${user.uid}`);
+    const avisado = lim?.fields?.avisadoTs?.timestampValue;
+    if (avisado && Date.now() - new Date(avisado).getTime() < HORA_MS) return;
+    await firestoreUpdate(env, `finanzas_limites/${user.uid}`, { avisadoTs: { timestampValue: new Date().toISOString() } }, ['avisadoTs']);
+    const masters = (await firestoreList(env, 'usuarios')).map(d => readDoc(d.fields)).filter(u => u && u.rol === 'master' && u.fcmToken);
+    if (!masters.length) return;
+    const atFcm = await saToken(env, 'https://www.googleapis.com/auth/firebase.messaging');
+    for (const m of masters) {
+      await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/messages:send`, {
+        method: 'POST', headers: { Authorization: 'Bearer ' + atFcm, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: { token: m.fcmToken, notification: { title: '⚠️ Finanzas · Cerrada La Marquesa', body: texto } } }),
+      }).catch(() => {});
+    }
+  } catch (e) {
+    console.error('avisarLimiteFinanzas', e);
+  }
+}
+
+/* Valida y normaliza los datos de un movimiento (alta o corrección). NO se confía en el front.
+   En ingresos, casa DEBE ser un JEFE de familia del padrón (comparación normalizada) y se guarda
+   el domicilio canónico. El alta exige casa ACTIVA (igual que siempre); una corrección acepta
+   también una casa suspendida — el pago original pudo ser de una casa que hoy está suspendida. */
+async function validarDatosMovimiento(env, body, { aceptarSuspendidas = false } = {}) {
+  const { tipo, concepto, categoria, monto, casa } = body || {};
+  if (!['ingreso','egreso'].includes(tipo)) throw httpErr(400, 'Tipo inválido');
+  const m = Number(monto);
+  if (!concepto || !(m > 0)) throw httpErr(400, 'Concepto o monto inválido');
+  const cat = String(categoria||'Otro').slice(0,40);
+
+  let casaCanon = '';
+  if (tipo === 'ingreso') {
+    const dom = String(casa == null ? '' : casa).trim().replace(/\s+/g, ' ');
+    if (!dom) throw httpErr(400, 'Falta el domicilio para un ingreso');
+    const domNorm = normDomicilio(dom);
+    const jefes = (await personasList(env)).filter(p => esJefe(p) && (aceptarSuspendidas || (p.estado || 'activo') === 'activo'));
+    const match = jefes.find(j => j.domicilioNorm === domNorm);
+    if (!match) throw httpErr(400, aceptarSuspendidas ? `Domicilio no registrado: "${dom}"` : `Domicilio no registrado o suspendido: "${dom}"`);
+    casaCanon = match.domicilio;
+  }
+  return { tipo, concepto: String(concepto).slice(0,120), cat, m, casaCanon };
+}
+
 /* ============ /finanzas/registrar — solo master/admin ============ */
 async function registrarFinanza(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
   if (!esStaff(perfil)) throw httpErr(403, 'Solo master/admin registran finanzas');
 
-  const { tipo, concepto, categoria, monto, casa } = await req.json();
-  if (!['ingreso','egreso'].includes(tipo)) throw httpErr(400, 'Tipo inválido');
-  const m = Number(monto);
-  if (!concepto || !(m > 0)) throw httpErr(400, 'Concepto o monto inválido');
-
-  const cat = String(categoria||'Otro').slice(0,40);
-
-  // FASE 5: en ingresos, casa DEBE coincidir con el domicilio de un vecino ACTIVO del
-  // padrón (comparación normalizada; NO se confía en el frontend). Se guarda el domicilio
-  // canónico del padrón para que morosos/termómetro/consulta casen exacto.
-  let casaCanon = '';
-  if (tipo === 'ingreso') {
-    const dom = String(casa == null ? '' : casa).trim().replace(/\s+/g, ' ');
-    if (!dom) throw httpErr(400, 'Falta el domicilio para un ingreso');
-    const domNorm = normDomicilio(dom);
-    // FASE 6.5: la casa debe ser un JEFE de familia activo del padrón de personas.
-    const jefes = (await personasList(env)).filter(p => esJefe(p) && (p.estado || 'activo') === 'activo');
-    const match = jefes.find(j => j.domicilioNorm === domNorm);
-    if (!match) throw httpErr(400, `Domicilio no registrado o suspendido: "${dom}"`);
-    casaCanon = match.domicilio;
-  }
+  const { tipo, concepto, cat, m, casaCanon } = await validarDatosMovimiento(env, await req.json());
 
   // Los ingresos llevan recibo: folio consecutivo del mes, asignado de forma atómica.
   // Se asigna DESPUÉS de validar la casa para no quemar un folio en un registro inválido.
   const folioRecibo = tipo === 'ingreso' ? await siguienteFolioRecibo(env) : '';
 
   const id = crypto.randomUUID();
-  await firestoreSet(env, `finanzas/${id}`, {
+  const fields = {
     tipo:{stringValue:tipo},
-    concepto:{stringValue:String(concepto).slice(0,120)},
+    concepto:{stringValue:concepto},
     categoria:{stringValue:cat},
     monto:{doubleValue:m},
     casa:{stringValue:casaCanon},
@@ -518,7 +652,14 @@ async function registrarFinanza(req, env) {
     creadoPor:{stringValue:user.uid},
     creadoNombre:{stringValue:perfil.nombre||''},
     ts:{timestampValue:new Date().toISOString()},
-  });
+  };
+  // Movimiento + su entrada de bitácora en el MISMO commit.
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  await fsCommit(env, at, [
+    { update:{ name: docName(env, `finanzas/${id}`), fields }, currentDocument:{ exists:false } },
+    writeLogFinanzas(env, req, { movId:id, accion:'crear', uid:user.uid, perfil,
+      resumen: resumenMov(id, readDoc(fields)), despues: fields }),
+  ]);
 
   // Reactivación automática: solo cuando el ingreso es una Cuota con casa válida. No bloquea
   // ni puede fallar la respuesta (ver comentario de intentarReactivarPorPago) — el ingreso ya
@@ -528,15 +669,23 @@ async function registrarFinanza(req, env) {
   }
 
   // FASE 7 — autocobro: un jefe-admin puede registrar el pago de SU PROPIA casa (es admin y
-  // es casa a la vez). Es legítimo, pero no debe ser invisible: queda en la bitácora. Borrar
-  // movimientos sigue siendo solo-master, así que no puede tapar su propio rastro.
+  // es casa a la vez). Es legítimo, pero no debe ser invisible: queda en la bitácora. Ya nadie
+  // borra movimientos (solo se cancelan, con motivo y rastro), así que no puede tapar su rastro.
   if (perfil.esAdmin === true && casaCanon && normDomicilio(perfil.casa || '') === normDomicilio(casaCanon)) {
-    await logBitacora(env, await saToken(env, 'https://www.googleapis.com/auth/datastore'), {
+    await logBitacora(env, at, {
       uid: user.uid,
       nombre: `${perfil.nombre || 'Admin'} registró un pago de su propia casa (${casaCanon}) por ${m}`,
     });
   }
   return json({ ok:true, id, folioRecibo });
+}
+
+/* Clave del contador de folios del mes (rec_YYYYMM). Mismo criterio que siempre: mes del
+   reloj del Worker. Compartida por siguienteFolioRecibo y la corrección transaccional. */
+function claveFolioMes() {
+  const now = new Date();
+  const ym = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}`;
+  return { ym, campo: `rec_${ym}` };
 }
 
 /* folio consecutivo atómico REC-YYYYMM-### — un solo commit con updateTransforms
@@ -545,8 +694,7 @@ async function registrarFinanza(req, env) {
    carreras entre registros simultáneos. El contador reinicia cada mes (campo
    rec_YYYYMM nuevo). config/folios está bajo match /config → solo el Worker escribe. */
 async function siguienteFolioRecibo(env) {
-  const now = new Date();
-  const ym = `${now.getFullYear()}${String(now.getMonth()+1).padStart(2,'0')}`;
+  const { ym, campo } = claveFolioMes();
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const base = `projects/${env.FIREBASE_PROJECT}/databases/(default)`;
   const r = await fetch(`https://firestore.googleapis.com/v1/${base}/documents:commit`, {
@@ -557,7 +705,7 @@ async function siguienteFolioRecibo(env) {
         // el increment va aparte en updateTransforms.
         update: { name: `${base}/documents/config/folios`, fields: {} },
         updateMask: { fieldPaths: [] },
-        updateTransforms: [{ fieldPath: `rec_${ym}`, increment: { integerValue: '1' } }],
+        updateTransforms: [{ fieldPath: campo, increment: { integerValue: '1' } }],
       }],
     }),
   });
@@ -570,50 +718,199 @@ async function siguienteFolioRecibo(env) {
 
 /* ============ /finanzas/marcar-recibo — solo master/admin ============
    Marca en el movimiento cuándo se compartió o descargó su recibo, para que el
-   reporte por casa pueda referenciar "enviado el ...". Solo toca ese campo. */
+   reporte por casa pueda referenciar "enviado el ...". Solo toca ese campo (y deja
+   su entrada en la bitácora, en el mismo commit). */
 async function marcarRecibo(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
   if (!esStaff(perfil)) throw httpErr(403, 'Solo master/admin');
 
   const { id, accion } = await req.json();
-  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  if (!id || !ID_MOV_RE.test(id)) throw httpErr(400, 'id inválido');
   if (!['compartido','descargado'].includes(accion)) throw httpErr(400, 'accion inválida');
 
   const campo = accion === 'compartido' ? 'reciboCompartidoTs' : 'reciboDescargadoTs';
-  await firestoreActualizarCampos(env, `finanzas/${id}`, {
-    [campo]:{timestampValue:new Date().toISOString()},
-  }, 'Movimiento');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  await fsCommit(env, at, [
+    { update:{ name: docName(env, `finanzas/${id}`), fields:{ [campo]:{timestampValue:new Date().toISOString()} } },
+      updateMask:{ fieldPaths:[campo] }, currentDocument:{ exists:true } },
+    writeLogFinanzas(env, req, { movId:id, accion:'marcar-recibo', uid:user.uid, perfil,
+      resumen: `Recibo ${accion}` }),
+  ]);
   return json({ ok:true, id, [campo]: true });
 }
 
-/* ============ /finanzas/borrar — SOLO master ============
-   Para errores de captura y pruebas. Antes de borrar copia el documento completo a
-   finanzas_borrados/{id} con quién y cuándo (auditoría; sin match en las reglas →
-   ilegible para clientes, visible solo en la consola de Firebase / vía Worker). */
-async function borrarFinanza(req, env) {
+/* Campos que marcan un movimiento como cancelado (se agregan con updateMask; el resto del
+   documento queda intacto — folio incluido). */
+function camposCancelacion(user, perfil, motivo, extra = {}) {
+  return {
+    estado:{stringValue:'cancelado'},
+    motivoCancelacion:{stringValue:motivo},
+    canceladoPor:{stringValue:user.uid},
+    canceladoNombre:{stringValue:perfil.nombre||''},
+    canceladoTs:{timestampValue:new Date().toISOString()},
+    ...extra,
+  };
+}
+
+/* ============ /finanzas/cancelar — staff, con motivo ============ */
+async function cancelarFinanza(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
-  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master borra movimientos');
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff cancela movimientos');
 
-  const { id } = await req.json();
-  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const { id, motivo } = await req.json();
+  if (!id || !ID_MOV_RE.test(id)) throw httpErr(400, 'id inválido');
+  const mot = validarMotivo(motivo);
 
-  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
-  const rGet = await fetch(`${fsBase(env)}/finanzas/${id}`, { headers:{ Authorization:'Bearer '+at } });
-  if (rGet.status === 404) throw httpErr(404, 'Movimiento no existe');
-  if (!rGet.ok) throw httpErr(500, 'Firestore get falló');
-  const docActual = await rGet.json();
+  try {
+    await conTx(env, async (at, tx) => {
+      const doc = await txGet(env, at, `finanzas/${id}`, tx);
+      if (!doc) throw httpErr(404, 'Movimiento no existe');
+      const d = readDoc(doc.fields);
+      if (esCancelado(d)) throw httpErr(409, 'Ese movimiento ya está cancelado');
+      checarVentanaMovimiento(perfil, d);
+      const wLimite = await limiteCancelacionTx(env, at, tx, user.uid);
 
-  await firestoreSet(env, `finanzas_borrados/${id}`, {
-    ...(docActual.fields || {}),
-    borradoPor:{stringValue:user.uid},
-    borradoNombre:{stringValue:perfil.nombre||''},
-    borradoTs:{timestampValue:new Date().toISOString()},
-  }, at);
+      const campos = camposCancelacion(user, perfil, mot);
+      return { writes: [
+        { update:{ name: docName(env, `finanzas/${id}`), fields: campos },
+          updateMask:{ fieldPaths: Object.keys(campos) }, currentDocument:{ exists:true } },
+        wLimite,
+        writeLogFinanzas(env, req, { movId:id, accion:'cancelar', uid:user.uid, perfil, motivo:mot,
+          resumen: 'Canceló ' + resumenMov(id, d), antes: doc.fields, despues: campos }),
+      ] };
+    });
+  } catch (e) {
+    if (e.status === 429) await avisarLimiteFinanzas(env, req, user, perfil, id);
+    throw e;
+  }
+  // Cancelar un pago NO suspende al instante: si la casa queda con adeudo, lo decide la
+  // suspensión automática (cron) con sus reglas de siempre.
+  return json({ ok:true, id });
+}
 
-  const rDel = await fetch(`${fsBase(env)}/finanzas/${id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
-  if (!rDel.ok) throw httpErr(500, 'Firestore delete falló');
+/* ============ /finanzas/corregir — staff, con motivo ============
+   UNA transacción: cancela el original (motivo + corregidoPorId) y crea el corregido
+   (corrigeAId, misma fecha del movimiento original). Si el corregido es ingreso lleva folio
+   NUEVO, reservado dentro de la misma transacción (config/folios leído y escrito en ella):
+   si algo falla no se quema folio ni queda el original cancelado sin su reemplazo. */
+async function corregirFinanza(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff corrige movimientos');
+
+  const body = await req.json();
+  const { id } = body;
+  if (!id || !ID_MOV_RE.test(id)) throw httpErr(400, 'id inválido');
+  const mot = validarMotivo(body.motivo);
+  const nuevo = await validarDatosMovimiento(env, body, { aceptarSuspendidas: true });
+
+  const nuevoId = crypto.randomUUID();
+  let folioRecibo = '';
+  try {
+    folioRecibo = await conTx(env, async (at, tx) => {
+      const doc = await txGet(env, at, `finanzas/${id}`, tx);
+      if (!doc) throw httpErr(404, 'Movimiento no existe');
+      const d = readDoc(doc.fields);
+      if (esCancelado(d)) throw httpErr(409, 'Ese movimiento ya está cancelado: no se puede corregir');
+      checarVentanaMovimiento(perfil, d);
+      const wLimite = await limiteCancelacionTx(env, at, tx, user.uid);
+
+      const writes = [];
+      let folio = '';
+      if (nuevo.tipo === 'ingreso') {
+        const { ym, campo } = claveFolioMes();
+        const fol = await txGet(env, at, 'config/folios', tx);
+        const n = Number(fol?.fields?.[campo]?.integerValue || 0) + 1;
+        folio = `REC-${ym}-${String(n).padStart(3,'0')}`;
+        writes.push({ update:{ name: docName(env, 'config/folios'), fields:{ [campo]:{ integerValue:String(n) } } },
+                      updateMask:{ fieldPaths:[campo] } });
+      }
+
+      const fieldsNuevo = {
+        tipo:{stringValue:nuevo.tipo},
+        concepto:{stringValue:nuevo.concepto},
+        categoria:{stringValue:nuevo.cat},
+        monto:{doubleValue:nuevo.m},
+        casa:{stringValue:nuevo.casaCanon},
+        ...(folio ? { folioRecibo:{stringValue:folio} } : {}),
+        corrigeAId:{stringValue:id},
+        creadoPor:{stringValue:user.uid},
+        creadoNombre:{stringValue:perfil.nombre||''},
+        // Conserva la fecha del movimiento original: la corrección de un pago de agosto sigue
+        // contando en agosto. registradoTs = cuándo se capturó la corrección.
+        ts:{timestampValue: d.ts || new Date().toISOString()},
+        registradoTs:{timestampValue:new Date().toISOString()},
+      };
+      const camposOrig = camposCancelacion(user, perfil, mot, { corregidoPorId:{stringValue:nuevoId} });
+
+      writes.push(
+        { update:{ name: docName(env, `finanzas/${id}`), fields: camposOrig },
+          updateMask:{ fieldPaths: Object.keys(camposOrig) }, currentDocument:{ exists:true } },
+        { update:{ name: docName(env, `finanzas/${nuevoId}`), fields: fieldsNuevo }, currentDocument:{ exists:false } },
+        wLimite,
+        writeLogFinanzas(env, req, { movId:id, accion:'corregir', uid:user.uid, perfil, motivo:mot, relacionadoId:nuevoId,
+          resumen: `Corrigió ${resumenMov(id, d)} → ${resumenMov(nuevoId, readDoc(fieldsNuevo))}`,
+          antes: doc.fields, despues: fieldsNuevo }),
+      );
+      return { writes, value: folio };
+    });
+  } catch (e) {
+    if (e.status === 429) await avisarLimiteFinanzas(env, req, user, perfil, id);
+    throw e;
+  }
+
+  // Si el corregido es un pago de Cuota, puede saldar el adeudo → reactivación de siempre.
+  // Si al revés la casa queda debiendo, NO se suspende aquí: lo decide el cron.
+  if (nuevo.tipo === 'ingreso' && nuevo.cat === 'Cuota' && nuevo.casaCanon) {
+    await intentarReactivarPorPago(env, nuevo.casaCanon);
+  }
+  return json({ ok:true, id, nuevoId, folioRecibo });
+}
+
+/* ============ /finanzas/reactivar — SOLO master, con motivo ============
+   Deshace una cancelación. Si el movimiento fue CORREGIDO, solo se permite cuando la corrección
+   ya está cancelada (si no, contarían los dos). */
+async function reactivarFinanza(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo el master reactiva movimientos');
+
+  const { id, motivo } = await req.json();
+  if (!id || !ID_MOV_RE.test(id)) throw httpErr(400, 'id inválido');
+  const mot = validarMotivo(motivo);
+
+  const d = await conTx(env, async (at, tx) => {
+    const doc = await txGet(env, at, `finanzas/${id}`, tx);
+    if (!doc) throw httpErr(404, 'Movimiento no existe');
+    const d = readDoc(doc.fields);
+    if (!esCancelado(d)) throw httpErr(409, 'Ese movimiento no está cancelado');
+    if (d.corregidoPorId) {
+      const corr = await txGet(env, at, `finanzas/${d.corregidoPorId}`, tx);
+      if (corr && !esCancelado(readDoc(corr.fields))) {
+        throw httpErr(409, `Este movimiento fue corregido por ${refMov(d.corregidoPorId, readDoc(corr.fields))}: cancela primero la corrección`);
+      }
+    }
+    // Campos en la máscara pero ausentes del body = se BORRAN del doc (limpia la cancelación;
+    // el historial completo queda en finanzas_log).
+    const campos = {
+      estado:{stringValue:'vigente'},
+      reactivadoPor:{stringValue:user.uid},
+      reactivadoNombre:{stringValue:perfil.nombre||''},
+      reactivadoTs:{timestampValue:new Date().toISOString()},
+      motivoReactivacion:{stringValue:mot},
+    };
+    const mascara = [...Object.keys(campos), 'motivoCancelacion', 'canceladoPor', 'canceladoNombre', 'canceladoTs', 'corregidoPorId'];
+    return { writes: [
+      { update:{ name: docName(env, `finanzas/${id}`), fields: campos },
+        updateMask:{ fieldPaths: mascara }, currentDocument:{ exists:true } },
+      writeLogFinanzas(env, req, { movId:id, accion:'reactivar', uid:user.uid, perfil, motivo:mot,
+        resumen: 'Reactivó ' + resumenMov(id, d), antes: doc.fields, despues: campos }),
+    ], value: d };
+  });
+
+  if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa) await intentarReactivarPorPago(env, d.casa);
   return json({ ok:true, id });
 }
 
@@ -762,6 +1059,7 @@ async function borrarVecino(req, env) {
 
   // Bloqueo por pagos: si existe algún movimiento de finanzas de este domicilio, no se
   // borra (los recibos quedarían huérfanos). Solo editar/suspender.
+  // Incluye movimientos CANCELADOS a propósito: un recibo cancelado sigue amarrado a su casa.
   const finanzas = (await firestoreList(env, 'finanzas')).map(d => readDoc(d.fields));
   const tienePagos = finanzas.some(m => m.casa && normDomicilio(m.casa) === domNorm);
   if (tienePagos) {
@@ -1171,6 +1469,7 @@ async function actualizarPersona(req, env) {
     if (!dom) throw httpErr(400, 'Falta el domicilio');
     const domNorm = normDomicilio(dom);
     if (domNorm !== p.domicilioNorm) {
+      // Incluye movimientos CANCELADOS a propósito: un recibo cancelado sigue amarrado a su casa.
       const finanzas = (await firestoreList(env, 'finanzas')).map(d => readDoc(d.fields));
       if (finanzas.some(m => m.casa && normDomicilio(m.casa) === p.domicilioNorm)) {
         throw httpErr(409, 'Esta casa tiene pagos registrados: no se puede renombrar el domicilio (rompería recibos y morosos). Solo se permite si no tiene pagos.');
@@ -1279,6 +1578,7 @@ async function borrarPersona(req, env) {
   if (esJefe(p)) {
     const nFam = all.filter(x => x.jefeId === id).length;
     if (nFam) throw httpErr(409, `Este jefe tiene ${nFam} familiar(es). Elimínalos primero.`);
+    // Incluye movimientos CANCELADOS a propósito: un recibo cancelado sigue amarrado a su casa.
     const finanzas = (await firestoreList(env, 'finanzas')).map(d => readDoc(d.fields));
     if (finanzas.some(m => m.casa && normDomicilio(m.casa) === p.domicilioNorm)) {
       throw httpErr(409, 'Esta casa tiene pagos registrados: solo puedes suspenderla, no borrarla.');
@@ -1430,6 +1730,7 @@ async function resumenFinanzas(req, env) {
   const pagaron = new Set();
   for (const doc of docs) {
     const d = readDoc(doc.fields);
+    if (esCancelado(d)) continue;   // cancelado = no cuenta en la caja
     const ts = new Date(d.ts);
     if (!(ts >= inicioMes && ts < finMes)) continue;
     if (d.tipo === 'ingreso') ingreso += d.monto || 0;
@@ -1471,6 +1772,7 @@ async function cobranzaFinanzas(req, env) {
   const pagosPorCasa = new Map(); // domicilioNorm -> [{ts, monto}, ...] (todo el tiempo)
   for (const doc of await firestoreList(env, 'finanzas')) {
     const d = readDoc(doc.fields);
+    if (esCancelado(d)) continue;   // un pago cancelado no abona al adeudo
     if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
     const dn = normDomicilio(d.casa);
     const ts = new Date(d.ts);
@@ -1516,6 +1818,7 @@ async function estadoCuentaFinanzas(req, env) {
   const pagos = [];
   for (const doc of await firestoreList(env, 'finanzas')) {
     const d = readDoc(doc.fields);
+    if (esCancelado(d)) continue;
     if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa && normDomicilio(d.casa) === domNorm) {
       pagos.push({ ts: d.ts, monto: d.monto || 0 });
     }
@@ -1628,6 +1931,7 @@ async function aplicarSuspensionAutomatica(env, modo = 'aplicar') {
   const pagosPorCasa = new Map();
   for (const doc of await firestoreList(env, 'finanzas')) {
     const d = readDoc(doc.fields);
+    if (esCancelado(d)) continue;   // un pago cancelado no abona al adeudo
     if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
     const dn = normDomicilio(d.casa);
     if (!pagosPorCasa.has(dn)) pagosPorCasa.set(dn, []);
@@ -1682,6 +1986,7 @@ async function intentarReactivarPorPago(env, casaCanon) {
     const pagos = [];
     for (const doc of await firestoreList(env, 'finanzas')) {
       const d = readDoc(doc.fields);
+      if (esCancelado(d)) continue;
       if (d.tipo === 'ingreso' && d.categoria === 'Cuota' && d.casa && normDomicilio(d.casa) === domNorm) {
         pagos.push({ ts: d.ts, monto: d.monto || 0 });
       }

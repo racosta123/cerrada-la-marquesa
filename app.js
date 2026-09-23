@@ -1155,7 +1155,9 @@ $('#familiarCancelConfirm')?.addEventListener('click', async () => {
 
 /* ====================== FINANZAS ====================== */
 let movType = 'ingreso';
-let finCache = [];      // movimientos de los últimos 6 meses (solo lectura)
+let finTodos = [];      // TODOS los movimientos de los últimos 6 meses, cancelados incluidos (lista visible)
+let finCache = [];      // solo los VIGENTES — base de TODOS los cálculos: caja, gráficas, PDF, cobranza.
+                        // Un cancelado sigue visible (tachado) en la lista, pero nunca suma.
 let finMonths = [];     // [{key,start,end,label}] los últimos 6 meses, más viejo primero
 let finCharts = { barras:null, pastel:null, linea:null };
 // Paleta compartida: colores de las categorías en la dona del PDF y su leyenda nativa (mismo orden,
@@ -1248,8 +1250,9 @@ function watchFinanzas(){
       .where('ts','>=',finMonths[0].start)
       .orderBy('ts','desc').limit(1200)
       .onSnapshot(snap => {
-        finCache = [];
-        snap.forEach(doc => finCache.push({ id: doc.id, ...doc.data() }));
+        finTodos = [];
+        snap.forEach(doc => finTodos.push({ id: doc.id, ...doc.data() }));
+        finCache = finTodos.filter(m => !esCanceladoMov(m));
         renderFinanzas();
       }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
   } else {
@@ -1757,7 +1760,7 @@ function populateFiltros(){
   const selCat = $('#filtroCategoria');
   const curCat = selCat.value;
   // Fijas primero; si algún movimiento viejo trae una categoría fuera de la lista, se agrega al final.
-  const extras = [...new Set(finCache.map(m=>m.categoria||'Otro'))].filter(c=>!CATEGORIAS_FIJAS.includes(c)).sort();
+  const extras = [...new Set(finTodos.map(m=>m.categoria||'Otro'))].filter(c=>!CATEGORIAS_FIJAS.includes(c)).sort();
   const cats = [...CATEGORIAS_FIJAS, ...extras];
   selCat.innerHTML = '<option value="">Todas las categorías</option>' + cats.map(c=>`<option value="${esc(c)}">${esc(c)}</option>`).join('');
   selCat.value = cats.includes(curCat) ? curCat : '';
@@ -1770,7 +1773,7 @@ function populateFiltros(){
 function filterAndRenderMovs(){
   const cat = $('#filtroCategoria').value;
   const mes = $('#filtroMes').value;
-  let list = finCache;
+  let list = finTodos;   // la lista muestra también los cancelados (tachados)
   if (cat) list = list.filter(m => (m.categoria||'Otro') === cat);
   if (mes) list = list.filter(m => monthKey(m.ts) === mes);
   renderMovs(list);
@@ -1778,17 +1781,45 @@ function filterAndRenderMovs(){
 $('#filtroCategoria').addEventListener('change', filterAndRenderMovs);
 $('#filtroMes').addEventListener('change', filterAndRenderMovs);
 
+/* ====================== FINANZAS PROTEGIDAS (front) ======================
+   Un movimiento NUNCA se borra: se CANCELA con motivo (sigue visible, tachado, y no suma) o se
+   CORRIGE (cancela el original y crea el corregido, ligados). Reactivar: solo master. Todo lo
+   decide el Worker (permisos, ventana de meses, límite 5/hora); aquí solo se muestran u ocultan
+   los botones — si el Worker dice que no, se enseña su mensaje tal cual. */
+function esCanceladoMov(m){ return m && m.estado === 'cancelado'; }
+// Referencia humana: el folio del recibo o, en gastos (sin folio), #ABC123. Mismo criterio que el Worker.
+function refMov(m){ return (m && m.folioRecibo) || ('#' + String(m?.id || '').slice(0, 6).toUpperCase()); }
+function refMovPorId(id){
+  const m = finTodos.find(x => x.id === id);
+  return m ? refMov(m) : ('#' + String(id || '').slice(0, 6).toUpperCase());
+}
+function mesesAtras(ts){
+  const d = tsADate(ts), n = new Date();
+  return (n.getFullYear() * 12 + n.getMonth()) - (d.getFullYear() * 12 + d.getMonth());
+}
+// Cosmético (el Worker revalida): staff cancela/corrige mes actual y anterior; master, cualquiera.
+function puedeCancelarMov(m){
+  if (!enModoStaff() || esCanceladoMov(m)) return false;
+  return ME.rol === 'master' || mesesAtras(m.ts) <= 1;
+}
+function puedeReactivarMov(m){ return ME.rol === 'master' && esCanceladoMov(m); }
+
 function renderMovs(movs){
   const list = $('#movList');
   if (!movs.length){ list.innerHTML = '<div class="empty">Sin movimientos</div>'; return; }
   list.innerHTML = '';
   movs.forEach(m => {
     const ing = m.tipo==='ingreso';
-    const row = document.createElement('div'); row.className = 'row';
+    const canc = esCanceladoMov(m);
+    const row = document.createElement('div'); row.className = 'row' + (canc ? ' cancelado' : '');
     const folioLinea = (ing && m.folioRecibo) ? `<div class="mov-folio">${esc(m.folioRecibo)}${m.casa ? ' · '+esc(m.casa) : ''}</div>` : '';
+    const ligas = (m.corrigeAId ? `<div class="mov-liga">Corrige a ${esc(refMovPorId(m.corrigeAId))}</div>` : '')
+      + (m.corregidoPorId ? `<div class="mov-liga">Corregido por ${esc(refMovPorId(m.corregidoPorId))}</div>` : '');
+    const cancLinea = canc
+      ? `<div class="mov-liga bad">Cancelado: ${esc(m.motivoCancelacion || '')}${m.canceladoNombre ? ' · ' + esc(m.canceladoNombre) : ''}</div>` : '';
     row.innerHTML = `
       <div class="ri"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">${ing?'<path d="M12 19V5 M5 12l7-7 7 7"/>':'<path d="M12 5v14 M19 12l-7 7-7-7"/>'}</svg></div>
-      <div class="rt"><div class="a">${esc(m.concepto||m.categoria)}</div><div class="b">${esc(m.categoria)} · ${fmtTime(m.ts)}</div>${folioLinea}</div>
+      <div class="rt"><div class="a">${esc(m.concepto||m.categoria)}${canc ? ' <span class="tag out">CANCELADO</span>' : ''}</div><div class="b">${esc(m.categoria)} · ${fmtTime(m.ts)}</div>${folioLinea}${ligas}${cancLinea}</div>
       <span class="mov-amt ${ing?'ok':'bad'}">${ing?'+':'−'}${money(m.monto)}</span>`;
     if (ing && m.folioRecibo){
       const act = document.createElement('button');
@@ -1796,42 +1827,148 @@ function renderMovs(movs){
       act.addEventListener('click', () => abrirReciboSheet(m));
       row.appendChild(act);
     }
-    // Borrar: SOLO master. El Worker respalda el doc en finanzas_borrados antes de eliminar.
-    if (ME.rol === 'master'){
-      const del = document.createElement('button');
-      del.className = 'row-act danger'; del.textContent = 'Borrar';
-      del.addEventListener('click', () => borrarMovimiento(m, del));
-      row.appendChild(del);
+    // Acciones (Corregir / Cancelar / Reactivar / historial del movimiento): solo staff.
+    if (enModoStaff()){
+      const more = document.createElement('button');
+      more.className = 'row-act'; more.textContent = '⋯'; more.title = 'Acciones';
+      more.setAttribute('aria-label', 'Acciones del movimiento');
+      more.addEventListener('click', () => abrirMovAcciones(m));
+      row.appendChild(more);
     }
     list.appendChild(row);
   });
 }
 
-/* Borrado de un movimiento (solo master). Confirmación explícita porque es
-   destructivo; el snapshot de watchFinanzas redibuja la lista al eliminarse. */
-async function borrarMovimiento(m, btn){
-  const detalle = `${m.tipo==='ingreso'?'+':'−'}${money(m.monto)} · ${m.concepto||m.categoria}` +
-    (m.folioRecibo ? ` · ${m.folioRecibo}` : '');
-  if (!confirm(`¿Borrar este movimiento?\n\n${detalle}\n\nSe conserva un respaldo, pero desaparece del reporte.`)) return;
+/* -------- hoja de acciones de un movimiento -------- */
+let movAccActual = null;
+function abrirMovAcciones(m){
+  movAccActual = m;
+  const ing = m.tipo === 'ingreso';
+  const canc = esCanceladoMov(m);
+  $('#movAccTitle').textContent = `Movimiento ${refMov(m)}`;
+  $('#movAccInfo').innerHTML =
+    `<b>${ing?'+':'−'}${money(m.monto)}</b> · ${esc(m.categoria || 'Otro')} · ${esc(m.concepto || '')}<br>`
+    + `${m.casa ? esc(m.casa) + ' · ' : ''}${fmtTime(m.ts)} · registró ${esc(m.creadoNombre || '—')}`
+    + (canc ? `<br><span style="color:var(--bad)">CANCELADO · ${esc(m.motivoCancelacion || '')}${m.canceladoNombre ? ' · ' + esc(m.canceladoNombre) : ''}${m.canceladoTs ? ' · ' + fmtTime(m.canceladoTs) : ''}</span>` : '')
+    + (m.corrigeAId ? `<br>Corrige a ${esc(refMovPorId(m.corrigeAId))}` : '')
+    + (m.corregidoPorId ? `<br>Corregido por ${esc(refMovPorId(m.corregidoPorId))}` : '');
+  const puede = puedeCancelarMov(m);
+  $('#movAccCorregir').classList.toggle('hidden', !puede);
+  $('#movAccCancelar').classList.toggle('hidden', !puede);
+  $('#movAccReactivar').classList.toggle('hidden', !puedeReactivarMov(m));
+  $('#movAccNota').textContent = (!canc && !puede && enModoStaff())
+    ? 'Este movimiento es de hace más de un mes: solo el master puede cancelarlo o corregirlo.' : '';
+  $('#movAccErr').textContent = '';
+  $('#movAccHist').innerHTML = '<div class="empty">Cargando historial…</div>';
+  openSheet('#movAccOverlay');
+  cargarHistorialMov(m.id);
+}
+$('#movAccOverlay')?.addEventListener('click', e => { if (e.target.id==='movAccOverlay') closeSheet('#movAccOverlay'); });
+$('#movAccCerrar')?.addEventListener('click', () => closeSheet('#movAccOverlay'));
+$('#movAccCancelar')?.addEventListener('click', () => { closeSheet('#movAccOverlay'); abrirMovMotivo(movAccActual, 'cancelar'); });
+$('#movAccReactivar')?.addEventListener('click', () => { closeSheet('#movAccOverlay'); abrirMovMotivo(movAccActual, 'reactivar'); });
+$('#movAccCorregir')?.addEventListener('click', () => { closeSheet('#movAccOverlay'); abrirCorreccion(movAccActual); });
+
+/* -------- hoja de motivo (cancelar / reactivar) — modal, no prompt nativo -------- */
+let movMotivoCtx = null;   // { m, modo }
+function abrirMovMotivo(m, modo){
+  if (!m) return;
+  movMotivoCtx = { m, modo };
+  const cancelar = modo === 'cancelar';
+  $('#movMotivoTitle').textContent = cancelar ? 'Cancelar movimiento' : 'Reactivar movimiento';
+  $('#movMotivoInfo').innerHTML = `<b>${esc(refMov(m))}</b> · ${m.tipo==='ingreso'?'+':'−'}${money(m.monto)} · ${esc(m.concepto || m.categoria || '')}`;
+  $('#movMotivoNota').textContent = cancelar
+    ? 'No se borra: queda visible como CANCELADO (con su folio y este motivo) y deja de contar en la caja.'
+    : 'Vuelve a contar en la caja. Queda registrado en el historial.';
+  $('#movMotivoTxt').value = '';
+  $('#movMotivoErr').textContent = '';
+  $('#movMotivoConfirm').textContent = cancelar ? 'Sí, cancelar movimiento' : 'Sí, reactivar';
+  openSheet('#movMotivoOverlay');
+}
+$('#movMotivoOverlay')?.addEventListener('click', e => { if (e.target.id==='movMotivoOverlay') closeSheet('#movMotivoOverlay'); });
+$('#movMotivoCancel')?.addEventListener('click', () => closeSheet('#movMotivoOverlay'));
+$('#movMotivoConfirm')?.addEventListener('click', async () => {
+  if (!movMotivoCtx) return;
+  const { m, modo } = movMotivoCtx;
+  const motivo = $('#movMotivoTxt').value.trim();
+  $('#movMotivoErr').textContent = '';
+  if (motivo.length < 5){ $('#movMotivoErr').textContent = 'Escribe el motivo (mínimo 5 caracteres)'; return; }
+  const btn = $('#movMotivoConfirm'); const original = btn.textContent;
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
-    await authedFetch('/finanzas/borrar', { id: m.id });
-    toast('Movimiento borrado', 'bad');
+    await authedFetch(modo === 'cancelar' ? '/finanzas/cancelar' : '/finanzas/reactivar', { id: m.id, motivo });
+    toast(modo === 'cancelar' ? 'Movimiento cancelado' : 'Movimiento reactivado', modo === 'cancelar' ? 'bad' : 'ok');
+    closeSheet('#movMotivoOverlay');
     // La lista se actualiza sola por el onSnapshot de finanzas.
   } catch(e){
-    toast(e.message || 'No se pudo borrar', 'bad');
-    btn.disabled = false; btn.textContent = 'Borrar';
+    $('#movMotivoErr').textContent = e.message || 'No se pudo completar';
+  } finally { btn.disabled = false; btn.textContent = original; }
+});
+
+/* -------- historial (finanzas_log): del movimiento (hoja de acciones) y general -------- */
+const ACCION_LOG = { crear:'Registró', cancelar:'Canceló', corregir:'Corrigió', reactivar:'Reactivó',
+  'marcar-recibo':'Recibo', limite:'⚠️ Bloqueo por límite', borrar:'Borró (sistema anterior)' };
+function filaLog(l){
+  const quien = `${l.nombre || l.uid || '—'}${l.rol ? ' (' + l.rol + ')' : ''}`;
+  return `<div class="row"><div class="rt">`
+    + `<div class="a">${esc(ACCION_LOG[l.accion] || l.accion)} · ${esc(quien)}</div>`
+    + `<div class="b">${fmtTime(l.ts)}${l.migrado ? ' · migrado' : ''}</div>`
+    + `<div class="mov-liga">${esc(l.resumen || '')}</div>`
+    + (l.motivo ? `<div class="mov-liga">Motivo: ${esc(l.motivo)}</div>` : '')
+    + `</div></div>`;
+}
+async function cargarHistorialMov(id){
+  const box = $('#movAccHist');
+  try {
+    // Dos consultas de un solo campo (sin índice compuesto): entradas del movimiento y las que lo
+    // mencionan como relacionado (la corrección se registra en el original, con el nuevo ligado).
+    const [a, b] = await Promise.all([
+      db.collection('finanzas_log').where('movId','==',id).get(),
+      db.collection('finanzas_log').where('relacionadoId','==',id).get(),
+    ]);
+    const vistos = new Set(); const items = [];
+    [...a.docs, ...b.docs].forEach(d => { if (!vistos.has(d.id)){ vistos.add(d.id); items.push(d.data()); } });
+    items.sort((x, y) => tsADate(y.ts) - tsADate(x.ts));
+    if (movAccActual?.id !== id) return;   // el usuario ya abrió otro movimiento
+    box.innerHTML = items.length ? items.map(filaLog).join('')
+      : '<div class="empty">Sin cambios registrados (anterior a la bitácora).</div>';
+  } catch(e){
+    console.error('historialMov', e);
+    box.innerHTML = '<div class="empty">No se pudo cargar el historial.</div>';
   }
 }
+let finLogAbierto = false;
+async function cargarHistorialFinanzas(){
+  const box = $('#finLogList');
+  box.innerHTML = '<div class="empty">Cargando…</div>';
+  try {
+    const snap = await db.collection('finanzas_log').orderBy('ts','desc').limit(100).get();
+    box.innerHTML = snap.empty ? '<div class="empty">Sin cambios registrados todavía.</div>'
+      : snap.docs.map(d => filaLog(d.data())).join('');
+  } catch(e){
+    console.error('historialFinanzas', e);
+    box.innerHTML = '<div class="empty">No se pudo cargar el historial.</div>';
+  }
+}
+$('#finLogToggle')?.addEventListener('click', () => {
+  finLogAbierto = !finLogAbierto;
+  $('#finLogList').classList.toggle('hidden', !finLogAbierto);
+  $('#finLogToggle').classList.toggle('abierto', finLogAbierto);
+  if (finLogAbierto) cargarHistorialFinanzas();
+});
 
-/* registrar movimiento (solo staff) */
+/* registrar movimiento (solo staff) — la misma hoja sirve para CORREGIR uno existente */
+let movCorrigiendo = null;   // null = alta normal; movimiento original = modo corrección
 /* FASE 4.5: casa obligatoria en TODO ingreso — cada recibo queda amarrado a una casa. */
 function casaRequerida(){ return movType==='ingreso'; }
 /* FASE 6.5: el campo Domicilio es un dropdown con las casas ACTIVAS del padrón (jefes
-   activos; ya no números 1..N ni texto libre) — el Worker revalida contra el padrón. */
+   activos; ya no números 1..N ni texto libre) — el Worker revalida contra el padrón.
+   En una CORRECCIÓN se listan también las suspendidas: el pago original pudo ser de una casa
+   que hoy está suspendida (el Worker lo acepta solo en /finanzas/corregir). */
 function poblarCasaSelect(){
   const sel = $('#movCasa');
-  const activos = casasActivas().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
+  const fuente = movCorrigiendo ? jefes() : casasActivas();
+  const activos = fuente.slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
   const prev = sel.value;
   sel.innerHTML = '';
   if (!activos.length){
@@ -1840,7 +1977,8 @@ function poblarCasaSelect(){
   }
   sel.disabled = false;
   sel.appendChild(new Option('Selecciona el domicilio…',''));
-  activos.forEach(v => sel.appendChild(new Option(v.domicilio, v.domicilio)));
+  activos.forEach(v => sel.appendChild(new Option(
+    v.estado === 'suspendido' ? v.domicilio + ' (suspendido)' : v.domicilio, v.domicilio)));
   if (prev) sel.value = prev;   // conserva selección si sigue en el padrón
 }
 function updateCasaField(){
@@ -1848,12 +1986,47 @@ function updateCasaField(){
   $('#movCasaField').classList.toggle('hidden', !req);
   if (req) poblarCasaSelect();
 }
-$('#newMovBtn').addEventListener('click', ()=>{ $('#movErr').textContent=''; updateCasaField(); openSheet('#movOverlay'); });
+function setMovType(t){
+  movType = t;
+  $$('#movTypeSeg button').forEach(x => x.classList.toggle('sel', x.dataset.t === t));
+}
+/* Pone la hoja en modo alta o corrección (título, motivo, texto del botón). */
+function modoFormMov(m){
+  movCorrigiendo = m || null;
+  $('#movSheetTitle').textContent = m ? `Corregir movimiento ${refMov(m)}` : 'Registrar movimiento';
+  $('#movMotivoField').classList.toggle('hidden', !m);
+  $('#movCorrigeNota').classList.toggle('hidden', !m);
+  $('#saveMovBtn').textContent = m ? 'Guardar corrección' : 'Guardar movimiento';
+  $('#movMotivo').value = '';
+  $('#movErr').textContent = '';
+}
+$('#newMovBtn').addEventListener('click', ()=>{
+  // Si lo último fue una corrección, se limpia para no arrastrar sus datos a un alta nueva.
+  if (movCorrigiendo){ $('#movConcept').value = $('#movAmount').value = ''; $('#movCat').value = 'Cuota'; $('#movCasa').value = ''; setMovType('ingreso'); }
+  modoFormMov(null); updateCasaField(); openSheet('#movOverlay');
+});
+/* "Corregir": abre la hoja con los datos del original; al guardar, el Worker cancela el original
+   y crea el corregido en UNA transacción (y folio nuevo si es ingreso). */
+function abrirCorreccion(m){
+  if (!m) return;
+  modoFormMov(m);
+  setMovType(m.tipo === 'egreso' ? 'egreso' : 'ingreso');
+  $('#movConcept').value = m.concepto || '';
+  $('#movCat').value = m.categoria || 'Otro';
+  if (!$('#movCat').value) $('#movCat').value = 'Otro';   // categoría vieja fuera de la lista
+  $('#movAmount').value = m.monto != null ? String(m.monto) : '';
+  $('#movCasa').value = '';
+  updateCasaField();
+  if (m.casa) $('#movCasa').value = m.casa;
+  $('#movCorrigeNota').textContent = m.folioRecibo
+    ? `El original (${m.folioRecibo}) quedará CANCELADO con su folio; el corregido llevará folio nuevo.`
+    : 'El original quedará CANCELADO; el corregido lo reemplaza.';
+  openSheet('#movOverlay');
+}
 $('#movOverlay').addEventListener('click', e => { if(e.target.id==='movOverlay') closeSheet('#movOverlay'); });
 $('#movTypeSeg').addEventListener('click', e => {
   const b = e.target.closest('button'); if(!b) return;
-  $$('#movTypeSeg button').forEach(x=>x.classList.remove('sel'));
-  b.classList.add('sel'); movType = b.dataset.t;
+  setMovType(b.dataset.t);
   updateCasaField();
 });
 $('#movCat').addEventListener('change', updateCasaField);
@@ -1864,26 +2037,33 @@ async function saveMov(){
   const categoria = $('#movCat').value.trim() || 'Otro';
   const monto = parseFloat($('#movAmount').value);
   const casa = $('#movCasa').value;  // FASE 4.6: dropdown numérico → "1".."totalCasas" o ""
+  const orig = movCorrigiendo;
+  const motivo = $('#movMotivo').value.trim();
   $('#movErr').textContent = '';
   if (!concepto || !(monto > 0)){ $('#movErr').textContent = 'Falta concepto o monto válido'; return; }
   if (casaRequerida() && !casa){ $('#movErr').textContent = 'Selecciona la casa (obligatorio en ingresos)'; return; }
+  if (orig && motivo.length < 5){ $('#movErr').textContent = 'Escribe el motivo de la corrección (mínimo 5 caracteres)'; return; }
   const btn = $('#saveMovBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
     // El movimiento lo escribe el Worker tras verificar rol master/admin.
     // En ingresos el Worker además asigna el folio consecutivo del recibo.
-    const r = await authedFetch('/finanzas/registrar', { tipo: movType, concepto, categoria, monto, casa });
-    toast('Movimiento registrado', 'ok');
+    const r = orig
+      ? await authedFetch('/finanzas/corregir', { id: orig.id, motivo, tipo: movType, concepto, categoria, monto, casa })
+      : await authedFetch('/finanzas/registrar', { tipo: movType, concepto, categoria, monto, casa });
+    toast(orig ? 'Corrección guardada · el original quedó cancelado' : 'Movimiento registrado', 'ok');
     closeSheet('#movOverlay');
     $('#movConcept').value = $('#movCat').value = $('#movAmount').value = $('#movCasa').value = '';
+    modoFormMov(null);
     if (r && r.folioRecibo){
       abrirReciboSheet({
-        id: r.id, folioRecibo: r.folioRecibo,
+        id: orig ? r.nuevoId : r.id, folioRecibo: r.folioRecibo,
         tipo: movType, concepto, categoria, monto, casa,
-        creadoNombre: ME.nombre || '', ts: new Date(),
+        creadoNombre: ME.nombre || '', ts: orig ? orig.ts : new Date(),
+        ...(orig ? { corrigeAId: orig.id } : {}),
       });
     }
   } catch(e){ $('#movErr').textContent = e.message || 'No se pudo guardar'; }
-  finally { btn.disabled = false; btn.textContent = 'Guardar movimiento'; }
+  finally { btn.disabled = false; btn.textContent = movCorrigiendo ? 'Guardar corrección' : 'Guardar movimiento'; }
 }
 
 /* reporte PDF para el grupo de residentes */
@@ -2175,12 +2355,19 @@ function construirReciboPDF(mov){
   doc.text(money(mov.monto), W - M - 18, y + 58, { align:'right' });
   y += boxH + 34;
 
+  const cancelado = esCanceladoMov(mov);
   const filas = [
     ['CASA', mov.casa || '—'],
     ['CONCEPTO', mov.concepto || '—'],
     ['CATEGORÍA', mov.categoria || 'Otro'],
     ['FECHA Y HORA', fecha],
     ['REGISTRÓ', mov.creadoNombre || '—'],
+    ...(mov.corrigeAId ? [['CORRIGE A', `Recibo ${refMovPorId(mov.corrigeAId)} (cancelado)`]] : []),
+    ...(cancelado ? [
+      ['ESTADO', 'CANCELADO — este recibo NO es válido'],
+      ['MOTIVO', mov.motivoCancelacion || '—'],
+      ...(mov.corregidoPorId ? [['SUSTITUIDO POR', `Recibo ${refMovPorId(mov.corregidoPorId)}`]] : []),
+    ] : []),
   ];
   filas.forEach(([k, v]) => {
     doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
@@ -2193,21 +2380,36 @@ function construirReciboPDF(mov){
   });
 
   doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
-  doc.text('Recibo oficial · Cerrada La Marquesa · Transparencia vecinal', M, H - 24);
+  doc.text(cancelado ? 'Recibo CANCELADO · sin validez · Cerrada La Marquesa' : 'Recibo oficial · Cerrada La Marquesa · Transparencia vecinal', M, H - 24);
   doc.text(`${mov.folioRecibo} · Página 1 de 1`, W - M, H - 24, { align:'right' });
 
-  return { doc, filename: `Recibo-${mov.folioRecibo}.pdf` };
+  // Marca de agua CANCELADO, encima de todo: diagonal, roja y semitransparente para que el
+  // contenido se siga leyendo (el folio y los datos originales se conservan a propósito).
+  if (cancelado){
+    doc.saveGraphicsState();
+    try { doc.setGState(new doc.GState({ opacity: 0.22 })); } catch(_){}
+    doc.setFont('helvetica','bold'); doc.setFontSize(80); doc.setTextColor(...PDF.red);
+    // Con ángulo, jsPDF ignora align:'center': se centra a mano con el ancho real del texto.
+    const ANG = 35, rad = ANG * Math.PI / 180, tw = doc.getTextWidth('CANCELADO');
+    doc.text('CANCELADO', W / 2 - (tw / 2) * Math.cos(rad), H / 2 + (tw / 2) * Math.sin(rad), { angle: ANG });
+    doc.restoreGraphicsState();
+  }
+
+  return { doc, filename: `Recibo-${mov.folioRecibo}${cancelado ? '-CANCELADO' : ''}.pdf` };
 }
 
 let reciboActual = null;
 function abrirReciboSheet(mov){
   reciboActual = mov;
   cargarLogoMarquesa();   // reintento silencioso por si la precarga de enterApp() falló
-  $('#reciboTitle').textContent = `Recibo ${mov.folioRecibo}`;
+  const cancelado = esCanceladoMov(mov);
+  $('#reciboTitle').textContent = `Recibo ${mov.folioRecibo}${cancelado ? ' · CANCELADO' : ''}`;
   $('#reciboErr').textContent = '';
   $('#reciboDatos').innerHTML =
     `<b>${esc(mov.casa || '—')}</b> · ${esc(mov.concepto || '')}<br>` +
-    `${esc(mov.categoria || 'Otro')} · ${money(mov.monto)} · ${fmtTime(mov.ts)}`;
+    `${esc(mov.categoria || 'Otro')} · ${money(mov.monto)} · ${fmtTime(mov.ts)}` +
+    (mov.corrigeAId ? `<br>Corrige a ${esc(refMovPorId(mov.corrigeAId))}` : '') +
+    (cancelado ? `<br><span style="color:var(--bad)">CANCELADO: ${esc(mov.motivoCancelacion || '')} — el PDF sale con la marca CANCELADO.</span>` : '');
   openSheet('#reciboOverlay');
 }
 $('#reciboOverlay').addEventListener('click', e => { if (e.target.id==='reciboOverlay') closeSheet('#reciboOverlay'); });
@@ -2287,7 +2489,7 @@ $('#casaRepGo').addEventListener('click', async () => {
     // encadenado al where para no requerir índice compuesto — se ordena aquí.
     const snap = await db.collection('finanzas').where('casa','==',casa).get();
     const movs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .filter(m => m.tipo === 'ingreso')
+      .filter(m => m.tipo === 'ingreso' && !esCanceladoMov(m))   // un pago cancelado no es un pago
       .sort((a,b) => tsADate(b.ts) - tsADate(a.ts));
     if (!movs.length){ $('#casaRepErr').textContent = `Sin pagos registrados para "${casa}"`; return; }
     const { doc, filename } = construirReporteCasaPDF(casa, movs);
@@ -2382,8 +2584,9 @@ function closeSheet(sel){ $(sel).classList.remove('open'); }
 
 /* ====================== PUSH (FCM) ====================== */
 async function registerPush(){
-  // Solo residentes reciben push (de sus esclavos/visitantes).
-  if (ME.rol!=='residente') return;
+  // Residentes reciben push (de sus esclavos/visitantes). El master también: el Worker le avisa
+  // si una cuenta choca con el límite de cancelaciones/correcciones de Finanzas.
+  if (ME.rol!=='residente' && ME.rol!=='master') return;
   try {
     if (!('serviceWorker' in navigator) || !firebase.messaging.isSupported()) return;
     const perm = await Notification.requestPermission();
@@ -2720,7 +2923,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v10';
+const APP_VERSION = 'v11';
 (function mostrarVersionInmediata(){
   const el = document.getElementById('appVersion');
   if (el) el.textContent = 'Versión ' + APP_VERSION;

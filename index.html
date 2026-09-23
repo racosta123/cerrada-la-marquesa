@@ -68,13 +68,14 @@
   }
   .field{margin-bottom:14px}
   .field label{display:block;font-size:12px;color:var(--muted);margin:0 0 7px 4px;letter-spacing:.3px}
-  .field input, .field select{
+  .field input, .field select, .field textarea{
     width:100%;padding:14px 16px;border-radius:var(--r-sm);
     background:var(--surface-2);border:1px solid var(--line);
     color:var(--text);font-size:15px;outline:none;transition:border .15s;
     font-family:inherit;
   }
-  .field input:focus, .field select:focus{border-color:var(--gold)}
+  .field input:focus, .field select:focus, .field textarea:focus{border-color:var(--gold)}
+  .field textarea{resize:vertical;min-height:64px;line-height:1.4}
   .btn-primary{
     width:100%;padding:15px;border-radius:var(--r-sm);margin-top:6px;
     background:linear-gradient(145deg,var(--gold),#b8941f);color:#1a1300;
@@ -253,6 +254,11 @@
   .recibo-datos b{color:var(--gold, #d4af37)}
   .mov-folio{font-size:11px;color:var(--muted-2);letter-spacing:.4px}
   .row-act.recibo{white-space:nowrap}
+  /* Finanzas protegidas: un cancelado sigue visible, atenuado y con el monto tachado */
+  .row.cancelado{opacity:.62}
+  .row.cancelado .mov-amt{text-decoration:line-through}
+  .mov-liga{font-size:11px;color:var(--muted-2);margin-top:2px;line-height:1.4}
+  .mov-liga.bad{color:var(--bad)}
   .moros-toggle{width:100%;text-align:left;background:var(--surface-2);border:1px solid var(--line);border-radius:var(--r-sm);padding:12px 14px;font-size:14px;font-weight:600;color:var(--text);cursor:pointer;display:flex;gap:9px;align-items:center;margin-bottom:10px}
   .moros-toggle .caret{color:var(--muted-2);display:inline-block;transition:transform .15s}
   .moros-toggle.abierto .caret{transform:rotate(90deg)}
@@ -483,6 +489,9 @@
         <select id="filtroMes"><option value="">Todos los meses</option></select>
       </div>
       <div class="list" id="movList"><div class="empty">Sin movimientos</div></div>
+      <!-- Bitácora de cambios de finanzas (finanzas_log) — solo staff; se carga al abrir -->
+      <button type="button" class="moros-toggle" id="finLogToggle" style="margin-top:14px"><span class="caret">▸</span> Historial de cambios</button>
+      <div class="list hidden" id="finLogList"></div>
     </div>
   </div>
 
@@ -670,7 +679,8 @@
 <div class="overlay" id="movOverlay">
   <div class="sheet" id="movSheet">
     <div class="grab"></div>
-    <h3>Registrar movimiento</h3>
+    <h3 id="movSheetTitle">Registrar movimiento</h3>
+    <p id="movCorrigeNota" class="vnote hidden" style="margin:-4px 0 14px"></p>
     <div class="seg" id="movTypeSeg">
       <button data-t="ingreso" class="sel">Ingreso (cobro)</button>
       <button data-t="egreso">Gasto</button>
@@ -690,8 +700,40 @@
     </div>
     <div class="field hidden" id="movCasaField"><label>Domicilio (obligatorio en ingresos)</label><select id="movCasa"></select></div>
     <div class="field"><label>Monto (MXN)</label><input id="movAmount" type="number" inputmode="decimal" placeholder="0.00"></div>
+    <div class="field hidden" id="movMotivoField"><label>Motivo de la corrección (obligatorio — queda en el historial)</label><textarea id="movMotivo" rows="2" maxlength="300" placeholder="Ej. Monto mal capturado, era $300"></textarea></div>
     <button class="btn-primary" id="saveMovBtn">Guardar movimiento</button>
     <div id="movErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ ACCIONES DE UN MOVIMIENTO (Finanzas protegidas) ============ -->
+<div class="overlay" id="movAccOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3 id="movAccTitle">Movimiento</h3>
+    <div class="recibo-datos" id="movAccInfo"></div>
+    <p id="movAccNota" class="vnote" style="margin:0 0 10px"></p>
+    <button class="btn-primary" id="movAccCorregir">Corregir</button>
+    <button class="btn-ghost" id="movAccCancelar" style="width:100%;margin-top:10px;color:var(--bad)">Cancelar movimiento</button>
+    <button class="btn-ghost" id="movAccReactivar" style="width:100%;margin-top:10px">Reactivar (solo master)</button>
+    <div class="section-title" style="margin:18px 0 8px">Historial de este movimiento</div>
+    <div class="list" id="movAccHist"></div>
+    <button class="btn-ghost" id="movAccCerrar" style="width:100%;margin-top:10px">Cerrar</button>
+    <div id="movAccErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ MOTIVO: cancelar / reactivar movimiento — modal, no prompt nativo ============ -->
+<div class="overlay" id="movMotivoOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3 id="movMotivoTitle">Cancelar movimiento</h3>
+    <div class="recibo-datos" id="movMotivoInfo"></div>
+    <p id="movMotivoNota" style="font-size:13px;color:var(--muted);line-height:1.6;margin:0 0 12px"></p>
+    <div class="field"><label>Motivo (obligatorio — lo verá cualquier staff)</label><textarea id="movMotivoTxt" rows="2" maxlength="300" placeholder="Ej. Capturado dos veces"></textarea></div>
+    <button class="btn-primary" id="movMotivoConfirm" style="background:linear-gradient(145deg,#b91c1c,#7f1d1d);color:#fff">Sí, cancelar movimiento</button>
+    <button class="btn-ghost" id="movMotivoCancel" style="width:100%;margin-top:10px">Volver</button>
+    <div id="movMotivoErr" class="err"></div>
   </div>
 </div>
 

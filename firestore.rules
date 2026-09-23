@@ -66,6 +66,23 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // ---- finanzas_log (bitácora de cambios de finanzas) ----
+    // Cada alta/cancelación/corrección/reactivación la escribe el Worker EN EL MISMO commit que
+    // el cambio. Staff la lee (vista "Historial"); nadie la escribe ni la borra desde el cliente.
+    match /finanzas_log/{id} {
+      allow read: if signedIn() && staff();
+      allow write: if false;
+    }
+    // ---- finanzas_limites (límite de cancelaciones por hora) y finanzas_borrados (respaldos
+    // de la época en que se borraba) — solo Worker. Explícito aunque la regla por defecto ya
+    // lo niega, para que nadie abra estas colecciones por accidente. ----
+    match /finanzas_limites/{uid} {
+      allow read, write: if false;
+    }
+    match /finanzas_borrados/{id} {
+      allow read, write: if false;
+    }
+
     // ---- config (ej. config/general → totalCasas) ----
     match /config/{id} {
       // Solo staff necesita leer la config directo; residentes la reciben ya

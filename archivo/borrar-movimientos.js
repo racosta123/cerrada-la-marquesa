@@ -1,4 +1,13 @@
 /* ===========================================================
+   ARCHIVADO — ya no se usa. Desde "Finanzas protegidas" un movimiento
+   NUNCA se borra: se cancela con motivo (y queda en finanzas_log).
+   Se conserva solo como referencia histórica; el guard de abajo impide
+   correrlo por accidente.
+   =========================================================== */
+console.error('borrar-movimientos.js está ARCHIVADO: los movimientos ya no se borran, se cancelan desde la app.');
+process.exit(1);
+
+/* ===========================================================
    Borrado de movimientos en "finanzas", a partir de un respaldo ya
    generado por respaldo-diagnostico.js.
 
