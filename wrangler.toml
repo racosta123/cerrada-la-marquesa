@@ -1,6 +1,10 @@
 name = "la-marquesa-proxy"
 main = "worker.js"
 compatibility_date = "2025-01-01"
+# Preview URLs APAGADAS (seguridad): cada versión subida tenía su propia URL pública que seguía
+# ejecutando código VIEJO con los secrets y el Firestore de producción. workers.dev (la URL
+# principal) sigue activa. Sin esta línea, un wrangler deploy las volvería a encender.
+preview_urls = false
 
 [vars]
 ALLOWED_ORIGIN = "https://racosta123.github.io"
