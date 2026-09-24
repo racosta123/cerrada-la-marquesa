@@ -26,6 +26,7 @@ const DOORS = [
 let ME = null;          // { uid, nombre, rol, casa, residenteUid? }
 let unsubLog = null;
 let unsubAlertas = null;   // alertas_bitacora (solo staff)
+let unsubAlertasFam = null;   // alertas_familiares (solo staff) — v13
 let unsubInvites = null;
 let unsubFin = null;
 let personasCache = [];       // padrón unificado (FASE 6.5): jefes (casas) + familiares + admins
@@ -127,6 +128,7 @@ function showLogin(){
   $('#loginBtn').disabled = false; $('#loginBtn').textContent = 'Entrar';
   if (unsubLog) unsubLog();
   if (unsubAlertas){ unsubAlertas(); unsubAlertas = null; }
+  if (unsubAlertasFam){ unsubAlertasFam(); unsubAlertasFam = null; }
   if (unsubInvites) unsubInvites();
   if (unsubFin) unsubFin();
 }
@@ -308,6 +310,24 @@ async function openDoor(door, el){
 let logDocsCache = null;                              // [{id, data}] de aperturas, más reciente primero
 let alertasBitacora = { porId: new Map(), lista: [] };
 let logSoloAlertas = false;
+/* v13 — alertas_familiares (solo staff): personaId → alerta. Solo cuentan las ACTIVAS: al
+   marcar "Revisado, es correcto" el familiar deja de salir en rojo en Gestión y en la bitácora. */
+let alertasFamiliares = new Map();
+function alertaFamActiva(personaId){
+  const a = personaId && alertasFamiliares.get(personaId);
+  return a && a.estado === 'activa' ? a : null;
+}
+/* La alerta a pintar en un registro de la bitácora (o null). Las de "otra casa" solo si la
+   alerta del familiar sigue activa; y si por algo faltara el doc de alertas_bitacora de una
+   apertura, se marca igual por el personaId del familiar. */
+function alertaDeRegistro(id, a){
+  let al = alertasBitacora.porId.get(id) || null;
+  if (al && al.tipoAlerta === 'posible-otra-casa' && !alertaFamActiva(al.personaId)) al = null;
+  if (!al && a && a.tipo === 'app' && alertaFamActiva(a.personaId)){
+    al = { tipoAlerta: 'posible-otra-casa', coincideCon: alertaFamActiva(a.personaId).coincideCon };
+  }
+  return al;
+}
 /* Casa = persona del JEFE (jefe: su personaId; familiar: su jefeId). Misma cuenta que miCasaId()
    en las reglas. '' si no es residente (esclavo/admin/master). */
 function miCasaId(){
@@ -317,7 +337,9 @@ function miCasaId(){
 function watchLog(){
   if (unsubLog) unsubLog();
   if (unsubAlertas){ unsubAlertas(); unsubAlertas = null; }
+  if (unsubAlertasFam){ unsubAlertasFam(); unsubAlertasFam = null; }
   alertasBitacora = { porId: new Map(), lista: [] };
+  alertasFamiliares = new Map();
   logDocsCache = null;
   const isStaff = enModoStaff();
   const qs = [];
@@ -360,6 +382,13 @@ function watchLog(){
         alertasBitacora = { porId, lista };
         renderLog();
       }, err => console.error('alertas_bitacora', err));
+    // Colección chica (una por familiar marcado): se escucha completa, sin índice.
+    unsubAlertasFam = db.collection('alertas_familiares').onSnapshot(snap => {
+      const m = new Map(); snap.forEach(d => m.set(d.id, { id: d.id, ...d.data() }));
+      alertasFamiliares = m;
+      renderLog();
+      if (personasCache.length) renderPersonas();
+    }, err => console.error('alertas_familiares', err));
   }
 }
 $('#logAlertasBtn')?.addEventListener('click', () => {
@@ -392,10 +421,17 @@ function filaBitacora(a, alerta){
   const titulo = esVisita ? (a.visitante || a.nombre || 'Visita') : (a.nombre || 'Usuario');
   // Si el registro trae la nota "— revisar" (entrada/salida sin su par), se conserva abajo.
   const nota = (esVisita && a.nombre && a.visitante && a.nombre !== a.visitante) ? a.nombre : '';
-  const invito = (a.invitadoPor || a.casa)
-    ? `<div class="mov-liga">Invitado por ${esc(a.invitadoPor || '—')}${a.casa ? ' · ' + esc(a.casa) : ''}</div>` : '';
+  // Visita: "Invitado por …". Apertura desde la app de un FAMILIAR (v13): "Familiar de <Jefe> ·
+  // <Casa> · dado de alta por <quien>" — datos que el Worker toma del padrón al registrarla.
+  const invito = esVisita
+    ? ((a.invitadoPor || a.casa)
+      ? `<div class="mov-liga">Invitado por ${esc(a.invitadoPor || '—')}${a.casa ? ' · ' + esc(a.casa) : ''}</div>` : '')
+    : (a.familiarDe
+      ? `<div class="mov-liga">Familiar de ${esc(a.familiarDe)}${a.casa ? ' · ' + esc(a.casa) : ''}`
+        + `${a.dadoDeAltaNombre ? ' · dado de alta por ' + esc(a.dadoDeAltaNombre) : ''}</div>` : '');
   const alertaHtml = alerta
-    ? `<div class="mov-liga bad">⚠️ Posible residente suspendido · coincide con ${esc(alerta.coincideCon || '')}</div>` : '';
+    ? `<div class="mov-liga bad">⚠️ ${alerta.tipoAlerta === 'posible-otra-casa' ? 'Posible residente de otra casa' : 'Posible residente suspendido'}`
+      + ` · coincide con ${esc(alerta.coincideCon || '')}</div>` : '';
   row.innerHTML = `
     <div class="ri">${SVG_CANDADO}</div>
     <div class="rt"><div class="a">${esc(titulo)}</div>`
@@ -411,7 +447,8 @@ function renderLog(){
   if (soloAlertas){
     // Se pinta desde alertas_bitacora (trae visitante, puerta, hora, quién invitó y casa):
     // así aparecen también alertas más viejas que las 60 aperturas recientes.
-    const al = alertasBitacora.lista;
+    // Las de "otra casa" cuyo familiar ya se marcó "Revisado, es correcto" no salen.
+    const al = alertasBitacora.lista.filter(a => a.tipoAlerta !== 'posible-otra-casa' || alertaFamActiva(a.personaId));
     if (!al.length){ list.innerHTML = '<div class="empty">Sin alertas</div>'; return; }
     list.innerHTML = '';
     al.forEach(a => list.appendChild(filaBitacora(a, a)));
@@ -420,7 +457,8 @@ function renderLog(){
   const docs = logDocsCache;
   if (!docs || !docs.length){ list.innerHTML = '<div class="empty">Sin movimientos</div>'; return; }
   list.innerHTML = '';
-  docs.forEach(d => list.appendChild(filaBitacora(d.data, alertasBitacora.porId.get(d.id))));
+  // alertaDeRegistro solo devuelve algo para staff: a un residente nunca le llegan alertas.
+  docs.forEach(d => list.appendChild(filaBitacora(d.data, enModoStaff() ? alertaDeRegistro(d.id, d.data) : null)));
 }
 
 function puertaName(id){ return (DOORS.find(d=>d.id===id)||{}).name || id; }
@@ -893,11 +931,40 @@ function personaRow(p){
   const motivoLine = (susp && p.motivoManual)
     ? `<div class="vnote" style="padding:0 2px 8px">📝 Motivo: ${esc(p.motivoManual)}</div>` : '';
 
-  return `<div class="row">`
+  // v13 — familiar marcado "Posible residente de otra casa" (solo staff ve alertas_familiares).
+  // NO bloquea: el comité decide con Suspender/Borrar, o quita la marca si es legítimo.
+  const alFam = esFam ? alertaFamActiva(p.id) : null;
+  const alertaLine = alFam
+    ? `<div class="mov-liga bad" style="padding:0 2px 6px">⚠️ Posible residente de otra casa · coincide con ${esc(alFam.coincideCon || '')}`
+      + `${alFam.dadoDeAltaNombre ? ' · dado de alta por ' + esc(alFam.dadoDeAltaNombre) : ''}</div>` : '';
+  if (alFam) acts = `<button class="row-act" data-act="revisar-alerta" data-id="${p.id}">✓ Revisado, es correcto</button>` + acts;
+
+  return `<div class="row${alFam ? ' alerta' : ''}">`
       + `<div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
       + `<div class="rt"><div class="a">${titulo}</div>${sub?`<div class="b">${sub}</div>`:''}</div>`
       + `<div class="tags">${tagEstado}${tagAdmin}${tagCuenta}</div>`
-    + `</div>` + motivoLine + (acts ? `<div class="persona-acts">${acts}</div>` : '');
+    + `</div>` + alertaLine + motivoLine + (acts ? `<div class="persona-acts">${acts}</div>` : '');
+}
+
+/* "Revisado, es correcto": el Worker revalida staff, marca la alerta como revisada y deja
+   registro (quién y cuándo) en la alerta y en la bitácora. La tarjeta se actualiza sola con
+   el listener de alertas_familiares. */
+async function revisarAlertaFamiliar(p, btn){
+  // Confirmación en el mismo botón (dos toques), sin confirm() del navegador.
+  if (btn.dataset.armado !== '1'){
+    btn.dataset.armado = '1'; btn.textContent = '¿Seguro? Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = '✓ Revisado, es correcto'; } }, 4000);
+    return;
+  }
+  btn.dataset.armado = '';
+  const orig = '✓ Revisado, es correcto'; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/personas/alerta-revisar', { personaId: p.id });
+    toast(`Marca quitada: ${p.nombre}`, 'ok');
+  } catch(e){
+    toast(e.message || 'No se pudo marcar como revisado', 'bad');
+    btn.disabled = false; btn.textContent = orig;
+  }
 }
 
 $('#personaSearch')?.addEventListener('input', renderPersonas);
@@ -912,6 +979,7 @@ $('#personasList')?.addEventListener('click', e => {
     case 'reactivar': cambiarEstadoPersona(p, 'reactivar', b); break;
     case 'admin':     cambiarAdminPersona(p, b); break;
     case 'borrar':    abrirPersonaDelSheet(p); break;
+    case 'revisar-alerta': revisarAlertaFamiliar(p, b); break;
   }
 });
 
@@ -3005,7 +3073,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v12';
+const APP_VERSION = 'v13';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

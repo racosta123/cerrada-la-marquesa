@@ -111,6 +111,7 @@ export default {
         case '/personas/listar':    out = await listarPersonas(req, env); break;
         case '/personas/mis-familiares': out = await misFamiliares(req, env); break;
         case '/personas/familiar-cancelar': out = await cancelarFamiliar(req, env); break;
+        case '/personas/alerta-revisar': out = await revisarAlertaFamiliar(req, env); break;
         case '/invitaciones/familiar': out = await crearInvitacionFamiliar(req, env); break;
         case '/invitaciones/familiar-reenviar': out = await reenviarInvitacionFamiliar(req, env); break;
         case '/votaciones/crear':         out = await crearVotacion(req, env); break;
@@ -156,9 +157,16 @@ async function abrir(req, env) {
   await triggerShelly(env, puerta);
 
   const hogar = perfil.rol === 'residente' ? user.uid : (perfil.residenteUid || user.uid);
-  await logApertura(env, {
-    uid: user.uid, nombre: perfil.nombre, puerta, hogar, tipo:'app',
-  });
+  if (perfil.rol === 'residente' && perfil.jefeId && perfil.personaId) {
+    // FAMILIAR: "Familiar de <Jefe> · <Casa> · dado de alta por <quien>" + posible alerta.
+    // Se calcula DESPUÉS del pulso (la puerta ya abrió) y todo sale del servidor.
+    const extra = await datosAperturaFamiliar(env, perfil);
+    await logAperturaFamiliar(env, { uid: user.uid, nombre: perfil.nombre, puerta, hogar, ...extra });
+  } else {
+    await logApertura(env, {
+      uid: user.uid, nombre: perfil.nombre, puerta, hogar, tipo:'app',
+    });
+  }
   // Notifica al residente si quien abrió es su esclavo
   if (perfil.rol === 'esclavo' && perfil.residenteUid) {
     await notificarResidente(env, perfil.residenteUid, `${perfil.nombre} usó ${puerta}`);
@@ -363,6 +371,62 @@ async function logVisita(env, o) {
     body: JSON.stringify({ writes }),
   });
   if (!r.ok) console.error(`[bitacora] no se pudo registrar la visita (HTTP ${r.status})`);
+}
+
+/* ---- Bitácora de aperturas desde la app hechas por un FAMILIAR ----
+   Datos del padrón (personas) en el servidor: jefe, casa, quién lo dio de alta y, si su
+   alerta sigue ACTIVA (alertas_familiares), la marca. Nunca lanza: si algo falla, la apertura
+   se registra igual, sin estos datos extra. */
+async function datosAperturaFamiliar(env, perfil) {
+  const out = { personaId: perfil.personaId, familiarDe: '', casa: perfil.casa || '', dadoDeAltaNombre: '', alerta: null };
+  try {
+    const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+    const [pd, jd, ad] = await Promise.all([
+      getDoc(env, at, `personas/${perfil.personaId}`),
+      getDoc(env, at, `personas/${perfil.jefeId}`),
+      getDoc(env, at, `alertas_familiares/${perfil.personaId}`),
+    ]);
+    const p = pd && readDoc(pd.fields), j = jd && readDoc(jd.fields), a = ad && readDoc(ad.fields);
+    out.familiarDe = j?.nombre || '';
+    out.casa = j?.domicilio || out.casa;
+    // Familiares anteriores a v13 no tienen dadoDeAltaNombre: si los creó su propio jefe, es él.
+    out.dadoDeAltaNombre = p?.dadoDeAltaNombre || (p?.creadoPor && j?.uid && p.creadoPor === j.uid ? (j.nombre || '') : '');
+    if (a && a.estado === 'activa') out.alerta = { coincideCon: a.coincideCon || '' };
+  } catch (e) {
+    console.error('[bitacora] no se pudieron completar los datos del familiar:', e && e.name);
+  }
+  return out;
+}
+/* aperturas/{id} (lo ve el staff y el propio hogar) + alertas_bitacora/{mismo id} si está
+   marcado (SOLO staff: el familiar nunca ve que está marcado). Mismo commit. */
+async function logAperturaFamiliar(env, o) {
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const id = crypto.randomUUID();
+  const comun = {
+    nombre: { stringValue: o.nombre || 'Usuario' }, puerta: { stringValue: o.puerta },
+    hogar: { stringValue: o.hogar }, tipo: { stringValue: 'app' },
+    personaId: { stringValue: o.personaId || '' }, familiarDe: { stringValue: o.familiarDe || '' },
+    casa: { stringValue: o.casa || '' }, dadoDeAltaNombre: { stringValue: o.dadoDeAltaNombre || '' },
+    ts: { timestampValue: new Date().toISOString() },
+  };
+  const writes = [{
+    update: { name: docName(env, `aperturas/${id}`), fields: { uid: { stringValue: o.uid }, ...comun } },
+    currentDocument: { exists: false },
+  }];
+  if (o.alerta) {
+    writes.push({
+      update: { name: docName(env, `alertas_bitacora/${id}`), fields: {
+        aperturaId: { stringValue: id }, tipoAlerta: { stringValue: 'posible-otra-casa' },
+        coincideCon: { stringValue: String(o.alerta.coincideCon || '').slice(0, 300) }, ...comun,
+      } },
+      currentDocument: { exists: false },
+    });
+  }
+  const r = await fetch(`${fsBase(env)}:commit`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ writes }),
+  });
+  if (!r.ok) console.error(`[bitacora] no se pudo registrar la apertura del familiar (HTTP ${r.status})`);
 }
 
 /* Reserva ATÓMICA de un uso (entrada con usos limitados). Transacción de Firestore REST (los
@@ -1273,12 +1337,179 @@ async function crearInvitacionFamiliar(req, env) {
     suspendidoPor:{nullValue:null},
     creadoPor:{stringValue:user.uid},
     creadoEn:{timestampValue:new Date().toISOString()},
+    // Quién lo dio de alta: del perfil verificado en el SERVIDOR (el jefe autenticado), nunca
+    // del cuerpo de la petición. Se muestra en la bitácora y en la alerta.
+    dadoDeAltaPor:{stringValue:user.uid},
+    dadoDeAltaNombre:{stringValue:jefe.nombre || ''},
   }, at);
 
-  const persona = { id: fid, nombre: nom, jefeId: jefe.id, rol:'residente' };
+  const persona = { id: fid, nombre: nom, telefono: tel, jefeId: jefe.id, rol:'residente' };
   byId[fid] = persona;
   const t = await emitirInvitacion(env, at, { persona, byId, creadoPor: user.uid });
+  // Solo MARCA (nunca bloquea): el alta ya quedó hecha arriba y esto no lanza.
+  await evaluarFamiliarSospechoso(env, at, { familiar: persona, jefe, all, dadoDeAltaPor: user.uid });
   return json({ ok:true, familiarId: fid, token: t.token, expiraEn: t.expiraEn });
+}
+
+/* ---- Alerta "⚠️ Posible residente de otra casa" (familiares) ----
+   Detecta a un vecino que se da de alta como FAMILIAR de otra casa para entrar aunque esté
+   suspendido. NO bloquea nada: solo deja una marca en alertas_familiares/{personaId} (SOLO
+   staff la lee — ver reglas) para que el comité decida con las acciones que ya existen
+   (suspender / borrar), y avisa por push al staff. Sospechoso si:
+     a) su teléfono coincide con el de un jefe o familiar de OTRA casa, o
+     b) su nombre (sin mayúsculas, acentos ni espacios extra) coincide con un residente o
+        familiar SUSPENDIDO de otra casa.
+   "Casa" = persona del jefe (jefe: su id; familiar: su jefeId). */
+function normTel(s) {
+  const d = String(s || '').replace(/\D/g, '');
+  return d.length >= 8 ? d.slice(-10) : '';   // últimos 10: ignora +52 / 044 / lada
+}
+function coincidenciasFamiliar(familiar, jefeId, all) {
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const tel = normTel(familiar.telefono), nom = normNombre(familiar.nombre);
+  const out = [];
+  for (const p of all) {
+    if (p.id === familiar.id || p.rol !== 'residente') continue;
+    if ((p.jefeId || p.id) === jefeId) continue;           // misma casa: no cuenta
+    const porTel = !!tel && normTel(p.telefono) === tel;
+    const porNombre = !!nom && p.estado === 'suspendido' && normNombre(p.nombre) === nom;
+    if (!porTel && !porNombre) continue;
+    const dom = domicilioDe(p, byId);
+    out.push({ id: p.id, motivo: porTel ? 'telefono' : 'nombre', texto: `${p.nombre}${dom ? ' (' + dom + ')' : ''}` });
+  }
+  return out;
+}
+function idsCoincidencia(c) { return [...new Set(c.map(x => x.id))].sort().join(','); }
+/* Escribe (crea o REACTIVA) la alerta ACTIVA de un familiar y avisa por push al staff. */
+async function marcarFamiliar(env, at, { familiar, jefe, c, dadoDeAltaPor, dadoDeAltaNombre, previa, origen }) {
+  const coincideCon = c.map(x => x.texto).join('; ').slice(0, 300);
+  const motivos = [...new Set(c.map(x => x.motivo))];
+  await firestoreSet(env, `alertas_familiares/${familiar.id}`, {
+    personaId:{stringValue:familiar.id}, nombre:{stringValue:familiar.nombre || ''},
+    telefono:{stringValue:familiar.telefono || ''},
+    jefeId:{stringValue:jefe.id}, jefeNombre:{stringValue:jefe.nombre || ''}, casa:{stringValue:jefe.domicilio || ''},
+    dadoDeAltaPor:{stringValue:dadoDeAltaPor || ''}, dadoDeAltaNombre:{stringValue:dadoDeAltaNombre || ''},
+    tipoAlerta:{stringValue:'posible-otra-casa'},
+    motivos:{arrayValue:{values: motivos.map(m => ({stringValue:m}))}},
+    coincideCon:{stringValue:coincideCon},
+    coincideIds:{stringValue:idsCoincidencia(c)},   // con QUIÉN coincide (ids del padrón), para comparar
+    estado:{stringValue:'activa'},
+    origen:{stringValue:origen},   // 'alta' | 'edicion'
+    creadaEn:{timestampValue:(previa && previa.creadaEn) || new Date().toISOString()},
+    actualizadaEn:{timestampValue:new Date().toISOString()},
+    // Una revisión/descartado anterior ya no aplica a la coincidencia nueva: se limpia (el
+    // historial de quién revisó queda en la bitácora general).
+    revisadoPor:{nullValue:null}, revisadoNombre:{nullValue:null}, revisadoEn:{nullValue:null},
+  }, at);
+  await pushStaff(env, '⚠️ Familiar marcado · Cerrada La Marquesa',
+    `${familiar.nombre}, familiar de ${jefe.nombre || '—'} (${jefe.domicilio || '—'}): posible residente de otra casa · coincide con ${coincideCon}`
+    + (origen === 'edicion' ? ' (tras editar el padrón)' : ''));
+  return { coincideCon, motivos };
+}
+/* Alta de un familiar. Nunca lanza: el alta ya está hecha y no debe fallar por esto. */
+async function evaluarFamiliarSospechoso(env, at, { familiar, jefe, all, dadoDeAltaPor }) {
+  try {
+    const c = coincidenciasFamiliar(familiar, jefe.id, all);
+    if (!c.length) return null;
+    return await marcarFamiliar(env, at, { familiar, jefe, c, dadoDeAltaPor, dadoDeAltaNombre: jefe.nombre || '', previa: null, origen: 'alta' });
+  } catch (e) {
+    console.error('[alerta-familiar] no se pudo evaluar:', e && e.name);
+    return null;
+  }
+}
+/* Tras EDITAR nombre, teléfono o domicilio de un residente (jefe o familiar): se vuelve a
+   evaluar a TODOS los familiares con la misma lógica, porque el dato editado puede crear o
+   quitar coincidencias en OTRAS casas (p.ej. el teléfono nuevo de un jefe = el de un familiar
+   ajeno). `all` ya trae los datos editados. Solo MARCA, nunca bloquea; nunca lanza.
+     - coincide y no había alerta (o estaba descartada) → alerta ACTIVA + push
+     - coincide y estaba ACTIVA → actualiza con quién coincide (sin push)
+     - coincide y estaba REVISADA ("es correcto"): se respeta si coincide con lo MISMO que se
+       revisó (mismas personas, por id); si ahora coincide con alguien distinto es un caso nuevo → se reactiva + push
+     - ya NO coincide y estaba ACTIVA → se descarta sola, con registro (quién editó y cuándo) */
+async function reevaluarAlertasFamiliares(env, at, all, { editor, editado }) {
+  const cambios = [];
+  try {
+    const byId = {}; all.forEach(p => byId[p.id] = p);
+    const previas = {};
+    (await firestoreList(env, 'alertas_familiares')).forEach(d => { previas[d.name.split('/').pop()] = readDoc(d.fields); });
+    for (const f of all.filter(p => p.rol === 'residente' && p.jefeId)) {
+      const jefe = byId[f.jefeId]; if (!jefe) continue;
+      const previa = previas[f.id] || null;
+      const c = coincidenciasFamiliar(f, jefe.id, all);
+      const coincideCon = c.map(x => x.texto).join('; ').slice(0, 300);
+      const dadoDeAltaNombre = f.dadoDeAltaNombre || previa?.dadoDeAltaNombre || '';
+      if (c.length) {
+        const nueva = !previa || previa.estado === 'descartada' || (previa.estado === 'revisada' && (previa.coincideIds || '') !== idsCoincidencia(c));
+        if (nueva) {
+          await marcarFamiliar(env, at, { familiar: f, jefe, c, dadoDeAltaPor: f.dadoDeAltaPor || previa?.dadoDeAltaPor || '', dadoDeAltaNombre, previa, origen: 'edicion' });
+          cambios.push(`${previa ? 'reactivó' : 'marcó'} a ${f.nombre}`);
+        } else if (previa.estado === 'activa' && (previa.coincideCon !== coincideCon || previa.nombre !== f.nombre || previa.telefono !== (f.telefono || '') || previa.casa !== (jefe.domicilio || ''))) {
+          await firestoreActualizarCampos(env, `alertas_familiares/${f.id}`, {
+            coincideCon:{stringValue:coincideCon}, coincideIds:{stringValue:idsCoincidencia(c)},
+            motivos:{arrayValue:{values: [...new Set(c.map(x => x.motivo))].map(m => ({stringValue:m}))}},
+            nombre:{stringValue:f.nombre || ''}, telefono:{stringValue:f.telefono || ''}, casa:{stringValue:jefe.domicilio || ''},
+            actualizadaEn:{timestampValue:new Date().toISOString()},
+          }, 'Alerta');
+        }
+      } else if (previa && previa.estado === 'activa') {
+        await firestoreActualizarCampos(env, `alertas_familiares/${f.id}`, {
+          estado:{stringValue:'descartada'},
+          descartadaEn:{timestampValue:new Date().toISOString()},
+          descartadaPor:{stringValue:editor.uid}, descartadaNombre:{stringValue:editor.nombre || ''},
+          motivoDescarte:{stringValue:`Ya no coincide tras editar a ${editado}`},
+        }, 'Alerta');
+        cambios.push(`descartó la alerta de ${f.nombre} (ya no coincide)`);
+      }
+    }
+    if (cambios.length) {
+      await logBitacora(env, at, { uid: editor.uid, nombre: `Alertas de familiares tras editar a ${editado} (${editor.nombre || 'staff'}): ${cambios.join('; ')}`.slice(0, 500) });
+    }
+  } catch (e) {
+    console.error('[alerta-familiar] no se pudo reevaluar:', e && e.name);
+  }
+  return cambios;
+}
+/* Push a TODO el staff (master, admin y jefe-admin activo) con notificaciones activas. Nunca lanza. */
+async function pushStaff(env, titulo, texto) {
+  try {
+    const staff = (await firestoreList(env, 'usuarios')).map(d => readDoc(d.fields)).filter(u => esStaff(u) && u.fcmToken);
+    if (!staff.length) return;
+    const atFcm = await saToken(env, 'https://www.googleapis.com/auth/firebase.messaging');
+    for (const s of staff) {
+      await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/messages:send`, {
+        method: 'POST', headers: { Authorization: 'Bearer ' + atFcm, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: { token: s.fcmToken, notification: { title: titulo, body: texto.slice(0, 900) } } }),
+      }).catch(() => {});
+    }
+  } catch (e) {
+    console.error('[pushStaff]', e && e.name);
+  }
+}
+
+/* /personas/alerta-revisar — SOLO staff. "Revisado, es correcto": quita la marca de un
+   familiar (caso legítimo). Queda registrado quién y cuándo en la alerta y en la bitácora.
+   No borra la alerta (historial); desde ese momento sus aperturas ya no se marcan. */
+async function revisarAlertaFamiliar(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff revisa alertas');
+  const { personaId } = await req.json();
+  if (!personaId || !/^[A-Za-z0-9-]{10,64}$/.test(personaId)) throw httpErr(400, 'personaId inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const doc = await getDoc(env, at, `alertas_familiares/${personaId}`);
+  const a = doc && readDoc(doc.fields);
+  if (!a) throw httpErr(404, 'Esa alerta no existe');
+  if (a.estado !== 'activa') throw httpErr(409, 'Esa alerta ya no está activa (revisada o descartada)');
+  const ahora = new Date().toISOString();
+  await firestoreActualizarCampos(env, `alertas_familiares/${personaId}`, {
+    estado:{stringValue:'revisada'}, revisadoPor:{stringValue:user.uid},
+    revisadoNombre:{stringValue:perfil.nombre || ''}, revisadoEn:{timestampValue:ahora},
+  }, 'Alerta');
+  await logBitacora(env, at, {
+    uid: user.uid,
+    nombre: `${perfil.nombre || 'Staff'} revisó la alerta de ${a.nombre}${a.casa ? ' (familiar de ' + a.casa + ')' : ''}: es correcto`,
+  });
+  return json({ ok:true, personaId, revisadoEn: ahora });
 }
 
 /* /invitaciones/familiar-reenviar — el JEFE re-emite el link de un familiar suyo que sigue
@@ -1560,6 +1791,14 @@ async function actualizarPersona(req, env) {
 
   await firestoreActualizarCampos(env, `personas/${id}`, fields, 'Persona');
   await resyncFamilia(env, at, id, cambioDomicilio);   // si cambió domicilio, resync familiares
+  // v13 — nombre/teléfono/domicilio de un residente (jefe o familiar) cambian las
+  // coincidencias: se reevalúan las alertas de familiares. Solo marca; nunca lanza.
+  if (p.rol === 'residente') {
+    const editadaP = { ...p };
+    for (const [k, v] of Object.entries(fields)) editadaP[k] = v.stringValue;
+    await reevaluarAlertasFamiliares(env, at, all.map(x => x.id === id ? editadaP : x),
+      { editor: { uid: user.uid, nombre: perfil.nombre || '' }, editado: editadaP.nombre || id });
+  }
   return json({ ok:true, id });
 }
 
@@ -1742,6 +1981,7 @@ async function listarPersonas(req, env) {
     domicilio: domicilioDe(p, byId), domicilioNorm: p.domicilioNorm || '',
     registrado: !!p.uid,
     esAdmin: p.esAdmin === true,   // FASE 7: para la etiqueta y el botón de master en Gestión
+    dadoDeAltaNombre: p.dadoDeAltaNombre || '',   // v13: quién dio de alta al familiar
   }));
   const casasActivas = all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
   return json({ personas, casasActivas });

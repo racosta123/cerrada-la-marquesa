@@ -49,11 +49,21 @@ service cloud.firestore {
       allow write: if false;
     }
 
-    // ---- alertas_bitacora ("⚠️ Posible residente suspendido") ----
+    // ---- alertas_bitacora ("⚠️ Posible residente suspendido" en visitas y, desde v13, "⚠️ Posible
+    // residente de otra casa" en aperturas de un familiar marcado) ----
     // Mismo id que el registro de aperturas al que marcan. SOLO staff: el residente que invitó
     // no debe poder saber (ni con devtools) que el nombre de su visita coincide con un vecino
     // suspendido. Las escribe únicamente el Worker.
     match /alertas_bitacora/{id} {
+      allow read: if signedIn() && staff();
+      allow write: if false;
+    }
+
+    // ---- alertas_familiares ("⚠️ Posible residente de otra casa") ----
+    // Una por familiar marcado (id = personaId). SOLO staff: ni el familiar ni su jefe deben
+    // saber que está marcado. La escribe únicamente el Worker (al dar de alta al familiar, al
+    // reevaluar tras editar el padrón y al marcarla "Revisado, es correcto").
+    match /alertas_familiares/{personaId} {
       allow read: if signedIn() && staff();
       allow write: if false;
     }
