@@ -13,3 +13,9 @@ poner-secret-worker.js
 *serviceaccount*.json
 *adminsdk*.json
 *-firebase-adminsdk-*.json
+
+# Firebase CLI: logs locales de depuración (pueden traer detalles de la sesión)
+firebase-debug.log
+firebase-debug.*.log
+firestore-debug.log
+.firebase/
