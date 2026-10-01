@@ -164,11 +164,34 @@ export async function callShellyOnce(env, device, label) {
       continue;
     }
     console.warn(`[shelly] Shelly falló puerta=${label} status=${r.status} intento=${attempt}`);
+    // DIAGNÓSTICO TEMPORAL (quitar al resolver): solo "errors"/"message" del cuerpo, redactado y truncado.
+    console.warn(`[shelly-diag] puerta=${label} http=${r.status} detalle=${diagDetalle(env, txt)}`);
     return fail();
   }
   return fail();
 }
 
+
+// DIAGNÓSTICO TEMPORAL: extrae SOLO "errors"/"message" del cuerpo de Shelly (nunca el cuerpo completo),
+// reemplaza por [redactado] IDs (hex/decimal largos), host, auth_key y URLs, y trunca a 200.
+export function diagDetalle(env, txt) {
+  let j = null;
+  try { j = JSON.parse(txt); } catch (e) { return '[cuerpo no JSON]'; }
+  if (!j || typeof j !== 'object') return '[sin errors/message]';
+  const partes = {};
+  if (j.errors !== undefined) partes.errors = j.errors;
+  if (j.message !== undefined) partes.message = j.message;
+  if (!Object.keys(partes).length) return '[sin errors/message]';
+  let s;
+  try { s = JSON.stringify(partes); } catch (e) { return '[ilegible]'; }
+  const esc = v => String(v).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const sec of [env.SHELLY_AUTH_KEY, env.SHELLY_HOST]) if (sec) s = s.replace(new RegExp(esc(sec), 'g'), '[redactado]');
+  s = s.replace(/https?:\/\/[^\s"']+/gi, '[redactado]')
+       .replace(/\b[0-9a-f]{12,}\b/gi, '[redactado]')
+       .replace(/\b\d{12,}\b/g, '[redactado]')
+       .replace(/auth_key=[^&\s"']*/gi, 'auth_key=[redactado]');
+  return s.slice(0, 200);
+}
 
 // Mismo contrato que httpErr de worker.js (Error con .status).
 function httpErr(status, msg){ const e=new Error(msg); e.status=status; return e; }

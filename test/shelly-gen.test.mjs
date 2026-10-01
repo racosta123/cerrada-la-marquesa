@@ -3,7 +3,7 @@
 // secrets reales (todos los valores de abajo son de prueba). El Worker de producción NO importa
 // este archivo.
 import assert from 'node:assert/strict';
-import { resolveShellyDevice, triggerShelly, callShellyOnce } from '../shelly-core.js';
+import { resolveShellyDevice, triggerShelly, callShellyOnce, diagDetalle } from '../shelly-core.js';
 import { ShellyGate } from '../worker.js';
 
 let calls = [];
@@ -108,6 +108,24 @@ await t('ráfaga Gen3 por el portero: menos llamadas que taps, todas v2', async 
   assert.ok(res.every(r => r.ok));
   assert.ok(calls.length < 3);
   assert.ok(calls.every(c => c.url.includes('/v2/devices/api/set/switch')));
+});
+
+console.log('\n[5] Diagnóstico temporal: redactado');
+await t('diagDetalle redacta ID/host/llave/URL, solo errors/message, trunca a 200', () => {
+  const env = { SHELLY_AUTH_KEY: 'LLAVE_TEST_XYZ', SHELLY_HOST: 'https://host.test' };
+  const cuerpo = JSON.stringify({ isok: false, secreto: 'NO_DEBE_SALIR', errors: { device: 'id aaaaaaaaaaaa no existe', n: '58058033954840', k: 'LLAVE_TEST_XYZ', u: 'https://host.test/x?auth_key=LLAVE_TEST_XYZ' }, message: 'x'.repeat(500) });
+  const d = diagDetalle(env, cuerpo);
+  for (const p of ['aaaaaaaaaaaa', '58058033954840', 'LLAVE_TEST_XYZ', 'host.test', 'NO_DEBE_SALIR', 'isok']) assert.ok(!d.includes(p), 'filtra ' + p);
+  assert.ok(d.includes('[redactado]')); assert.ok(d.length <= 200);
+  assert.equal(diagDetalle(env, 'no es json'), '[cuerpo no JSON]');
+});
+await t('el log [shelly-diag] sale con HTTP y detalle redactado, sin secretos', async () => {
+  respond = () => ({ ok: false, status: 400, text: JSON.stringify({ errors: { id: 'bbbbbbbbbbbb inválido' } }) });
+  const lines = []; console.warn = (...a) => lines.push(a.join(' ')); console.log = () => {};
+  try { await triggerShelly(envDirecto, 'visitantes').catch(() => {}); } finally { console.log = realLog; console.warn = realWarn; }
+  const d = lines.find(l => l.startsWith('[shelly-diag]'));
+  assert.ok(d && d.includes('http=400') && d.includes('[redactado]'), d);
+  for (const p of ['bbbbbbbbbbbb', 'aaaaaaaaaaaa', 'LLAVE_TEST', 'host.test']) assert.ok(!lines.join('\n').includes(p));
 });
 
 console.log(`\nTODAS LAS PRUEBAS PASARON (${pass})`);
