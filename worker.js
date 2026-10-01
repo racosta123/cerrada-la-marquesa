@@ -24,8 +24,11 @@
      salvo que SHELLY_GATE_ENABLED="0" (la vinculación sigue existiendo, solo se deja de usar).
    =========================================================== */
 
+// Lógica de Shelly Cloud (selector Gen1/Gen2+, llamada, triggerShelly) en módulo aparte.
+import { triggerShelly, callShellyOnce, shellyCfg, shellySleep } from './shelly-core.js';
+
 // Nombres de puerta válidos. Los IDs reales de cada Shelly YA NO viven en el código (repo
-// público): se leen en tiempo de petición del secret SHELLY_DEVICES vía resolveShellyDeviceId()
+// público): se leen en tiempo de petición del secret SHELLY_DEVICES vía resolveShellyDevice()
 // (más abajo, junto a triggerShelly). Una puerta sin entrada en ese JSON (peatones/salida hoy,
 // sin hardware instalado) responde error claro en vez de intentar hablarle a un Shelly que no existe.
 const PUERTAS = new Set([
@@ -2447,64 +2450,6 @@ async function crearUsuario(req, env) {
 /* ===========================================================
    SHELLY
    =========================================================== */
-/* Único punto de salida hacia Shelly Cloud (lo usan /abrir y consumirInvitacion). NO llama a
-   Shelly directamente: entrega la orden al Durable Object "shelly-gate" (una sola instancia
-   global), que serializa y espacia TODAS las llamadas de la cuenta (el límite de Shelly Cloud
-   es ~1 req/s por Cloud Key, compartido por todas las puertas). Mismo contrato de errores que
-   antes: falla => httpErr(status, mensaje) => {error} con ese status. */
-/* Lee el secret SHELLY_DEVICES (JSON {"puerta":"deviceId",...}) y devuelve el deviceId de esa
-   puerta, o null si el secret falta, está mal formado, o esa puerta no tiene entrada (sin
-   hardware asignado todavía — hoy: peatones, salida). Nunca lanza ni loguea el contenido del
-   secret ni el motivo exacto de un JSON roto: solo null, para que triggerShelly responda el
-   mismo error genérico en ambos casos ("puerta sin dispositivo configurado"). */
-function resolveShellyDeviceId(env, puerta) {
-  if (!env.SHELLY_DEVICES) return null;
-  let mapa;
-  try { mapa = JSON.parse(env.SHELLY_DEVICES); } catch (e) { return null; }
-  if (!mapa || typeof mapa !== 'object' || Array.isArray(mapa)) return null;
-  const id = mapa[puerta];
-  return (typeof id === 'string' && id) ? id : null;
-}
-
-async function triggerShelly(env, puerta) {
-  // Resuelto y validado ANTES de tocar el portero de fila: una puerta sin Shelly asignado (o un
-  // secret SHELLY_DEVICES roto) falla YA, rápido y con mensaje genérico — nunca entra a la cola
-  // del Durable Object ni intenta una llamada real a Shelly, en ningún modo.
-  const deviceId = resolveShellyDeviceId(env, puerta);
-  if (!deviceId) throw httpErr(503, 'Puerta sin dispositivo configurado');
-
-  // "0" exacto = modo directo (bypass del portero, solo para el A/B de tiempos). Cualquier otro
-  // valor, vacío o ausente = portero (modo seguro por defecto) — ver SHELLY_GATE_ENABLED arriba.
-  const directo = env.SHELLY_GATE_ENABLED === '0';
-  const t0 = Date.now();
-  let out = null;
-
-  if (directo) {
-    // Llamada directa a Shelly Cloud: misma función (callShellyOnce), mismo timeout, mismos
-    // secrets — SIN pasar por la cola/espaciado/dedupe del Durable Object.
-    try { out = await callShellyOnce(env, deviceId, puerta); }
-    catch (e) { /* callShellyOnce no debería lanzar, pero por si acaso: mismo error genérico */ }
-  } else {
-    if (!env.SHELLY_GATE) throw httpErr(500, 'Portero de fila no configurado');
-    try {
-      const stub = env.SHELLY_GATE.get(env.SHELLY_GATE.idFromName(SHELLY_GATE_NAME));
-      const r = await stub.fetch('https://shelly-gate/abrir', {
-        method: 'POST',
-        body: JSON.stringify({ deviceId, label: puerta }),
-      });
-      out = await r.json();
-    } catch (e) { /* DO inalcanzable o respuesta ilegible => mismo error que "no respondió" */ }
-  }
-
-  // Log de tiempo por apertura, en ambos modos — nunca deviceId, host, ni llave, solo el nombre
-  // de la puerta (igual que el resto de logs de este archivo).
-  const ms = Date.now() - t0;
-  const ok = !!(out && out.ok === true);
-  console.log(`[shelly] modo=${directo ? 'directo' : 'portero'}, puerta=${puerta}, ms=${ms}, resultado=${ok ? 'ok' : 'error'}${out?.limitado ? ', max_req=si' : ''}`);
-
-  if (!ok) throw httpErr(out?.status || 502, out?.error || 'La cerradura no respondió');
-}
-
 /* ===========================================================
    ShellyGate — Durable Object "portero de fila" (UNA instancia global, nombre fijo).
    - Cola FIFO en memoria; UNA llamada real a Shelly a la vez.
@@ -2522,71 +2467,6 @@ async function triggerShelly(env, puerta) {
      deviceId, ni la llave, ni el cuerpo de la respuesta de Shelly.
    Los valores se ajustan en wrangler.toml [vars]; los números de abajo son solo el respaldo.
    =========================================================== */
-const SHELLY_GATE_NAME = 'shelly-gate';
-const SHELLY_DEFAULTS = {
-  SHELLY_MIN_SPACING_MS:    1200,   // separación mínima entre llamadas reales a Shelly
-  SHELLY_RETRY_DELAY_MS:    1500,   // pausa antes del único reintento por max_req / 429
-  SHELLY_CALL_TIMEOUT_MS:   8000,   // tope de UNA llamada a Shelly; al vencer se aborta => 502
-  SHELLY_MAX_QUEUE_WAIT_MS: 20000,  // tope de espera en fila antes de responder "reintenta"
-  SHELLY_DEDUPE_WINDOW_MS:  2000,   // ventana para juntar el mismo "abrir" a la misma puerta
-};
-const shellySleep = ms => new Promise(r => setTimeout(r, ms));
-
-function shellyCfg(env, name) {
-  const v = Number(env[name]);
-  return Number.isFinite(v) && v >= 0 ? v : SHELLY_DEFAULTS[name];
-}
-
-/* Única llamada real a Shelly Cloud (turn=on), con el mismo timeout (SHELLY_CALL_TIMEOUT_MS) y
-   el mismo reintento por max_req/429 (SHELLY_RETRY_DELAY_MS) en ambos modos — ShellyGate.callShelly
-   de abajo delega aquí, no es una copia. Lo único que decide "portero" vs "directo" (ver
-   SHELLY_GATE_ENABLED / triggerShelly) es si esta llamada pasa antes por la cola/espaciado/dedupe
-   del Durable Object o no; el pulso a Shelly en sí es idéntico. Nunca loguea deviceId, host, ni
-   la auth key — mismo criterio que el resto del archivo. limitado:true si CUALQUIER intento de
-   esta llamada topó con max_req/429 (haya terminado en éxito tras reintentar, o en fallo). */
-async function callShellyOnce(env, deviceId, label) {
-  let sawLimitado = false;
-  const fail = () => ({ ok:false, status:502, error:'La cerradura no respondió', limitado: sawLimitado });
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    if (attempt === 2) await shellySleep(shellyCfg(env, 'SHELLY_RETRY_DELAY_MS'));
-    const body = new URLSearchParams({
-      id: deviceId,
-      channel: '0',
-      turn: 'on',
-      auth_key: env.SHELLY_AUTH_KEY,
-    });
-    const ctrl = new AbortController();
-    const timeoutMs = shellyCfg(env, 'SHELLY_CALL_TIMEOUT_MS');
-    const timer = timeoutMs > 0 ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
-    let r, txt = '';
-    try {
-      r = await fetch(`${env.SHELLY_HOST}/device/relay/control`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body,
-        signal: ctrl.signal,
-      });
-      txt = await r.text().catch(() => '');
-    } catch (e) {
-      if (ctrl.signal.aborted) console.warn(`[shelly] TIMEOUT de llamada puerta=${label} intento=${attempt} tras ${timeoutMs}ms`);
-      else console.warn(`[shelly] error de red puerta=${label} intento=${attempt}`);
-      return fail();
-    } finally {
-      clearTimeout(timer);
-    }
-    const limitado = r.status === 429 || /max_req/i.test(txt);
-    if (limitado) sawLimitado = true;
-    if (r.ok && !limitado) return { ok:true, limitado: sawLimitado };
-    if (limitado && attempt === 1) {
-      console.warn(`[shelly] max_req/429 puerta=${label} status=${r.status}; reintento en ${shellyCfg(env, 'SHELLY_RETRY_DELAY_MS')}ms`);
-      continue;
-    }
-    console.warn(`[shelly] Shelly falló puerta=${label} status=${r.status} intento=${attempt}`);
-    return fail();
-  }
-  return fail();
-}
-
 export class ShellyGate {
   constructor(state, env) {
     this.env = env;
@@ -2601,13 +2481,13 @@ export class ShellyGate {
   }
 
   async fetch(req) {
-    let deviceId, label;
-    try { ({ deviceId, label } = await req.json()); } catch (e) {}
+    let deviceId, label, gen, offSec;
+    try { ({ deviceId, label, gen, offSec } = await req.json()); } catch (e) {}
     if (typeof deviceId !== 'string' || !deviceId) return json({ ok:false, status:400, error:'Puerta no válida' });
-    return json(await this.enqueue(deviceId, String(label || 'desconocida')));
+    return json(await this.enqueue(deviceId, String(label || 'desconocida'), gen, offSec));
   }
 
-  enqueue(deviceId, label) {
+  enqueue(deviceId, label, gen, offSec) {
     const now = Date.now();
     const dedupeMs = this.cfg('SHELLY_DEDUPE_WINDOW_MS');
     for (const [k, v] of this.recent) if (now - v.at >= dedupeMs) this.recent.delete(k);
@@ -2616,7 +2496,7 @@ export class ShellyGate {
     const dup = this.recent.get(deviceId);
     if (dup && !dup.job.started) { console.log(`[shelly-gate] dedupe puerta=${label}`); return dup.job.promise; }
 
-    const job = { deviceId, label, at: now, started: false };
+    const job = { deviceId, label, gen, offSec, at: now, started: false };
     job.promise = new Promise(resolve => { job.resolve = resolve; });
     this.recent.set(deviceId, { at: now, job });
 
@@ -2660,10 +2540,10 @@ export class ShellyGate {
 
   async callShelly(job) {
     // Delega en callShellyOnce (arriba, junto a SHELLY_DEFAULTS) — es la MISMA función que usa
-    // el modo "directo" (SHELLY_GATE_ENABLED="0"): un solo "turn=on", sin apagado explícito
-    // desde el Worker (el pulso lo maneja el auto-off configurado en el propio Shelly).
+    // el modo "directo" (SHELLY_GATE_ENABLED="0"). El método (Gen1 form-urlencoded vs Gen2+ JSON)
+    // lo decide la generación del dispositivo, que viaja con el job.
     try {
-      return await callShellyOnce(this.env, job.deviceId, job.label);
+      return await callShellyOnce(this.env, { id: job.deviceId, gen: job.gen, offSec: job.offSec }, job.label);
     } finally {
       // El espaciado (drain(), abajo) cuenta desde que TERMINA esta llamada, tuviera que
       // reintentar por max_req/429 o no — así la siguiente llegada a Shelly siempre queda
