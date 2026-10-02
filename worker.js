@@ -95,6 +95,7 @@ export default {
         case '/finanzas/corregir': out = await corregirFinanza(req, env); break;
         case '/finanzas/reactivar': out = await reactivarFinanza(req, env); break;
         case '/finanzas/estado-cuenta': out = await estadoCuentaFinanzas(req, env); break;
+        case '/cobranza/aviso-pago':     out = await avisoPagoCasa(req, env); break;
         case '/config/cobranza':            out = await obtenerConfigCobranza(req, env); break;
         case '/config/cobranza-actualizar': out = await actualizarConfigCobranza(req, env); break;
         case '/vecinos/crear':     out = await crearVecino(req, env); break;
@@ -2705,7 +2706,7 @@ function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa, ahora = ahoraH
 /* Núcleo ÚNICO de "quién debe": jefes ACTIVOS con adeudo > 0. Lo usan la suspensión automática
    y el recordatorio de pago (mismo criterio, sin duplicar el cálculo). Solo lee. `ahora` es
    opcional (hora Hermosillo, ver calcularEstadoCuenta); sin él, el momento actual. */
-async function casasConAdeudo(env, at, cfg, ahora) {
+async function casasConAdeudo(env, at, cfg, ahora, soloDomNorm) {
   // Mismo recorrido único de "finanzas" que ya usa cobranzaFinanzas para armar el historial
   // completo de pagos de Cuota por casa, en vez de repetirlo casa por casa.
   const pagosPorCasa = new Map();
@@ -2714,12 +2715,13 @@ async function casasConAdeudo(env, at, cfg, ahora) {
     if (esCancelado(d)) continue;   // un pago cancelado no abona al adeudo
     if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
     const dn = normDomicilio(d.casa);
+    if (soloDomNorm && dn !== soloDomNorm) continue;   // consulta de UNA casa: mismo cálculo, menos trabajo
     if (!pagosPorCasa.has(dn)) pagosPorCasa.set(dn, []);
     pagosPorCasa.get(dn).push({ ts: d.ts, monto: d.monto || 0 });
   }
   const all = await personasList(env, at);
   const morosas = [];
-  for (const jefe of all.filter(p => esJefe(p) && p.estado === 'activo')) {
+  for (const jefe of all.filter(p => esJefe(p) && p.estado === 'activo' && (!soloDomNorm || p.domicilioNorm === soloDomNorm))) {
     const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(jefe.domicilioNorm), ...(ahora ? { ahora } : {}) });
     if (estado.adeudo > 0) morosas.push({ jefe, estado });
   }
@@ -2799,6 +2801,9 @@ function textoRecordatorioPago(dia, mesIdx) {
   if (dia === 3) return 'Te quedan 2 días para pagar tu cuota y evitar la suspensión del acceso vehicular.';
   return null;
 }
+function antesDeInicioCobro(cfg, ahora) {
+  return inicioDiaHermosilloUTC(ahora.getUTCFullYear(), ahora.getUTCMonth(), ahora.getUTCDate()).getTime() < Date.parse(cfg.fechaInicioCobro);
+}
 /* `ahora`: Date en marco Hermosillo (como ahoraHermosillo()). Solo lee; arma el plan del día. */
 async function planRecordatoriosPago(env, at, ahora) {
   const dia = ahora.getUTCDate(), mesIdx = ahora.getUTCMonth(), anio = ahora.getUTCFullYear();
@@ -2807,7 +2812,7 @@ async function planRecordatoriosPago(env, at, ahora) {
   if (!texto) return { fecha, dia, texto: null, casas: [] };
   const cfg = cfgCobranzaDesdeDoc(await getDoc(env, at, 'config/cobranza'));
   // Nunca antes de fechaInicioCobro (además de que el adeudo ya sería 0 por el cálculo común).
-  if (inicioDiaHermosilloUTC(anio, mesIdx, dia).getTime() < Date.parse(cfg.fechaInicioCobro)) return { fecha, dia, texto, casas: [] };
+  if (antesDeInicioCobro(cfg, ahora)) return { fecha, dia, texto, casas: [] };
   const dia5 = new Date(Date.UTC(anio, mesIdx, 5));
   const { morosas } = await casasConAdeudo(env, at, cfg, dia5);
   const casas = [];
@@ -2857,6 +2862,33 @@ async function enviarRecordatoriosPago(env, ahora = ahoraHermosillo()) {
     return res;
   }
 }
+/* ============ /cobranza/aviso-pago — residente o familiar, SOLO su propia casa ============
+   Solo lectura. Alimenta el aviso amarillo de Puertas en la app (la app NO lo consulta en cada
+   apertura). mostrar:true únicamente del día 1 al 4 (Hermosillo), si la casa sería suspendida el
+   día 5 (casasConAdeudo evaluado al día 5, el mismo núcleo del corte y del push) y nunca antes de
+   fechaInicioCobro. Calcula en cada llamada, así que un pago que salda el adeudo apaga el aviso
+   de inmediato para el jefe y todos sus familiares. La casa sale del perfil del token; si el
+   cuerpo trae otra casa, 403. Nunca se lee otra casa. */
+async function avisoPagoCasa(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'residente' || !perfil.casa) throw httpErr(403, 'Solo residentes con casa');
+  const domNorm = normDomicilio(perfil.casa);
+  const { casa } = await req.json().catch(() => ({}));
+  if (casa !== undefined && casa !== null && casa !== '' && normDomicilio(casa) !== domNorm) throw httpErr(403, 'Solo puedes consultar tu propia casa');
+
+  const ahora = ahoraHermosillo();
+  const dia = ahora.getUTCDate();
+  if (dia < 1 || dia > 4) return json({ ok:true, mostrar:false });
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const cfg = cfgCobranzaDesdeDoc(await getDoc(env, at, 'config/cobranza'));
+  if (antesDeInicioCobro(cfg, ahora)) return json({ ok:true, mostrar:false });
+  const dia5 = new Date(Date.UTC(ahora.getUTCFullYear(), ahora.getUTCMonth(), 5));
+  const { morosas } = await casasConAdeudo(env, at, cfg, dia5, domNorm);
+  if (!morosas.length) return json({ ok:true, mostrar:false });
+  return json({ ok:true, mostrar:true, mes: MESES_ES[ahora.getUTCMonth()] });
+}
+
 /* ============ /admin/simular-recordatorio-pago — SOLO master y admin ============
    Muestra a qué casas se enviaría y con qué texto. No envía ni escribe nada. `fecha` opcional
    (AAAA-MM-DD) para ver cómo saldría otro día (p. ej. el 1 del mes que entra); sin ella, hoy. */

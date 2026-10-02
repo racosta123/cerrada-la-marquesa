@@ -71,7 +71,7 @@ const cron = async (fecha) => {
   await worker.scheduled({}, env, { waitUntil: p => ps.push(p) }); await Promise.all(ps);
 };
 const jefe = (id, nom, dom, uid, extra = {}) => put(`personas/${id}`, { nombre: nom, rol: 'residente', estado: 'activo', uid, domicilio: dom, domicilioNorm: dom.toUpperCase(), jefeId: null, creadoEn: { __ts: '2026-10-01T00:00:00Z' }, ...extra });
-const pago = (id, dom) => put(`finanzas/${id}`, { tipo: 'ingreso', categoria: 'Cuota', casa: dom, monto: 350, ts: { __ts: '2026-11-20T18:00:00Z' } });
+const pago = (id, dom, monto = 350) => put(`finanzas/${id}`, { tipo: 'ingreso', categoria: 'Cuota', casa: dom, monto, ts: { __ts: '2026-11-20T18:00:00Z' } });
 const reset = (inicio = '2026-11-01T07:00:00.000Z') => {
   store.clear(); fcm = []; fcmStatus = 200; fakeNow = null;
   put('config/cobranza', { cuotaMensual: 350, fechaInicioCobro: { __ts: inicio } });
@@ -190,6 +190,58 @@ await t('roles: jefe-admin 403, residente 403, sin token 401', async () => {
   assert.equal((await call('/admin/simular-recordatorio-pago', 'uJA')).status, 403);
   assert.equal((await call('/admin/simular-recordatorio-pago', 'uR')).status, 403);
   assert.equal((await call('/admin/simular-recordatorio-pago', null)).status, 401);
+});
+
+console.log('\n[5] aviso dentro de la app (/cobranza/aviso-pago)');
+const aviso = (uid, dia, body = {}) => { fakeNow = Date.parse(dia + 'T16:00:00Z'); return call('/cobranza/aviso-pago', uid, body); };
+await t('días 1 al 4 con adeudo: muestra (jefe) con el mes', async () => {
+  for (const d of ['01', '02', '03', '04']) { const r = await aviso('u1', '2026-12-' + d); assert.equal(r.status, 200); assert.equal(r.body.mostrar, true); assert.equal(r.body.mes, 'diciembre'); }
+});
+await t('día 5 en adelante: no muestra', async () => {
+  for (const d of ['05', '06', '15', '31']) assert.equal((await aviso('u1', '2026-12-' + d)).body.mostrar, false);
+});
+await t('casa al corriente: no muestra', async () => { assert.equal((await aviso('u2', '2026-12-01')).body.mostrar, false); });
+await t('antes de fechaInicioCobro: no muestra', async () => {
+  reset('2027-01-01T07:00:00.000Z'); assert.equal((await aviso('u1', '2026-12-01')).body.mostrar, false);
+  reset(); assert.equal((await aviso('u1', '2026-10-02')).body.mostrar, false);
+  assert.equal((await aviso('u1', '2026-11-01')).body.mostrar, false);
+});
+await t('un familiar ve el aviso de SU casa', async () => {
+  assert.equal((await aviso('uF', '2026-12-02')).body.mostrar, true);
+});
+await t('intentar leer otra casa: 403; sin casa (master): 403; sin token: 401; su propia casa en el cuerpo: ok', async () => {
+  assert.equal((await aviso('u1', '2026-12-01', { casa: 'Casa 2' })).status, 403);
+  assert.equal((await aviso('uF', '2026-12-01', { casa: 'casa  5' })).status, 403);
+  assert.equal((await aviso('u1', '2026-12-01', { casa: 'casa 1' })).status, 200);
+  assert.equal((await aviso('uM', '2026-12-01')).status, 403);
+  assert.equal((await call('/cobranza/aviso-pago', null)).status, 401);
+});
+await t('no expone datos de otras casas (solo ok, mostrar y mes)', async () => {
+  const r = await aviso('u1', '2026-12-01'); assert.deepEqual(Object.keys(r.body).sort(), ['mes', 'mostrar', 'ok']);
+});
+await t('casa suspendida: no muestra', async () => { assert.equal((await aviso('u4', '2026-12-01')).body.mostrar, false); });
+await t('consulta caída (Firestore falla): el endpoint falla y se recupera después; nada más se afecta', async () => {
+  const orig = globalThis.fetch; fakeNow = Date.parse('2026-12-02T16:00:00Z');
+  globalThis.fetch = async (u, o) => String(u).includes('/finanzas') ? new Response('{}', { status: 500 }) : orig(u, o);
+  try { assert.equal((await call('/cobranza/aviso-pago', 'u1')).status >= 500, true); } finally { globalThis.fetch = orig; }
+  assert.equal((await aviso('u1', '2026-12-02')).body.mostrar, true);
+});
+await t('pago el día 2 que salda: el aviso se apaga YA para jefe y familiar, y el push del día 3 no sale', async () => {
+  assert.equal((await aviso('u1', '2026-12-02')).body.mostrar, true);
+  pago('f1', 'Casa 1');
+  assert.equal((await aviso('u1', '2026-12-02')).body.mostrar, false);
+  assert.equal((await aviso('uF', '2026-12-02')).body.mostrar, false);
+  await cron('2026-12-03'); assert.ok(!toks().includes('tok1')); assert.ok(toks().includes('tok5'));
+});
+await t('pago parcial que no salda: el aviso sigue (jefe y familiar) y el push del día 3 también sale', async () => {
+  pago('f1', 'Casa 1', 100);
+  assert.equal((await aviso('u1', '2026-12-02')).body.mostrar, true);
+  assert.equal((await aviso('uF', '2026-12-02')).body.mostrar, true);
+  await cron('2026-12-03'); assert.ok(toks().includes('tok1'));
+});
+await t('solo lectura: la consulta no escribe nada ni envía push', async () => {
+  const antes = JSON.stringify([...store]); await aviso('u1', '2026-12-01'); await aviso('uF', '2026-12-03');
+  assert.equal(JSON.stringify([...store]), antes); assert.equal(fcm.length, 0);
 });
 
 console.log(`\n${pass} pruebas OK`);

@@ -122,6 +122,7 @@ auth.onAuthStateChanged(async user => {
 });
 
 function showLogin(){
+  avisoPago = null; pintarAvisoPago();
   document.body.classList.remove('in-app');   // fondo con capa suave en el login
   $('#appView').classList.add('hidden');
   $('#loginView').classList.remove('hidden');
@@ -150,6 +151,7 @@ function enterApp(){
   if (ME.rol==='residente' || ME.rol==='esclavo') watchInvites();
   setupMiFamilia();
   registerPush();
+  refrescarAvisoPago(true);
   cargarLogoMarquesa();   // dispara la precarga del logo del recibo; no bloquea nada
 }
 
@@ -292,6 +294,46 @@ function renderDoors(){
   });
 }
 
+/* ====================== AVISO DE PAGO (días 1 al 4) ======================
+   El Worker decide (/cobranza/aviso-pago, solo lectura, solo la casa del propio usuario); aquí
+   solo se pinta. Se consulta al abrir la app, al volver a primer plano y tras ver el estado de
+   cuenta — NUNCA al abrir una puerta (el toast usa lo ya cargado). Si la consulta falla, no hay
+   aviso y la app sigue normal. */
+let avisoPago = null, avisoPagoT = 0, avisoPagoBusy = false, avisoPagoLink;
+function textoAvisoPago(){
+  return `Tienes pendiente tu cuota de ${avisoPago.mes}. Paga antes del día 5 para evitar la suspensión del acceso vehicular.`;
+}
+function pintarAvisoPago(){
+  const el = $('#avisoPagoBanner'); if (!el) return;
+  if (!avisoPago || !avisoPago.mostrar){ el.classList.add('hidden'); el.innerHTML = ''; return; }
+  const link = (avisoPagoLink || '').trim();
+  el.innerHTML = `<b>⚠️ ${esc(textoAvisoPago())}</b>`
+    + (link ? `<a class="btn-primary" style="display:block;text-align:center;margin-top:10px;text-decoration:none" href="${esc(link)}" target="_blank" rel="noopener">Pagar cuota</a>` : '');
+  el.classList.remove('hidden');
+}
+async function refrescarAvisoPago(forzar){
+  if (!ME || ME.rol !== 'residente' || !ME.casa) return;   // staff sin casa: no aplica
+  if (avisoPagoBusy || (!forzar && Date.now() - avisoPagoT < 20000)) return;
+  avisoPagoBusy = true;
+  try {
+    const r = await authedFetch('/cobranza/aviso-pago', {});
+    avisoPago = r && r.mostrar ? r : null;
+    if (avisoPago && avisoPagoLink === undefined){
+      try { avisoPagoLink = (await authedFetch('/config/cobranza', {})).linkPago || ''; } catch(e){ /* sin botón, el aviso igual sale */ }
+    }
+  } catch(e){
+    avisoPago = null;   // consulta caída: sin aviso, todo lo demás normal
+  } finally {
+    avisoPagoT = Date.now(); avisoPagoBusy = false; pintarAvisoPago();
+  }
+}
+function avisoPagoToast(){
+  if (!avisoPago || !avisoPago.mostrar) return;
+  setTimeout(() => { if (avisoPago && avisoPago.mostrar) toast(`Tienes pendiente tu cuota de ${avisoPago.mes}. Paga antes del día 5 para evitar la suspensión.`); }, 1600);
+}
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') refrescarAvisoPago(false); });
+window.addEventListener('focus', () => refrescarAvisoPago(false));
+
 let opening = false;
 async function openDoor(door, el){
   if (opening) return;
@@ -299,6 +341,7 @@ async function openDoor(door, el){
   try {
     await authedFetch('/abrir', { puerta: door.id });
     toast(door.name + ' abriéndose', 'ok');
+    avisoPagoToast();   // DESPUÉS de la respuesta de /abrir; solo usa el estado ya cargado (sin consulta)
   } catch(e){
     toast(e.message || 'No se pudo abrir', 'bad');
   } finally {
@@ -1855,6 +1898,7 @@ async function cargarMiEstadoCuenta(){
     ]);
 
     renderAvisoCorte(r.avisoCorte);
+    refrescarAvisoPago(true);   // el usuario acaba de ver su estado de cuenta/pagos: aviso al día
 
     if (r.alCorriente){
       el.innerHTML = `<p class="vnote" style="margin:0;color:var(--ok);font-size:14px">✅ Estás al corriente.</p>
@@ -3491,7 +3535,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v21';
+const APP_VERSION = 'v22';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
