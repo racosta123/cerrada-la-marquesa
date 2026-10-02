@@ -73,7 +73,7 @@ globalThis.fetch = async (url, opts = {}) => {
       const body = JSON.parse(opts.body); shellyCalls.push({ tipo: 'v2', body });
       if (shellyV2 === false) return R({}, 404);
       if (shellyV2 === 'falla') throw new Error('red');
-      return R(body.ids.filter(id => shellyDevices.has(id) && !shellyDevices.get(id).sinV2).map(id => { const d = shellyDevices.get(id); return { id, type: 'relay', code: d.modelo || 'SHSW-1', gen: d.gen, online: d.online ? 1 : 0, settings: d.nombre ? { name: d.nombre } : {} }; }));
+      return R(body.ids.filter(id => shellyDevices.has(id) && !shellyDevices.get(id).sinV2).map(id => { const d = shellyDevices.get(id); const g3 = (d.modelo || '').startsWith('S3'); const it = { id, type: 'relay', code: d.modelo || 'SHSW-1', gen: g3 ? 'G2' : d.gen, online: d.online ? 1 : 0 }; if (body.select && body.select.includes('settings') && !d.sinSettings) it.settings = g3 ? { sys: { device: { name: d.nombre || '', mac: 'X' } }, wifi: {} } : (d.nombre ? { name: d.nombre, device: { type: 'SHSW-1' } } : { device: { type: 'SHSW-1' } }); return it; }));
     }
     if (u.pathname === '/device/relay/control') { const p = new URLSearchParams(String(opts.body)); shellyCalls.push({ tipo: 'pulso', gen: 1, id: p.get('id') }); return new Response('ok'); }
     if (u.pathname === '/v2/devices/api/set/switch') { shellyCalls.push({ tipo: 'pulso', gen: 3, id: JSON.parse(opts.body).id }); return new Response('ok'); }
@@ -349,13 +349,13 @@ await t('3 en la cuenta, los 3 asignados: 0 repuestos; la generación sale por l
 });
 await t('con la API v2 la generación se afina: el Gen3 queda como 3 (criterio v2.gen)', async () => {
   cuentaReal();
-  const c = (await call('/dispositivos/disponibles', 'uM', { diagnostico: true })).body.cuenta.find(x => x.id6 === 'bbbbbb'); assert.deepEqual([c.gen, c.criterioGen], [3, 'v2.gen']);
+  const c = (await call('/dispositivos/disponibles', 'uM', { diagnostico: true })).body.cuenta.find(x => x.id6 === 'bbbbbb'); assert.deepEqual([c.gen, c.genEtiqueta, c.criterioGen], [3, 3, 'code'], 'la v2 dice G2 para un Gen3; manda el prefijo S3');
 });
 await t('API v2: trae el NOMBRE de la app de Shelly, la generación G1/G3 y online 0/1 (autoritativos)', async () => {
   cuentaReal(); shellyDevices.set('dddddddddddd', { gen: 'G1', online: true, nombre: 'REPUESTO 1' });
   const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
   assert.deepEqual(r.body.disponibles.map(d => [d.nombre, d.gen]), [['REPUESTO 1', 1]]);
-  const v2 = shellyCalls.filter(c => c.tipo === 'v2'); assert.equal(v2.length, 1); assert.deepEqual(v2[0].body.select, ['settings']); assert.deepEqual(v2[0].body.pick, { settings: ['name'] }); assert.ok(v2[0].body.ids.length <= 10);
+  const v2 = shellyCalls.filter(c => c.tipo === 'v2'); assert.equal(v2.length, 1); assert.deepEqual(v2[0].body.select, ['settings']); assert.equal(v2[0].body.pick, undefined, 'sin pick: el nombre cuelga de sys.device / name'); assert.ok(v2[0].body.ids.length <= 10);
   assert.ok(r.body.cuenta.every(c => c.criterioOnline === 'v2.online' && c.nombre));
   assert.ok(!JSON.stringify(r.body).includes('LLAVE_TEST'));
 });
@@ -411,6 +411,43 @@ await t('con la forma real y 3 asignados: "Dispositivos en la cuenta: 3 · Repue
   r = await call('/dispositivos/disponibles', 'uM'); assert.deepEqual(r.body.disponibles.map(d => d.id), ['dddddddddddd']); assert.equal(shellyCalls.filter(c => c.tipo === 'status').length, 1);
   skew += 20000; shellyDevices.set('dddddddddddd', { gen: 'G1', online: false });
   r = await call('/dispositivos/disponibles', 'uM'); assert.deepEqual(r.body.disponibles, []); assert.equal(r.body.fueraDeLinea, 1);
+});
+
+console.log('\n[7] Correcciones tras el diagnóstico real v18: nombres (sin pick), Gen por prefijo del code, _dev_info.online de respaldo');
+await t('NOMBRES: Gen3 por settings.sys.device.name y Gen1 por settings.name; la petición v2 va SIN pick', async () => {
+  cuentaReal(); shellyDevices.set('dddddddddddd', { gen: 'G1', online: true, nombre: 'REPUESTO 1' });
+  const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
+  const por = Object.fromEntries(r.body.cuenta.map(c => [c.id6, c]));
+  assert.deepEqual([por['bbbbbb'].nombre, por['bbbbbb'].criterioNombre], ['VISITAS', 'settings.sys.device.name']);
+  assert.deepEqual([por['dddddd'].nombre, por['dddddd'].criterioNombre], ['REPUESTO 1', 'settings.name']);
+  assert.equal(shellyCalls.find(c => c.tipo === 'v2').body.pick, undefined);
+});
+await t('SIN nombre en la app: nombre null (el front muestra "(sin nombre en la app de Shelly)"); settings ausentes no rompen nada', async () => {
+  cuentaReal(); shellyDevices.set('dddddddddddd', { gen: 'G1', online: true, nombre: '' }); shellyDevices.get('bbbbbbbbbbbb').sinSettings = true;
+  const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true }); assert.equal(r.status, 200);
+  const por = Object.fromEntries(r.body.cuenta.map(c => [c.id6, c]));
+  assert.equal(por['dddddd'].nombre, null); assert.equal(por['bbbbbb'].nombre, null); assert.equal(r.body.disponibles[0].nombre, null);
+  assert.ok(JSON.stringify(r.body.formaV2).includes('AUSENTE'), 'el diagnóstico indica que no llegaron settings');
+});
+await t('GENERACIÓN: la v2 dice "G2" para el S3SW pero se muestra Gen3 (prefijo); SH… = Gen1; S4… = Gen4 (opera como Gen3)', async () => {
+  cuentaReal(); shellyDevices.set('dddddddddddd', { gen: 'G2', online: true, modelo: 'S4SW-001X16EU', nombre: 'FUTURO' });
+  const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
+  const por = Object.fromEntries(r.body.cuenta.map(c => [c.id6, c]));
+  assert.deepEqual([por['bbbbbb'].genEtiqueta, por['bbbbbb'].gen], [3, 3]); assert.deepEqual([por['aaaaaa'].genEtiqueta, por['aaaaaa'].gen], [1, 1]);
+  assert.deepEqual([por['dddddd'].genEtiqueta, por['dddddd'].gen, por['dddddd'].criterioGen], [4, 3, 'code']);
+  assert.equal(r.body.disponibles[0].genEtiqueta, 4);
+});
+await t('EN LÍNEA de respaldo: si la v2 falla, _dev_info.online de all_status (autoritativo) basta y no gasta consultas de confirmación', async () => {
+  shellyForma = 'dev_info'; shellyV2 = 'falla';
+  shellyDevices.set('dddddddddddd', { gen: 'G1', online: true, nombre: 'R' });
+  const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
+  assert.ok(r.body.errorV2); assert.deepEqual(r.body.disponibles.map(d => d.id), ['dddddddddddd', 'eeeeeeeeeeee', '112233445566'].filter(id => r.body.disponibles.some(d => d.id === id)));
+  assert.ok(r.body.cuenta.every(c => c.criterioOnline === '_dev_info.online')); assert.equal(shellyCalls.filter(c => c.tipo === 'status').length, 0);
+});
+await t('el diagnóstico v2 muestra la forma por generación (campos del item y 3 niveles de settings, solo nombres)', async () => {
+  cuentaReal(); const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
+  const f = r.body.formaV2; assert.ok(f._item.gen1 && f._item.gen3 && 'settings' in f._item.gen1);
+  assert.ok(!/VISITAS|RESIDENTES|PEATONAL|aaaaaaaaaaaa|bbbbbbbbbbbb|LLAVE_TEST/.test(JSON.stringify(f)), 'sin nombres, ids ni llaves');
 });
 
 console.log(`\n${pass} pruebas OK`);

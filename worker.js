@@ -2367,12 +2367,12 @@ async function disponiblesDispositivos(req, env) {
     if (c.existe) { x.online = c.online; x.criterioOnline = 'v1.status'; if (!x.gen && c.gen) { x.gen = c.gen; x.criterioGen = 'v1.status'; } }
     else { x.online = false; x.criterioOnline = 'sin-confirmar:' + (c.error || '?'); }
   }
-  const disponibles = libres.filter(x => x.online).map(x => ({ id: x.id, nombre: x.nombre, gen: x.gen, modelo: x.modelo }));
+  const disponibles = libres.filter(x => x.online).map(x => ({ id: x.id, nombre: x.nombre, gen: x.gen, genEtiqueta: x.genEtiqueta || x.gen, modelo: x.modelo }));
   const extra = diagnostico !== true ? {} : {
     forma: q.forma, formaV2: q.formaV2, errorV2: q.errorV2,
     // TODA la cuenta (solo últimos 6 del ID): a qué puerta está asignado cada uno y con qué criterio se decidió generación y línea
-    cuenta: q.dispositivos.map(x => ({ id6: x.id.slice(-6), nombre: x.nombre, gen: x.gen, modelo: x.modelo, online: x.online,
-      criterioGen: x.criterioGen, criterioOnline: x.criterioOnline,
+    cuenta: q.dispositivos.map(x => ({ id6: x.id.slice(-6), nombre: x.nombre, gen: x.gen, genEtiqueta: x.genEtiqueta || x.gen, modelo: x.modelo, online: x.online,
+      criterioGen: x.criterioGen, criterioOnline: x.criterioOnline, criterioNombre: x.criterioNombre || null,
       asignadoA: PUERTAS_DISP.find(p => (dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, p)?.id || '').toLowerCase() === x.id.toLowerCase()) || null })),
   };
   return json({ ok: true, disponibles, fueraDeLinea: libres.length - disponibles.length, totalCuenta: q.dispositivos.length, ...extra });

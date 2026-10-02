@@ -77,6 +77,7 @@ export function genDesdeInfo(info) {
   if (g === 1 || g === '1' || g === 'G1') return 1;
   if (g === 2 || g === '2' || g === 'G2') return 2;
   if (g === 3 || g === '3' || g === 'G3') return 3;
+  if (g === 4 || g === '4' || g === 'G4') return 4;
   return null;
 }
 
@@ -133,6 +134,27 @@ export function genPorForma(st, modelo) {
   return null;
 }
 
+/* Generación por MODELO (campo "code"). La API v2 reporta "G2" también para los Gen3 (comparten API), así que para MOSTRAR manda
+   el prefijo: SH… = Gen1, SN… = Gen2, S3… = Gen3, S4… = Gen4. La OPERACIÓN no cambia: Gen2+ se opera igual (API v2 de la nube),
+   por eso lo guardado/operativo se limita a 1|2|3 (genOperativa) y la etiqueta (genEtiqueta) es solo para mostrar. */
+export function genPorModelo(code) {
+  const c = String(code || '');
+  if (/^SH/i.test(c)) return 1;
+  if (/^SN/i.test(c)) return 2;
+  const m = /^S(\d)/i.exec(c);
+  return m ? +m[1] : null;
+}
+export const genOperativa = g => (g >= 3 ? 3 : g);
+
+/* Nombre que el usuario le puso en la app de Shelly, desde el objeto settings de la API v2. Gen2+/Gen3: settings.sys.device.name;
+   Gen1: settings.name (o settings.device.name). Devuelve { nombre, ruta } o null. NUNCA el nombre de un canal/relé. */
+export function nombreDeSettings(settings) {
+  const s = objOrNull(settings); if (!s) return null;
+  const cand = [['settings.sys.device.name', s.sys && s.sys.device && s.sys.device.name], ['settings.name', s.name], ['settings.device.name', s.device && s.device.name]];
+  for (const [ruta, v] of cand) if (typeof v === 'string' && v.trim()) return { nombre: v.trim(), ruta };
+  return null;
+}
+
 /* ¿En línea?, con el criterio usado (para el diagnóstico). Prioridad:
    1) online de la API v2 (0|1) — autoritativo; 2) _dev_info.online / online — autoritativos;
    3) PISTAS cloud.connected (Gen1/Gen2) y ws.connected (Gen2+/Gen3): NO autoritativas (la nube devuelve el último estado
@@ -167,10 +189,11 @@ export function parsearListaShelly(j) {
     const di = objOrNull(st._dev_info) || objOrNull(inf._dev_info) || {};
     const modelo = [di.code, inf.code, inf.type, st.code].find(v => typeof v === 'string' && v) || null;
     const nombre = [inf.name, inf.device_name, di.name, st.name].find(v => typeof v === 'string' && v.trim()) || null;
-    let gen = genDesdeInfo(di) ?? genDesdeInfo(inf), criterioGen = gen ? 'campo-gen' : null;
-    if (!gen) { gen = genPorForma(st, modelo); criterioGen = gen ? 'forma' : null; }
+    let genE = genPorModelo(modelo), criterioGen = genE ? 'code' : null;
+    if (!genE) { genE = genDesdeInfo(di) ?? genDesdeInfo(inf); criterioGen = genE ? 'campo-gen' : null; }
+    if (!genE) { genE = genPorForma(st, modelo); criterioGen = genE ? 'forma' : null; }
     const l = enLinea(st, inf, null);
-    out.push({ id: String(di.id || inf.id || id), nombre, gen, modelo, online: l.online, criterioOnline: l.criterio, criterioGen });
+    out.push({ id: String(di.id || inf.id || id), nombre, gen: genE ? genOperativa(genE) : null, genEtiqueta: genE, modelo, online: l.online, criterioOnline: l.criterio, criterioGen, criterioNombre: nombre ? 'all_status' : null });
   }
   return out;
 }
@@ -210,15 +233,18 @@ export async function consultarV2(env, ids, { timeoutMs = 8000 } = {}) {
   for (let i = 0; i < ids.length; i += 10) {
     const r = await peticionShelly(env, `/v2/devices/api/get?auth_key=${encodeURIComponent(env.SHELLY_AUTH_KEY)}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ids: ids.slice(i, i + 10), select: ['settings'], pick: { settings: ['name'] } }),
+      body: JSON.stringify({ ids: ids.slice(i, i + 10), select: ['settings'] }),   // SIN pick: "pick" solo acepta propiedades de primer nivel y el nombre cuelga de sys.device (Gen2+) o name (Gen1)
     }, timeoutMs);
     if (r.error || r.limitado || !r.j) { error = r.error || (r.limitado ? 'limite' : 'respuesta'); continue; }
-    forma = forma || formaDe(r.j);
     const lista = Array.isArray(r.j) ? r.j : (Array.isArray(r.j.data) ? r.j.data : []);
     for (const it of lista) {
       if (!it || typeof it.id !== 'string') continue;
-      const nombre = it.settings && typeof it.settings.name === 'string' && it.settings.name.trim() ? it.settings.name.trim() : null;
-      mapa.set(it.id.toLowerCase(), { nombre, gen: genDesdeInfo(it), online: it.online, modelo: typeof it.code === 'string' ? it.code : null });
+      const nom = nombreDeSettings(it.settings);
+      mapa.set(it.id.toLowerCase(), { nombre: nom ? nom.nombre : null, rutaNombre: nom ? nom.ruta : null, gen: genDesdeInfo(it), online: it.online, modelo: typeof it.code === 'string' ? it.code : null });
+      // Para el diagnóstico: forma de UN dispositivo de cada generación (3 niveles de settings, solo nombres de campos)
+      forma = forma || { _array: lista.length, _item: {} };
+      const g = genPorModelo(it.code) ?? genDesdeInfo(it) ?? 0, clave = 'gen' + g;
+      if (!(clave in forma._item)) forma._item[clave] = { ...Object.fromEntries(Object.keys(it).filter(k => k !== 'settings').map(k => [k, typeof it[k]])), settings: it.settings === undefined ? 'AUSENTE' : formaDe(it.settings, 3) };
     }
   }
   return { mapa, forma, error };
@@ -245,9 +271,11 @@ export async function listarDispositivosCuenta(env, { timeoutMs = 8000 } = {}) {
     formaV2 = v2.forma; errorV2 = v2.error;
     for (const d of dispositivos) {
       const x = v2.mapa.get(d.id.toLowerCase()); if (!x) continue;
-      if (x.nombre) d.nombre = x.nombre;
-      if (x.gen) { d.gen = x.gen; d.criterioGen = 'v2.gen'; }
+      if (x.nombre) { d.nombre = x.nombre; d.criterioNombre = x.rutaNombre; }
       if (x.modelo && !d.modelo) d.modelo = x.modelo;
+      const gm = genPorModelo(d.modelo);
+      if (gm) { d.genEtiqueta = gm; d.gen = genOperativa(gm); d.criterioGen = 'code'; }
+      else if (x.gen && !d.genEtiqueta) { d.genEtiqueta = x.gen; d.gen = genOperativa(x.gen); d.criterioGen = 'v2.gen'; }
       const l = enLinea(objOrNull(estados[d.id]) || {}, null, x);
       if (l.criterio === 'v2.online') { d.online = l.online; d.criterioOnline = 'v2.online'; }
     }

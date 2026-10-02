@@ -1334,7 +1334,7 @@ $('#dispDiagBtn')?.addEventListener('click', async () => {
   b.disabled = true; b.innerHTML = '<span class="spinner"></span>'; out.classList.remove('hidden'); out.textContent = 'Consultando Shelly Cloud…';
   try {
     const r = await authedFetch('/dispositivos/disponibles', { diagnostico: true });
-    const etiqueta = c => `  • ${c.nombre || '(sin nombre)'} · ${c.gen ? 'Gen' + c.gen : 'gen ?'} · ${c.modelo || ''} · …${c.id6} · ${c.online ? 'EN LÍNEA' : 'fuera de línea'} · asignado a: ${c.asignadoA ? (DISP_NOMBRE[c.asignadoA] || c.asignadoA) : 'nadie (repuesto)'}\n      criterios → gen: ${c.criterioGen || '?'} · línea: ${c.criterioOnline || '?'}`;
+    const etiqueta = c => `  • ${c.nombre || '(sin nombre en la app de Shelly)'} · ${c.genEtiqueta || c.gen ? 'Gen' + (c.genEtiqueta || c.gen) : 'gen ?'} · ${c.modelo || ''} · …${c.id6} · ${c.online ? 'EN LÍNEA' : 'fuera de línea'} · asignado a: ${c.asignadoA ? (DISP_NOMBRE[c.asignadoA] || c.asignadoA) : 'nadie (repuesto)'}\n      criterios → gen: ${c.criterioGen || '?'} · línea: ${c.criterioOnline || '?'} · nombre: ${c.criterioNombre || 'no viene'}`;
     out.textContent = `Consulta correcta.\nDispositivos en la cuenta: ${r.totalCuenta}\n` + (r.cuenta || []).map(etiqueta).join('\n')
       + `\n\nRepuestos EN LÍNEA y sin asignar: ${r.disponibles.length}\nSin asignar y fuera de línea: ${r.fueraDeLinea}`
       + (r.errorV2 ? `\n(Aviso: la consulta de nombres (v2) falló: ${r.errorV2})` : '')
@@ -1378,7 +1378,7 @@ async function buscarRepuestos(){
     } else {
       msg.textContent = 'Toca el repuesto que vas a instalar:';
       dispRepuestos = r.disponibles;
-      lista.innerHTML = r.disponibles.map((d, i) => `<div class="row" data-rep="${i}" style="cursor:pointer"><div class="ri">⚡</div><div class="rt"><div class="a">${esc(d.nombre || 'Sin nombre en la app de Shelly')}</div><div class="b">${d.gen ? 'Gen' + d.gen : 'Generación sin informar'} · ${esc(d.modelo || '')} · ID …${esc(d.id.slice(-6))}</div></div><div class="tags"><span class="tag in">En línea</span></div></div>`).join('');
+      lista.innerHTML = r.disponibles.map((d, i) => `<div class="row" data-rep="${i}" style="cursor:pointer"><div class="ri">⚡</div><div class="rt"><div class="a">${esc(d.nombre || '(sin nombre en la app de Shelly)')}</div><div class="b">${(d.genEtiqueta || d.gen) ? 'Gen' + (d.genEtiqueta || d.gen) : 'Generación sin informar'} · ${esc(d.modelo || '')} · ID …${esc(d.id.slice(-6))}</div></div><div class="tags"><span class="tag in">En línea</span></div></div>`).join('');
     }
   } catch(e){ msg.textContent = e.message || 'No se pudo consultar Shelly Cloud'; }
   finally { b.disabled = false; }
@@ -1389,7 +1389,7 @@ $('#dispLista')?.addEventListener('click', e => {
   const d = dispRepuestos[+row.dataset.rep]; if (!d) return;
   $('#dispId').value = d.id; dispValidado = d.id; dispGenSel = d.gen;
   $$('#dispLista .row').forEach(x => x.style.outline = ''); row.style.outline = '2px solid var(--gold)';
-  $('#dispSel').textContent = `Seleccionado: ${d.nombre || 'sin nombre'} · ${d.gen ? 'Gen' + d.gen : 'elige la generación abajo'} · …${d.id.slice(-6)}`;
+  $('#dispSel').textContent = `Seleccionado: ${d.nombre || '(sin nombre en la app de Shelly)'} · ${(d.genEtiqueta || d.gen) ? 'Gen' + (d.genEtiqueta || d.gen) : 'elige la generación abajo'} · …${d.id.slice(-6)}`;
   $('#dispGenField').classList.toggle('hidden', !!d.gen);
 });
 $('#dispBuscarBtn')?.addEventListener('click', () => buscarRepuestos());
@@ -3458,7 +3458,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v18';
+const APP_VERSION = 'v19';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
