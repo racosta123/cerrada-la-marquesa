@@ -26,6 +26,8 @@
 
 // Lógica de Shelly Cloud (selector Gen1/Gen2+, llamada, triggerShelly) en módulo aparte.
 import { triggerShelly, callShellyOnce, shellyCfg, shellySleep } from './shelly-core.js';
+// Módulo "Dispositivos" (cambiar un Shelly desde la app): lógica pura aparte, igual que shelly-core.
+import { PUERTAS_DISP, idShellyValido, parsearDispositivos, mapaParaTrigger, dispositivoEfectivo, consultarShelly, listarDispositivosCuenta, HISTORIAL_MAX } from './dispositivos-core.js';
 
 // Nombres de puerta válidos. Los IDs reales de cada Shelly YA NO viven en el código (repo
 // público): se leen en tiempo de petición del secret SHELLY_DEVICES vía resolveShellyDevice()
@@ -119,6 +121,13 @@ export default {
         case '/personas/alta-cancelar':  out = await cancelarAlta(req, env); break;
         case '/personas/duplicado-revisar': out = await revisarDuplicadoPersona(req, env); break;
         case '/personas/baja':           out = await darDeBajaPersona(req, env); break;
+        case '/dispositivos/listar':     out = await listarDispositivos(req, env); break;
+        case '/dispositivos/estado':     out = await estadoDispositivo(req, env); break;
+        case '/dispositivos/verificar':  out = await verificarDispositivo(req, env); break;
+        case '/dispositivos/disponibles': out = await disponiblesDispositivos(req, env); break;
+        case '/dispositivos/cambiar':    out = await cambiarDispositivo(req, env); break;
+        case '/dispositivos/revertir':   out = await revertirDispositivo(req, env); break;
+        case '/dispositivos/probar':     out = await probarDispositivo(req, env); break;
         case '/invitaciones/familiar': out = await crearInvitacionFamiliar(req, env); break;
         case '/invitaciones/familiar-reenviar': out = await reenviarInvitacionFamiliar(req, env); break;
         case '/votaciones/crear':         out = await crearVotacion(req, env); break;
@@ -161,7 +170,7 @@ async function abrir(req, env) {
     if (padre && padre.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw httpErr(403, 'Residente del hogar suspendido por mora');
   }
   // master, admin, residente y esclavo pueden abrir las 4 puertas.
-  await triggerShelly(env, puerta);
+  await triggerShelly(env, puerta, await mapaDispositivos(env));
 
   const hogar = perfil.rol === 'residente' ? user.uid : (perfil.residenteUid || user.uid);
   if (perfil.rol === 'residente' && perfil.jefeId && perfil.personaId) {
@@ -294,7 +303,7 @@ async function consumirInvitacion(env, inv, readerId, metodo) {
   // se deshace para ESTA petición, así un acceso fallido nunca quema un uso ni deja una
   // entrada/salida fantasma. El error original se relanza intacto (mismo contrato).
   try {
-    await triggerShelly(env, reader.puerta);
+    await triggerShelly(env, reader.puerta, await mapaDispositivos(env));
   } catch (e) {
     await devolverReservaInvitacion(env, inv, reader.direccion === 'entrada' && inv.usosRestantes !== null);
     throw e;
@@ -2217,6 +2226,236 @@ async function darDeBajaPersona(req, env) {
   const fam = objetivos.length - 1;
   await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Master'} dio de baja a ${p.nombre}${domicilioDe(p, Object.fromEntries(all.map(x => [x.id, x]))) ? ' (' + domicilioDe(p, Object.fromEntries(all.map(x => [x.id, x]))) + ')' : ''}${fam ? ' y a ' + fam + ' familiar(es)' : ''}: ${mot}`.slice(0, 500) });
   return json({ ok:true, id, bajas: objetivos.map(t => t.id) });
+}
+
+/* ===========================================================
+   DISPOSITIVOS — cambiar/revertir el Shelly de una puerta desde la app (SOLO master).
+   config/dispositivos (Firestore; las reglas niegan TODO acceso al cliente, solo este Worker lo lee/escribe)
+   manda sobre el secret SHELLY_DEVICES, que SIGUE siendo el respaldo: si el documento no existe, falla,
+   tarda o viene corrupto, /abrir usa el secret como siempre. SHELLY_HOST y SHELLY_AUTH_KEY no se mueven.
+   =========================================================== */
+const DISP_TTL_MS = 30000;        // un cambio guardado se ve en TODAS las instancias en <= 30 s (en la que lo guarda, al instante)
+const DISP_FALLO_TTL_MS = 15000;  // si la lectura falla, no se reintenta en cada apertura: se usa el secret 15 s
+const DISP_LECTURA_MAX_MS = 1500; // tope DURO que una apertura espera al documento antes de caer al secret
+let DISP_CACHE = { mapa: null, exp: 0 };
+let DISP_VUELO = null;
+function invalidarCacheDispositivos() { DISP_CACHE = { mapa: null, exp: 0 }; DISP_VUELO = null; }
+
+/* Mapa JSON (formato SHELLY_DEVICES) del documento, o null (=> el secret). NUNCA lanza ni demora más de
+   DISP_LECTURA_MAX_MS: la puerta jamás espera ni falla por este módulo. Con caché vigente no hace ninguna lectura. */
+async function mapaDispositivos(env) {
+  const ahora = Date.now();
+  if (ahora < DISP_CACHE.exp) return DISP_CACHE.mapa;
+  try {
+    if (!DISP_VUELO) {
+      DISP_VUELO = (async () => {
+        const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+        const doc = await getDoc(env, at, 'config/dispositivos');
+        return doc ? mapaParaTrigger(parsearDispositivos(readDoc(doc.fields))) : null;
+      })();
+      DISP_VUELO.catch(() => {});
+    }
+    const vuelo = DISP_VUELO;
+    const mapa = await Promise.race([vuelo, new Promise((_, rej) => setTimeout(() => rej(new Error('tope')), DISP_LECTURA_MAX_MS))]);
+    if (DISP_VUELO === vuelo) { DISP_CACHE = { mapa, exp: Date.now() + DISP_TTL_MS }; DISP_VUELO = null; }
+    return mapa;
+  } catch (e) {
+    DISP_VUELO = null;
+    DISP_CACHE = { mapa: null, exp: Date.now() + DISP_FALLO_TTL_MS };
+    return null;
+  }
+}
+
+async function soloMaster(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master administra los dispositivos');
+  return { user, perfil };
+}
+/* Contraseña de nuevo: el cliente reautentica con Firebase y manda un token fresco; aquí se exige que el
+   inicio de sesión (auth_time) sea de hace <= 5 min. Se lee del token YA verificado por requireAuth. */
+function reautenticacionFresca(req) {
+  try {
+    const t = (req.headers.get('Authorization') || '').slice(7);
+    const at = JSON.parse(b64urlToStr(t.split('.')[1])).auth_time;
+    const ahora = Date.now() / 1000;
+    return typeof at === 'number' && ahora - at <= 300 && at <= ahora + 60;
+  } catch (e) { return false; }
+}
+const pideContrasena = () => json({ error: 'Confirma tu contraseña para continuar', requiereContrasena: true }, 403);
+
+async function leerDocDispositivos(env, at) {
+  const doc = await getDoc(env, at, 'config/dispositivos');
+  if (!doc) return { existe: false, updateTime: null, campos: {}, parsed: parsearDispositivos(null) };
+  const campos = readDoc(doc.fields) || {};
+  return { existe: true, updateTime: doc.updateTime, campos, parsed: parsearDispositivos(campos) };
+}
+async function guardarDispositivos(env, at, previo, fields) {
+  const mask = Object.keys(fields).map(f => 'updateMask.fieldPaths=' + encodeURIComponent(f)).join('&');
+  const pre = previo.existe ? 'currentDocument.updateTime=' + encodeURIComponent(previo.updateTime) : 'currentDocument.exists=false';
+  const r = await fetch(`${fsBase(env)}/config/dispositivos?${mask}&${pre}`, {
+    method: 'PATCH', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' }, body: JSON.stringify({ fields }),
+  });
+  if (r.status === 409 || r.status === 412) throw httpErr(409, 'Otro cambio se guardó al mismo tiempo: vuelve a intentar');
+  if (!r.ok) throw httpErr(500, 'No se pudo guardar el cambio');
+  invalidarCacheDispositivos();
+}
+const ult6 = id => '…' + String(id || '').slice(-6);
+const idUsadoPorOtra = (parsed, secret, puerta, id) => PUERTAS_DISP.some(p => p !== puerta && (dispositivoEfectivo(parsed, secret, p)?.id || '').toLowerCase() === id.toLowerCase());
+function errorShelly(q) {
+  if (q.error === 'no-existe') return httpErr(404, 'Ese Shelly no existe en tu cuenta de Shelly Cloud');
+  if (q.error === 'formato') return httpErr(400, 'ID inválido: son de 6 a 16 caracteres hexadecimales (0-9, a-f)');
+  if (q.error) return httpErr(503, 'No se pudo consultar Shelly Cloud, intenta en un minuto');
+  return null;
+}
+
+/* /dispositivos/listar — SOLO master. Sin llamar a Shelly (no gasta el límite de la cuenta). */
+async function listarDispositivos(req, env) {
+  await soloMaster(req, env);
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  const puertas = PUERTAS_DISP.map(p => {
+    const e = dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, p);
+    const hist = d.parsed.historial.filter(h => h.puerta === p);
+    const ult = hist[hist.length - 1];
+    return { puerta: p, id: e?.id || null, gen: e?.gen || null, origen: e ? e.origen : 'sin-asignar',
+      cambios: hist.length, ultimoCambio: ult ? { en: ult.en, nombre: ult.nombre, tipo: ult.tipo } : null, puedeRegresar: hist.length > 0 };
+  });
+  return json({ puertas });
+}
+
+/* /dispositivos/estado — SOLO master. UNA puerta por llamada, a petición (cada consulta gasta del límite de Shelly Cloud). */
+const DISP_ESTADO_CACHE = new Map();
+async function estadoDispositivo(req, env) {
+  await soloMaster(req, env);
+  const { puerta } = await req.json();
+  if (!PUERTAS_DISP.includes(puerta)) throw httpErr(400, 'Puerta no válida');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const e = dispositivoEfectivo((await leerDocDispositivos(env, at)).parsed, env.SHELLY_DEVICES, puerta);
+  if (!e) return json({ ok: true, puerta, asignado: false });
+  const previo = DISP_ESTADO_CACHE.get(puerta);
+  if (previo && Date.now() - previo.at < 10000 && previo.id === e.id) return json({ ...previo.r, cache: true });
+  const q = await consultarShelly(env, e.id);
+  const r = { ok: true, puerta, asignado: true, existe: q.existe, online: q.online, gen: q.gen || e.gen, error: q.error };
+  DISP_ESTADO_CACHE.set(puerta, { at: Date.now(), id: e.id, r });
+  return json(r);
+}
+
+/* /dispositivos/disponibles — SOLO master. MANUAL (una consulta por toque, máx. 1 cada 8 s: gasta del límite de 1 req/s de la
+   cuenta de Shelly). Pide a Shelly Cloud la lista de dispositivos de la cuenta y devuelve SOLO los EN LÍNEA que NO están
+   asignados a ninguna puerta (nombre puesto en la app de Shelly, generación e ID). El frontend nunca recibe la llave de Shelly.
+   diagnostico:true añade la FORMA de la respuesta (campos y tipos, sin valores) para validar el parser contra la nube real. */
+let ULTIMA_LISTA = 0;
+async function disponiblesDispositivos(req, env) {
+  await soloMaster(req, env);
+  const { diagnostico } = await req.json().catch(() => ({}));
+  if (Date.now() - ULTIMA_LISTA < 8000) throw httpErr(429, 'Espera unos segundos antes de buscar de nuevo');
+  ULTIMA_LISTA = Date.now();
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  const asignados = new Set(PUERTAS_DISP.map(p => (dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, p)?.id || '').toLowerCase()).filter(Boolean));
+  const q = await listarDispositivosCuenta(env);
+  if (!q.ok) {
+    const msg = q.error === 'limite' ? 'Shelly Cloud pide esperar un momento (límite de consultas). Intenta en un minuto.' : 'No se pudo consultar Shelly Cloud, intenta en un minuto.';
+    return json({ error: msg, codigo: q.error, ...(diagnostico === true && q.forma ? { forma: q.forma } : {}) }, 503);
+  }
+  const libres = q.dispositivos.filter(x => idShellyValido(x.id) && !asignados.has(x.id.toLowerCase()));
+  const disponibles = libres.filter(x => x.online).map(x => ({ id: x.id, nombre: x.nombre, gen: x.gen, modelo: x.modelo }));
+  return json({ ok: true, disponibles, fueraDeLinea: libres.length - disponibles.length, totalCuenta: q.dispositivos.length, ...(diagnostico === true ? { forma: q.forma } : {}) });
+}
+
+/* /dispositivos/verificar — SOLO master. Valida un ID candidato SIN guardar: formato, existencia, línea y generación. */
+async function verificarDispositivo(req, env) {
+  await soloMaster(req, env);
+  const { id, puerta } = await req.json();
+  const nuevo = String(id || '').trim();
+  if (!idShellyValido(nuevo)) throw httpErr(400, 'ID inválido: son de 6 a 16 caracteres hexadecimales (0-9, a-f)');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  if (PUERTAS_DISP.includes(puerta) && idUsadoPorOtra(d.parsed, env.SHELLY_DEVICES, puerta, nuevo)) throw httpErr(409, 'Ese Shelly ya está asignado a otra puerta');
+  const q = await consultarShelly(env, nuevo);
+  const err = errorShelly(q); if (err) throw err;
+  return json({ ok: true, existe: true, online: q.online, gen: q.gen, generacionDetectada: q.gen !== null });
+}
+
+/* Cambia/regresa una puerta: arma el registro, guarda con precondición (updateTime) y deja bitácora. */
+async function aplicarCambioDispositivo(env, at, { user, perfil, d, puerta, nuevoId, nuevoGen, tipo }) {
+  const actual = dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, puerta);
+  const secreto = (() => { try { const e = JSON.parse(env.SHELLY_DEVICES || 'null')?.[puerta]; return typeof e === 'string' ? e : e?.id || null; } catch (x) { return null; } })();
+  const ahora = new Date().toISOString();
+  const hist = d.parsed.historial.concat([{ puerta, idAnterior: actual?.id || null, genAnterior: actual?.gen || null, idNuevo: nuevoId, genNuevo: nuevoGen, en: ahora, por: user.uid, nombre: perfil.nombre || '', tipo }]).slice(-HISTORIAL_MAX);
+  const vuelveAlSecreto = !!secreto && secreto.toLowerCase() === nuevoId.toLowerCase();
+  const fields = {
+    [`${puerta}_id`]: vuelveAlSecreto ? { nullValue: null } : { stringValue: nuevoId },
+    [`${puerta}_gen`]: vuelveAlSecreto ? { nullValue: null } : { integerValue: String(nuevoGen) },
+    [`${puerta}_offSec`]: { nullValue: null },
+    historial: { stringValue: JSON.stringify(hist) },
+    version: { integerValue: String((d.parsed.version || 0) + 1) },
+    actualizadoEn: { timestampValue: ahora },
+    actualizadoPor: { stringValue: user.uid },
+  };
+  await guardarDispositivos(env, at, d, fields);
+  await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Master'} ${tipo === 'regreso' ? 'regresó' : 'cambió'} el Shelly de ${puerta}: ${actual ? ult6(actual.id) + ' (Gen' + actual.gen + ')' : 'sin asignar'} → ${ult6(nuevoId)} (Gen${nuevoGen})` });
+}
+
+/* /dispositivos/cambiar — SOLO master + contraseña reciente. El Shelly nuevo debe existir y estar EN LÍNEA antes de guardar. */
+async function cambiarDispositivo(req, env) {
+  const { user, perfil } = await soloMaster(req, env);
+  if (!reautenticacionFresca(req)) return pideContrasena();
+  const { puerta, id, genManual } = await req.json();
+  if (!PUERTAS_DISP.includes(puerta)) throw httpErr(400, 'Puerta no válida');
+  const nuevo = String(id || '').trim();
+  if (!idShellyValido(nuevo)) throw httpErr(400, 'ID inválido: son de 6 a 16 caracteres hexadecimales (0-9, a-f)');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  const actual = dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, puerta);
+  if (actual && actual.id.toLowerCase() === nuevo.toLowerCase()) throw httpErr(409, 'Ese ya es el Shelly de esta puerta');
+  if (idUsadoPorOtra(d.parsed, env.SHELLY_DEVICES, puerta, nuevo)) throw httpErr(409, 'Ese Shelly ya está asignado a otra puerta');
+  const q = await consultarShelly(env, nuevo);
+  const err = errorShelly(q); if (err) throw err;
+  if (!q.online) throw httpErr(409, 'El Shelly existe pero está fuera de línea: enciéndelo y conéctalo antes de asignarlo');
+  const gen = q.gen ?? ([1, 2, 3].includes(genManual) ? genManual : null);
+  if (!gen) throw httpErr(409, 'No se pudo detectar la generación: indícala manualmente (Gen1, Gen2 o Gen3)');
+  await aplicarCambioDispositivo(env, at, { user, perfil, d, puerta, nuevoId: nuevo, nuevoGen: gen, tipo: 'cambio' });
+  return json({ ok: true, puerta, gen });
+}
+
+/* /dispositivos/revertir — SOLO master + contraseña reciente. Un toque: vuelve al Shelly anterior de esa puerta
+   (si el anterior era el del secret, la puerta regresa al secret). Exige que el anterior esté en línea, salvo forzar:true. */
+async function revertirDispositivo(req, env) {
+  const { user, perfil } = await soloMaster(req, env);
+  if (!reautenticacionFresca(req)) return pideContrasena();
+  const { puerta, forzar } = await req.json();
+  if (!PUERTAS_DISP.includes(puerta)) throw httpErr(400, 'Puerta no válida');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const d = await leerDocDispositivos(env, at);
+  const ult = d.parsed.historial.filter(h => h.puerta === puerta).pop();
+  if (!ult || !ult.idAnterior || !idShellyValido(ult.idAnterior)) throw httpErr(409, 'No hay un Shelly anterior para esta puerta');
+  const objetivoGen = [1, 2, 3].includes(ult.genAnterior) ? ult.genAnterior : 1;
+  if (forzar !== true) {
+    const q = await consultarShelly(env, ult.idAnterior);
+    const err = errorShelly(q); if (err) throw err;
+    if (!q.online) return json({ error: 'El Shelly anterior está fuera de línea. Si aun así quieres regresar, confirma.', anteriorFueraDeLinea: true }, 409);
+  }
+  await aplicarCambioDispositivo(env, at, { user, perfil, d, puerta, nuevoId: ult.idAnterior, nuevoGen: objetivoGen, tipo: 'regreso' });
+  return json({ ok: true, puerta });
+}
+
+/* /dispositivos/probar — SOLO master + contraseña reciente + confirmar:true. ABRE LA PUERTA FÍSICA por la ruta normal
+   (portero y todo), para comprobar el Shelly recién asignado. Máximo una prueba cada 10 s. */
+let ULTIMA_PRUEBA = 0;
+async function probarDispositivo(req, env) {
+  const { user, perfil } = await soloMaster(req, env);
+  if (!reautenticacionFresca(req)) return pideContrasena();
+  const { puerta, confirmar } = await req.json();
+  if (!PUERTAS_DISP.includes(puerta)) throw httpErr(400, 'Puerta no válida');
+  if (confirmar !== true) throw httpErr(400, 'Falta la confirmación explícita: el pulso ABRE la puerta');
+  if (Date.now() - ULTIMA_PRUEBA < 10000) throw httpErr(429, 'Espera unos segundos entre pulsos de prueba');
+  ULTIMA_PRUEBA = Date.now();
+  await triggerShelly(env, puerta, await mapaDispositivos(env));
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Master'} hizo un pulso de prueba en ${puerta}` });
+  return json({ ok: true, puerta });
 }
 
 /* /personas/mis-familiares — el JEFE lista SOLO a su propia familia (self-service:

@@ -43,11 +43,13 @@ export function resolveShellyDevice(env, puerta) {
   return null;
 }
 
-export async function triggerShelly(env, puerta) {
+export async function triggerShelly(env, puerta, mapaVigente) {
   // Resuelto y validado ANTES de tocar el portero de fila: una puerta sin Shelly asignado (o un
   // secret SHELLY_DEVICES roto) falla YA, rápido y con mensaje genérico — nunca entra a la cola
   // del Durable Object ni intenta una llamada real a Shelly, en ningún modo.
-  const device = resolveShellyDevice(env, puerta);
+  // mapaVigente (opcional, JSON como SHELLY_DEVICES) viene de config/dispositivos (módulo Dispositivos). Si falta, no
+  // trae esta puerta o no sirve, se usa EXACTAMENTE el secret de siempre: el respaldo nunca deja de funcionar.
+  const device = (mapaVigente && resolveShellyDevice({ SHELLY_DEVICES: mapaVigente }, puerta)) || resolveShellyDevice(env, puerta);
   if (!device) throw httpErr(503, 'Puerta sin dispositivo configurado');
 
   // "0" exacto = modo directo (bypass del portero, solo para el A/B de tiempos). Cualquier otro

@@ -116,7 +116,8 @@ service cloud.firestore {
     match /config/{id} {
       // Solo staff necesita leer la config directo; residentes la reciben ya
       // incorporada en el agregado de /finanzas/resumen.
-      allow read: if signedIn() && staff();
+      // config/dispositivos (IDs de los Shelly) NO se lee desde el cliente: solo el Worker (Admin SDK).
+      allow read: if signedIn() && staff() && id != 'dispositivos';
       // SOLO el Worker escribe (tras verificar rol master/admin)
       allow write: if false;
     }
