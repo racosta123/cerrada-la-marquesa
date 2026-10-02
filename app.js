@@ -729,7 +729,8 @@ function watchInvites(){
    jefeId (hereda el domicilio del jefe). Admin/master = sin domicilio. usuarios/{uid} es solo
    un índice que sincroniza el Worker; aquí NO se lee/escribe esa colección directo. */
 const normDom = s => String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
-function esJefeP(p){ return p.rol === 'residente' && !p.jefeId; }
+const esBajaP = p => p.estado === 'baja';
+function esJefeP(p){ return p.rol === 'residente' && !p.jefeId && !esBajaP(p); }
 /* jefes() = TODAS las casas (activas y suspendidas) — también el dropdown de registro de
    ingreso: se puede cobrar a una casa suspendida. El termómetro y las listas de cobranza
    usan el conteo del Worker (todas las casas). */
@@ -954,11 +955,11 @@ function renderPersonas(){
   const match = p => !q || normDom(p.nombre).includes(q)
     || (p.domicilioNorm||'').includes(q) || (p.telefono||'').includes(raw);
 
-  const familiaresDe = id => personasCache.filter(p => p.jefeId === id)
+  const familiaresDe = id => personasCache.filter(p => p.jefeId === id && !esBajaP(p))
     .sort((a,b)=>normDom(a.nombre).localeCompare(normDom(b.nombre),'es'));
 
   const casas = jefes().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
-  const admins = personasCache.filter(p => p.rol==='admin' || p.rol==='master')
+  const admins = personasCache.filter(p => (p.rol==='admin' || p.rol==='master') && !esBajaP(p))
     .sort((a,b)=>normDom(a.nombre).localeCompare(normDom(b.nombre),'es'));
 
   let html = '';
@@ -980,6 +981,24 @@ function renderPersonas(){
       + visAdmins.map(personaRow).join('') + `</div>`;
   }
   list.innerHTML = html || '<div class="empty">Sin personas en el padrón</div>';
+  renderBajas();
+}
+
+/* -------- Bajas: SOLO consulta (nadie las edita ni reactiva desde aquí) -------- */
+function renderBajas(){
+  const sec = $('#bajasSection'); if (!sec) return;
+  const bajas = personasCache.filter(esBajaP)
+    .sort((a,b)=>String(b.bajaEn||'').localeCompare(String(a.bajaEn||'')));
+  $('#bajasCount').textContent = String(bajas.length);
+  sec.classList.toggle('hidden', !bajas.length);
+  $('#bajasList').innerHTML = bajas.map(p => {
+    const dom = p.domicilio ? p.domicilio + ' · ' : '';
+    const cuando = p.bajaEn ? new Date(p.bajaEn).toLocaleDateString('es-MX', { timeZone:'America/Hermosillo', day:'numeric', month:'short', year:'numeric' }) : '—';
+    return `<div class="row"><div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
+      + `<div class="rt"><div class="a">${esc(p.nombre)}</div>`
+      + `<div class="b">${esc(dom)}baja el ${esc(cuando)} · por ${esc(p.bajaNombre||'—')} · ${esc(p.bajaMotivo||'sin motivo')}</div></div>`
+      + `<div class="tags"><span class="tag susp">Baja</span></div></div>`;
+  }).join('');
 }
 
 /* -------- una fila de persona: identidad + tags + botones de acción (según rol/estado) -------- */
@@ -1017,7 +1036,8 @@ function personaRow(p){
     if (ME.rol === 'master' && !esFam && !esAdmin)
       acts += `<button class="row-act" data-act="admin" data-id="${p.id}">${p.esAdmin ? 'Quitar admin' : '🛡 Hacer admin'}</button>`;
     if (ME.rol === 'master')
-      acts += `<button class="row-act danger" data-act="borrar" data-id="${p.id}">Borrar</button>`;
+      acts += `<button class="row-act danger" data-act="baja" data-id="${p.id}">Dar de baja</button>`
+            + `<button class="row-act danger" data-act="borrar" data-id="${p.id}">Borrar</button>`;
   }
 
   // Motivo de la suspensión MANUAL, visible sin tener que preguntar (ausente si la suspendió
@@ -1100,6 +1120,7 @@ $('#personasList')?.addEventListener('click', e => {
     case 'reactivar': cambiarEstadoPersona(p, 'reactivar', b); break;
     case 'admin':     cambiarAdminPersona(p, b); break;
     case 'borrar':    abrirPersonaDelSheet(p); break;
+    case 'baja':      abrirPersonaBajaSheet(p); break;
     case 'revisar-alerta': revisarAlertaFamiliar(p, b); break;
     case 'revisar-dup': revisarDuplicado(p, b); break;
   }
@@ -1256,6 +1277,45 @@ async function cambiarEstadoPersona(p, accion, btn){
     btn.disabled = false; btn.textContent = orig;
   }
 }
+
+/* -------- DAR DE BAJA (solo master): motivo obligatorio + confirmación en 2 pasos (mismo botón).
+   El Worker revalida master, motivo y que no sea master/uno mismo; aquí solo se pide. -------- */
+let personaBajaId = null;
+function abrirPersonaBajaSheet(p){
+  personaBajaId = p.id;
+  const fam = esJefeP(p) ? personasCache.filter(x => x.jefeId === p.id && !esBajaP(x)).length : 0;
+  $('#personaBajaInfo').innerHTML = esJefeP(p)
+    ? `<b>${esc(p.domicilio||'')}</b> · ${esc(p.nombre||'')}${fam ? ` · y sus ${fam} familiar(es)` : ''}`
+    : `<b>${esc(p.nombre||'')}</b>${p.domicilio?' · '+esc(p.domicilio):''}`;
+  $('#personaBajaMotivo').value = '';
+  $('#personaBajaErr').textContent = '';
+  const b = $('#personaBajaConfirm'); b.dataset.armado = ''; b.disabled = false; b.textContent = 'Dar de baja';
+  openSheet('#personaBajaOverlay');
+}
+$('#personaBajaCancel')?.addEventListener('click', () => closeSheet('#personaBajaOverlay'));
+$('#personaBajaOverlay')?.addEventListener('click', e => { if(e.target.id==='personaBajaOverlay') closeSheet('#personaBajaOverlay'); });
+$('#personaBajaMotivo')?.addEventListener('input', () => { const b = $('#personaBajaConfirm'); b.dataset.armado = ''; b.textContent = 'Dar de baja'; });
+$('#personaBajaConfirm')?.addEventListener('click', async () => {
+  if (!personaBajaId || ME.rol !== 'master') return;
+  const btn = $('#personaBajaConfirm');
+  const motivo = $('#personaBajaMotivo').value.trim();
+  $('#personaBajaErr').textContent = '';
+  if (motivo.length < 3){ $('#personaBajaErr').textContent = 'Escribe el motivo de la baja'; return; }
+  if (btn.dataset.armado !== '1'){
+    btn.dataset.armado = '1'; btn.textContent = '¿Seguro? Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = 'Dar de baja'; } }, 5000);
+    return;
+  }
+  btn.dataset.armado = ''; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/personas/baja', { id: personaBajaId, motivo });
+    toast(`Baja registrada (${(r.bajas||[]).length} persona(s))`, 'bad');
+    closeSheet('#personaBajaOverlay');
+    await refrescarPersonas(true);
+  } catch(e){
+    $('#personaBajaErr').textContent = e.message || 'No se pudo dar de baja';
+  } finally { btn.disabled = false; btn.textContent = 'Dar de baja'; }
+});
 
 /* -------- borrado de persona (solo master) — confirmación por MODAL, no confirm nativo.
    El Worker revalida master, bloquea jefe con familiares/pagos y respalda a personas_borradas. -------- */
@@ -3211,7 +3271,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v14';
+const APP_VERSION = 'v15';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

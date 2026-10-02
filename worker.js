@@ -118,6 +118,7 @@ export default {
         case '/personas/pendientes':     out = await pendientesPersonas(req, env); break;
         case '/personas/alta-cancelar':  out = await cancelarAlta(req, env); break;
         case '/personas/duplicado-revisar': out = await revisarDuplicadoPersona(req, env); break;
+        case '/personas/baja':           out = await darDeBajaPersona(req, env); break;
         case '/invitaciones/familiar': out = await crearInvitacionFamiliar(req, env); break;
         case '/invitaciones/familiar-reenviar': out = await reenviarInvitacionFamiliar(req, env); break;
         case '/votaciones/crear':         out = await crearVotacion(req, env); break;
@@ -1327,7 +1328,7 @@ async function crearInvitacionFamiliar(req, env) {
   if (!tel) throw httpErr(400, 'El teléfono es obligatorio');
 
   // Límite de 5 familiares VIVOS (los suspendidos ocupan slot).
-  if (all.filter(p => p.jefeId === jefe.id).length >= 5) throw httpErr(409, 'Ya alcanzaste el máximo de 5 familiares');
+  if (all.filter(p => p.jefeId === jefe.id && !esBaja(p)).length >= 5) throw httpErr(409, 'Ya alcanzaste el máximo de 5 familiares');
 
   const fid = crypto.randomUUID();
   await firestoreSet(env, `personas/${fid}`, {
@@ -1684,12 +1685,15 @@ function domicilioDe(p, byId) {
   if (p.jefeId) { const j = byId[p.jefeId]; return j ? (j.domicilio || '') : ''; }
   return p.domicilio || '';
 }
-function esJefe(p) { return p.rol === 'residente' && !p.jefeId; }
+/* BAJA (venta de casa, mudanza): la persona queda en el padrón solo para auditoría. Una baja ya no
+   cuenta como casa (cobranza, cupo, anti-duplicado de domicilio: el domicilio queda libre). */
+const esBaja = p => !!p && p.estado === 'baja';
+function esJefe(p) { return p.rol === 'residente' && !p.jefeId && !esBaja(p); }
 
 /* Proyecta la persona a usuarios/{uid} (solo si tiene cuenta) para reglas/getPerfil/abrir.
    updateMask para NO borrar el fcmToken que escribe el cliente. */
 async function syncUsuarioIndex(env, at, persona, byId) {
-  if (!persona || !persona.uid) return;
+  if (!persona || !persona.uid || esBaja(persona)) return;
   const fields = {
     nombre:{stringValue: persona.nombre || ''},
     rol:{stringValue: persona.rol || 'residente'},
@@ -1804,6 +1808,7 @@ async function actualizarPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(p => byId[p.id] = p);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: solo consulta.');
   if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede editar a un administrador');
 
   const fields = {};
@@ -1872,6 +1877,7 @@ async function suspenderPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: no se suspende.');
   if (p.rol === 'master') throw httpErr(403, 'No se puede suspender un master');
   if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede suspender a un administrador');
 
@@ -1899,6 +1905,7 @@ async function reactivarPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: no se reactiva.');
   if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master puede reactivar a un administrador');
   if (p.jefeId) {
     const jefe = byId[p.jefeId];
@@ -1929,6 +1936,7 @@ async function borrarPersona(req, env) {
   const all = await personasList(env, at);
   const byId = {}; all.forEach(x => byId[x.id] = x);
   const p = byId[id]; if (!p) throw httpErr(404, 'Persona no existe');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: se conserva para auditoría (pagos e historial).');
   if (p.rol === 'master') throw httpErr(403, 'No se puede borrar un master');
 
   if (esJefe(p)) {
@@ -2024,6 +2032,7 @@ async function listarPersonas(req, env) {
     dadoDeAltaNombre: p.dadoDeAltaNombre || '',   // v13: quién dio de alta al familiar
     duplicadoEstado: p.duplicadoEstado ?? null,   // 'activa' = alta con teléfono/nombre repetido, pendiente de revisar
     duplicadoCon: p.duplicadoCon ?? null,
+    bajaMotivo: p.bajaMotivo ?? null, bajaEn: p.bajaEn ?? null, bajaNombre: p.bajaNombre ?? null,
   }));
   const casasActivas = all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
   return json({ personas, casasActivas });
@@ -2045,7 +2054,7 @@ async function pendientesPersonas(req, env) {
   const invs = (await firestoreList(env, 'registro_invitaciones')).map(d => readDoc(d.fields)).filter(Boolean);
   const ahora = Date.now();
 
-  const pendientes = all.filter(p => !p.uid && !p.jefeId && p.rol !== 'master').map(p => {
+  const pendientes = all.filter(p => !p.uid && !p.jefeId && p.rol !== 'master' && !esBaja(p)).map(p => {
     const mias = invs.filter(i => i.personaId === p.id && !i.usado);
     const viva = mias.filter(i => i.expiraEn && new Date(i.expiraEn).getTime() > ahora)
       .sort((a, b) => String(b.expiraEn).localeCompare(String(a.expiraEn)))[0];
@@ -2081,6 +2090,7 @@ async function cancelarAlta(req, env) {
   const p = all.find(x => x.id === id);
   if (!p) throw httpErr(404, 'Persona no existe');
   if (p.rol === 'master') throw httpErr(403, 'No se puede cancelar un master');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona está dada de baja: se conserva para auditoría');
   if (p.uid) throw httpErr(409, 'Esta persona ya tiene cuenta: no es un alta pendiente');
   if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master cancela el alta de un administrador');
   const nFam = all.filter(x => x.jefeId === id).length;
@@ -2133,6 +2143,82 @@ async function revisarDuplicadoPersona(req, env) {
   return json({ ok:true, id });
 }
 
+/* /personas/baja — SOLO MASTER (como /personas/borrar). "Dar de baja" a una persona real que sale
+   (venta de casa, mudanza) sin perder su historia. Si es jefe, la baja alcanza a TODA su familia.
+   Para cada persona dada de baja:
+     1) Auth: se DESHABILITA la cuenta (no puede volver a entrar). Si falla, se aborta ANTES de tocar
+        Firestore, como /personas/borrar.
+     2) Puertas: se elimina su índice usuarios/{uid}; /abrir responde "Sin perfil" para TODAS las puertas
+        (incluye peatones y salida) sin tocar /abrir. Sus QR de visita activos se desactivan.
+     3) Sus ligas de registro sin usar se borran.
+     4) personas/{id} queda estado:'baja' con motivo, quién y cuándo. NO se borra: pagos, recibos,
+        finanzas y bitácora siguen intactos y con su nombre para auditoría.
+   Una baja no cuenta como casa (esJefe) ni aparece en listas activas; su domicilio queda libre.
+   No aplica a master, a uno mismo ni a quien ya está de baja. */
+async function darDeBajaPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master da de baja');
+
+  const { id, motivo } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const mot = String(motivo || '').trim().replace(/\s+/g, ' ').slice(0, 300);
+  if (mot.length < 3) throw httpErr(400, 'El motivo de la baja es obligatorio');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/identitytoolkit https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const p = all.find(x => x.id === id);
+  if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.rol === 'master') throw httpErr(403, 'No se puede dar de baja a un master');
+  if (p.uid && p.uid === user.uid) throw httpErr(403, 'No puedes darte de baja a ti mismo');
+  if (esBaja(p)) throw httpErr(409, 'Esta persona ya está dada de baja');
+
+  // Objetivos: la persona y, si es jefe, toda su familia que siga viva.
+  const objetivos = [p, ...(p.rol === 'residente' && !p.jefeId ? all.filter(x => x.jefeId === p.id && !esBaja(x)) : [])];
+  if (objetivos.some(t => t.uid && t.uid === user.uid)) throw httpErr(403, 'No puedes darte de baja a ti mismo');
+
+  // 1) Auth primero (todas): si algo falla, Firestore no se ha tocado.
+  for (const t of objetivos) {
+    if (!t.uid) continue;
+    const r = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts:update`, {
+      method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+      body: JSON.stringify({ localId: t.uid, disableUser: true }),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      if (!String(err.error?.message || '').includes('USER_NOT_FOUND')) throw httpErr(500, 'No se pudo deshabilitar la cuenta de acceso');
+    }
+  }
+
+  // 2-4) Firestore
+  const ahora = new Date().toISOString();
+  const invisitas = (await firestoreList(env, 'invitaciones')).map(d => ({ id: d.name.split('/').pop(), ...readDoc(d.fields) }));
+  const ligas = (await firestoreList(env, 'registro_invitaciones')).map(d => ({ id: d.name.split('/').pop(), ...readDoc(d.fields) }));
+  for (const t of objetivos) {
+    if (t.uid) {
+      await fetch(`${fsBase(env)}/usuarios/${t.uid}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+      for (const v of invisitas.filter(v => v.activa && (v.creadaPor === t.uid || v.hogar === t.uid))) {
+        await firestoreUpdate(env, `invitaciones/${v.id}`, { activa:{ booleanValue:false } }, ['activa']);
+      }
+    }
+    for (const l of ligas.filter(l => l.personaId === t.id && !l.usado)) {
+      await fetch(`${fsBase(env)}/registro_invitaciones/${l.id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+    }
+    await firestoreActualizarCampos(env, `personas/${t.id}`, {
+      estado:{ stringValue:'baja' },
+      bajaMotivo:{ stringValue: mot },
+      bajaPor:{ stringValue: user.uid },
+      bajaNombre:{ stringValue: perfil.nombre || '' },
+      bajaEn:{ timestampValue: ahora },
+      bajaEstadoPrevio:{ stringValue: t.estado || 'activo' },
+      bajaDeJefeId:{ stringValue: t.id === p.id ? '' : p.id },
+    }, 'Persona');
+  }
+  const fam = objetivos.length - 1;
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Master'} dio de baja a ${p.nombre}${domicilioDe(p, Object.fromEntries(all.map(x => [x.id, x]))) ? ' (' + domicilioDe(p, Object.fromEntries(all.map(x => [x.id, x]))) + ')' : ''}${fam ? ' y a ' + fam + ' familiar(es)' : ''}: ${mot}`.slice(0, 500) });
+  return json({ ok:true, id, bajas: objetivos.map(t => t.id) });
+}
+
 /* /personas/mis-familiares — el JEFE lista SOLO a su propia familia (self-service:
    badge N/5, invitar, cancelar). Nunca expone otras casas ni al resto del padrón.
    Devuelve id/nombre/estado/registrado de cada familiar + el tope de 5. */
@@ -2141,7 +2227,7 @@ async function misFamiliares(req, env) {
   const all = await personasList(env);
   const jefe = all.find(p => p.uid === user.uid);
   if (!jefe || !esJefe(jefe)) throw httpErr(403, 'Solo un jefe de familia tiene familiares');
-  const familiares = all.filter(p => p.jefeId === jefe.id)
+  const familiares = all.filter(p => p.jefeId === jefe.id && !esBaja(p))
     .map(f => ({
       id: f.id, nombre: f.nombre || '', telefono: f.telefono || '',
       estado: f.estado || 'activo', registrado: !!f.uid, suspendidoPor: f.suspendidoPor ?? null,

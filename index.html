@@ -532,6 +532,12 @@
     <div id="personasErr" class="vbanner hidden" style="margin:0 0 10px"></div>
     <div class="list" id="personasList"><div class="empty">Cargando…</div></div>
 
+    <!-- Bajas — SOLO consulta: personas que salieron (venta de casa, mudanza). Sus pagos e historial se conservan. -->
+    <div id="bajasSection" class="hidden">
+      <div class="section-title">Bajas <span class="tag" id="bajasCount">0</span></div>
+      <div class="list" id="bajasList"></div>
+    </div>
+
     <!-- Configuración de cobranza — cuota/fecha: staff (master/admin/jefe-admin). Link de pago: SOLO master (#ccLinkField, oculto al resto) -->
     <div id="cobranzaConfigSection" class="hidden">
       <div class="section-title">Configuración de cobranza</div>
@@ -653,6 +659,20 @@
     <button class="btn-primary" id="personaSuspenderConfirm" style="background:linear-gradient(145deg,#b91c1c,#7f1d1d);color:#fff">Sí, suspender</button>
     <button class="btn-ghost" id="personaSuspenderCancel" style="width:100%;margin-top:10px">Cancelar</button>
     <div id="personaSuspenderErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ DAR DE BAJA (solo master) — motivo obligatorio + confirmación en 2 pasos ============ -->
+<div class="overlay" id="personaBajaOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3>Dar de baja</h3>
+    <div class="recibo-datos" id="personaBajaInfo"></div>
+    <div class="vbanner" style="margin:0 0 12px">Se deshabilita su cuenta, se bloquean TODAS sus puertas y sus invitaciones, y sale de las listas activas (si es jefe, también su familia). Sus pagos, recibos e historial se conservan con su nombre.</div>
+    <div class="field"><label>Motivo (obligatorio)</label><input id="personaBajaMotivo" maxlength="300" placeholder="Ej. Vendió la casa / se mudó"></div>
+    <button class="btn-primary" id="personaBajaConfirm" style="background:linear-gradient(145deg,#b91c1c,#7f1d1d);color:#fff">Dar de baja</button>
+    <button class="btn-ghost" id="personaBajaCancel" style="width:100%;margin-top:10px">Cancelar</button>
+    <div id="personaBajaErr" class="err"></div>
   </div>
 </div>
 
