@@ -571,6 +571,9 @@
         <button class="btn-primary" id="susSimularBtn" style="margin-top:0;flex:1">Simular (sin cambios)</button>
         <button class="btn-ghost" id="susAplicarBtn" style="color:var(--bad);border-color:rgba(248,113,113,.4)">Aplicar de verdad</button>
       </div>
+      <!-- Recordatorio de pago por push (días 1 y 3) — SOLO master y admin. Nunca envía: solo muestra a quién y qué texto. -->
+      <button class="btn-ghost hidden" id="recSimularBtn" style="width:100%;margin-top:8px">Simular recordatorio (sin enviar)</button>
+      <div id="recResultado" class="list" style="margin-top:10px"></div>
       <div class="vbanner" style="margin:10px 0 0">
         ⚠️ "Aplicar de verdad" suspende personas REALES ahora mismo (bloquea sus puertas) si tienen adeudo — no es una prueba. Usa "Simular" primero para ver a quién afectaría.
       </div>

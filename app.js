@@ -236,6 +236,7 @@ function buildTabs(){
   // (ver #ccLinkField más abajo): el Worker rechaza linkPago si quien llama no es master.
   $('#cobranzaConfigSection').classList.toggle('hidden', !isStaff);
   $('#susAutoSection').classList.toggle('hidden', !isStaff);
+  $('#recSimularBtn').classList.toggle('hidden', !(ME.rol === 'master' || ME.rol === 'admin'));   // cosmético; el Worker revalida
   $('#ccLinkField').classList.toggle('hidden', ME.rol !== 'master');
   if (isStaff) cargarConfigCobranza();
 }
@@ -951,6 +952,26 @@ async function ejecutarSuspensionAutomatica(modo){
   }
 }
 $('#susSimularBtn')?.addEventListener('click', () => ejecutarSuspensionAutomatica('simular'));
+
+/* Simular recordatorio de pago (master/admin): solo muestra a quién y qué texto; el Worker no envía nada. */
+$('#recSimularBtn')?.addEventListener('click', async () => {
+  const btn = $('#recSimularBtn'), el = $('#recResultado');
+  const orig = btn.textContent; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/admin/simular-recordatorio-pago', {});
+    if (!r.texto) el.innerHTML = '<div class="empty">Hoy no toca recordatorio (solo los días 1 y 3 del mes).</div>';
+    else if (!r.casas.length) el.innerHTML = `<div class="empty">Ninguna casa recibiría recordatorio hoy.</div><div class="vnote">Texto: ${esc(r.texto)}</div>`;
+    else el.innerHTML = `<div class="vnote" style="margin:0 0 6px">Texto: ${esc(r.texto)}</div>` + r.casas.map(c =>
+      `<div class="row"><div class="rt"><div class="a">${esc(c.domicilio || '')}</div>`
+      + `<div class="b">${esc(c.nombre || '')}${c.push ? '' : ' · sin push activado'}${c.yaEnviado ? ' · ya enviado hoy' : ''}</div></div>`
+      + `<span class="tag out">${money(c.adeudo)}</span></div>`).join('');
+    toast('Simulación: no se envió nada', 'ok');
+  } catch(e){
+    toast(e.message || 'No se pudo simular', 'bad');
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
+});
 $('#susAplicarBtn')?.addEventListener('click', () => ejecutarSuspensionAutomatica('aplicar'));
 
 /* -------- lista agrupada por casa: jefe + sus familiares anidados; admins aparte -------- */
@@ -3470,7 +3491,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v20';
+const APP_VERSION = 'v21';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

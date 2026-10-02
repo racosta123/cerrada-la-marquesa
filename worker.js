@@ -138,6 +138,7 @@ export default {
         case '/votaciones/historial':     out = await historialVotaciones(req, env); break;
         case '/votaciones/participantes':  out = await participantesVotacion(req, env); break;
         case '/admin/probar-suspension-automatica': out = await probarSuspensionAutomatica(req, env); break;
+        case '/admin/simular-recordatorio-pago': out = await simularRecordatorioPago(req, env); break;
         default: out = json({ error:'Ruta no encontrada' }, 404);
       }
       return cors(out, origin);
@@ -151,6 +152,8 @@ export default {
   // evita que el Worker se corte antes de terminar el recorrido de personas/finanzas.
   async scheduled(event, env, ctx) {
     ctx.waitUntil(aplicarSuspensionAutomatica(env));
+    // Recordatorio push (días 1 y 3). Aparte y con su propio try/catch: nunca afecta la suspensión.
+    ctx.waitUntil(enviarRecordatoriosPago(env));
   },
 };
 
@@ -2654,12 +2657,11 @@ async function estadoCuentaFinanzas(req, env) {
    mes de "hoy" aún no alcanza al de fechaEfectiva, ese mes en curso no cuenta como completo).
    Si fechaEfectiva cae en el futuro, meses da negativo y se recorta a 0 (nunca error, nunca
    adeudo negativo). */
-function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa }) {
+function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa, ahora = ahoraHermosillo() }) {
   const inicioCobro = new Date(cfg.fechaInicioCobro);
   const alta = altaCasa ? new Date(altaCasa) : inicioCobro;
   const fechaEfectiva = (alta instanceof Date && !isNaN(alta) && alta > inicioCobro) ? alta : inicioCobro;
 
-  const ahora = ahoraHermosillo();
   const fechaEfectivaHermosillo = aHermosillo(fechaEfectiva);
   let meses = (ahora.getUTCFullYear() - fechaEfectivaHermosillo.getUTCFullYear()) * 12
             + (ahora.getUTCMonth() - fechaEfectivaHermosillo.getUTCMonth());
@@ -2700,6 +2702,38 @@ function calcularEstadoCuenta({ altaCasa, cfg, pagosCuotaPorCasa }) {
    reservado (ver comentario junto a suspenderPersona) que distingue esta suspensión
    automática de una manual de staff. Una suspensión manual (motivoSuspension ausente)
    jamás se toca aquí: solo se suspende a quien está 'activo' hoy. */
+/* Núcleo ÚNICO de "quién debe": jefes ACTIVOS con adeudo > 0. Lo usan la suspensión automática
+   y el recordatorio de pago (mismo criterio, sin duplicar el cálculo). Solo lee. `ahora` es
+   opcional (hora Hermosillo, ver calcularEstadoCuenta); sin él, el momento actual. */
+async function casasConAdeudo(env, at, cfg, ahora) {
+  // Mismo recorrido único de "finanzas" que ya usa cobranzaFinanzas para armar el historial
+  // completo de pagos de Cuota por casa, en vez de repetirlo casa por casa.
+  const pagosPorCasa = new Map();
+  for (const doc of await firestoreList(env, 'finanzas')) {
+    const d = readDoc(doc.fields);
+    if (esCancelado(d)) continue;   // un pago cancelado no abona al adeudo
+    if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
+    const dn = normDomicilio(d.casa);
+    if (!pagosPorCasa.has(dn)) pagosPorCasa.set(dn, []);
+    pagosPorCasa.get(dn).push({ ts: d.ts, monto: d.monto || 0 });
+  }
+  const all = await personasList(env, at);
+  const morosas = [];
+  for (const jefe of all.filter(p => esJefe(p) && p.estado === 'activo')) {
+    const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(jefe.domicilioNorm), ...(ahora ? { ahora } : {}) });
+    if (estado.adeudo > 0) morosas.push({ jefe, estado });
+  }
+  return { all, morosas };
+}
+/* Config de cobranza SOLO lectura (no siembra config/cobranza si falta). */
+function cfgCobranzaDesdeDoc(rawCfgDoc) {
+  const raw = rawCfgDoc ? readDoc(rawCfgDoc.fields) : {};
+  return {
+    cuotaMensual: typeof raw.cuotaMensual === 'number' ? raw.cuotaMensual : 350,
+    fechaInicioCobro: raw.fechaInicioCobro || new Date().toISOString(),
+  };
+}
+
 async function aplicarSuspensionAutomatica(env, modo = 'aplicar') {
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const ahora = ahoraHermosillo();
@@ -2721,31 +2755,12 @@ async function aplicarSuspensionAutomatica(env, modo = 'aplicar') {
     // 'simular' NUNCA escribe — ni siquiera sembrar config/cobranza si no existiera todavía.
     // Arma cfg en memoria desde rawCfgDoc (ya leído arriba, un solo GET), con los mismos
     // defaults que usa leerConfigCobranza, pero sin llamarla (esa sí siembra el doc si falta).
-    const raw = rawCfgDoc ? readDoc(rawCfgDoc.fields) : {};
-    cfg = {
-      cuotaMensual: typeof raw.cuotaMensual === 'number' ? raw.cuotaMensual : 350,
-      fechaInicioCobro: raw.fechaInicioCobro || new Date().toISOString(),
-    };
+    cfg = cfgCobranzaDesdeDoc(rawCfgDoc);
   }
 
-  // Mismo recorrido único de "finanzas" que ya usa cobranzaFinanzas para armar el historial
-  // completo de pagos de Cuota por casa, en vez de repetirlo casa por casa.
-  const pagosPorCasa = new Map();
-  for (const doc of await firestoreList(env, 'finanzas')) {
-    const d = readDoc(doc.fields);
-    if (esCancelado(d)) continue;   // un pago cancelado no abona al adeudo
-    if (d.tipo !== 'ingreso' || d.categoria !== 'Cuota' || !d.casa) continue;
-    const dn = normDomicilio(d.casa);
-    if (!pagosPorCasa.has(dn)) pagosPorCasa.set(dn, []);
-    pagosPorCasa.get(dn).push({ ts: d.ts, monto: d.monto || 0 });
-  }
-
-  const all = await personasList(env, at);
+  const { all, morosas } = await casasConAdeudo(env, at, cfg);
   const suspendidas = [];
-  for (const jefe of all.filter(p => esJefe(p) && p.estado === 'activo')) {
-    const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(jefe.domicilioNorm) });
-    if (estado.adeudo <= 0) continue;
-
+  for (const { jefe, estado } of morosas) {
     if (modo === 'aplicar') {
       await firestoreActualizarCampos(env, `personas/${jefe.id}`, {
         estado:{stringValue:'suspendido'}, suspendidoPor:{stringValue:'individual'}, motivoSuspension:{stringValue:'mora'},
@@ -2766,6 +2781,105 @@ async function aplicarSuspensionAutomatica(env, modo = 'aplicar') {
     await firestoreActualizarCampos(env, 'config/cobranza', { ultimoMesProcesado:{stringValue:mesActual} }, 'Configuración de cobranza');
   }
   return { ok:true, modo, aplico: modo === 'aplicar', mesActual, ultimoMesProcesado, suspendidas };
+}
+
+/* ============ Recordatorio de pago por push ============
+   Lo dispara el MISMO cron diario (scheduled()); no hay cron nuevo. Día 1 y día 3 del mes
+   (hora Hermosillo) avisa por push SOLO al jefe de las casas que el día 5 serían suspendidas.
+   "Serían suspendidas" = casasConAdeudo (el núcleo de la suspensión automática) evaluado al día 5
+   del mes en curso, así el criterio es idéntico al del corte. Antes de fechaInicioCobro el adeudo
+   es 0 por definición, por lo que nadie recibe nada. Quien está al corriente, suspendido o dado
+   de baja no sale en casasConAdeudo.
+   Una marca por casa y día (recordatorios_pago/{personaId}_{AAAA-MM-DD}, creada con
+   currentDocument.exists=false) evita repetir si el cron corre dos veces. Sin fcmToken no hay nada
+   que enviar ni marca: no falla. Solo el Worker escribe ahí (las reglas niegan todo lo no listado). */
+const MESES_ES = ['enero','febrero','marzo','abril','mayo','junio','julio','agosto','septiembre','octubre','noviembre','diciembre'];
+function textoRecordatorioPago(dia, mesIdx) {
+  if (dia === 1) return `Ya puedes pagar tu cuota de ${MESES_ES[mesIdx]}. Págala antes del día 5 para evitar la suspensión.`;
+  if (dia === 3) return 'Te quedan 2 días para pagar tu cuota y evitar la suspensión del acceso vehicular.';
+  return null;
+}
+/* `ahora`: Date en marco Hermosillo (como ahoraHermosillo()). Solo lee; arma el plan del día. */
+async function planRecordatoriosPago(env, at, ahora) {
+  const dia = ahora.getUTCDate(), mesIdx = ahora.getUTCMonth(), anio = ahora.getUTCFullYear();
+  const fecha = `${anio}-${String(mesIdx + 1).padStart(2, '0')}-${String(dia).padStart(2, '0')}`;
+  const texto = textoRecordatorioPago(dia, mesIdx);
+  if (!texto) return { fecha, dia, texto: null, casas: [] };
+  const cfg = cfgCobranzaDesdeDoc(await getDoc(env, at, 'config/cobranza'));
+  // Nunca antes de fechaInicioCobro (además de que el adeudo ya sería 0 por el cálculo común).
+  if (inicioDiaHermosilloUTC(anio, mesIdx, dia).getTime() < Date.parse(cfg.fechaInicioCobro)) return { fecha, dia, texto, casas: [] };
+  const dia5 = new Date(Date.UTC(anio, mesIdx, 5));
+  const { morosas } = await casasConAdeudo(env, at, cfg, dia5);
+  const casas = [];
+  for (const { jefe, estado } of morosas) {
+    const perfil = jefe.uid ? await getPerfil(env, jefe.uid) : null;
+    casas.push({ id: jefe.id, nombre: jefe.nombre, domicilio: jefe.domicilio, uid: jefe.uid || null,
+      adeudo: estado.adeudo, push: !!perfil?.fcmToken, fcmToken: perfil?.fcmToken || null });
+  }
+  return { fecha, dia, texto, casas };
+}
+/* Envío real (cron). Nunca lanza hacia scheduled(): un fallo aquí no debe tumbar la suspensión. */
+async function enviarRecordatoriosPago(env, ahora = ahoraHermosillo()) {
+  const res = { enviados: [], omitidas: [] };
+  try {
+    const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+    const plan = await planRecordatoriosPago(env, at, ahora);
+    if (!plan.texto || !plan.casas.length) return { ...res, dia: plan.dia };
+    let atFcm = null;
+    for (const c of plan.casas) {
+      if (!c.push) { res.omitidas.push({ id: c.id, motivo: 'sin-push' }); continue; }
+      const marca = `recordatorios_pago/${c.id}_${plan.fecha}`;
+      const r = await fetch(`${fsBase(env)}:commit`, {
+        method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+        body: JSON.stringify({ writes:[{ update:{ name: docName(env, marca), fields:{
+          personaId:{stringValue:c.id}, fecha:{stringValue:plan.fecha}, dia:{integerValue:String(plan.dia)},
+          ts:{timestampValue:new Date().toISOString()} } }, currentDocument:{ exists:false } }] }),
+      });
+      if (r.status === 409 || r.status === 400) { res.omitidas.push({ id: c.id, motivo: 'ya-enviado' }); continue; }
+      if (!r.ok) { res.omitidas.push({ id: c.id, motivo: 'error-marca' }); continue; }
+      try {
+        atFcm = atFcm || await saToken(env, 'https://www.googleapis.com/auth/firebase.messaging');
+        const p = await fetch(`https://fcm.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/messages:send`, {
+          method:'POST', headers:{ Authorization:'Bearer '+atFcm, 'Content-Type':'application/json' },
+          body: JSON.stringify({ message:{ token:c.fcmToken, notification:{ title:'Cerrada La Marquesa', body:plan.texto } } }),
+        });
+        if (!p.ok) throw new Error('fcm ' + p.status);
+        res.enviados.push(c.id);
+      } catch (e) {
+        // No salió: se quita la marca para que un reintento del mismo día sí pueda enviarlo.
+        await fetch(`${fsBase(env)}/${marca}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+        res.omitidas.push({ id: c.id, motivo: 'fallo-envio' });
+      }
+    }
+    return { ...res, dia: plan.dia };
+  } catch (e) {
+    console.error('enviarRecordatoriosPago', e);
+    return res;
+  }
+}
+/* ============ /admin/simular-recordatorio-pago — SOLO master y admin ============
+   Muestra a qué casas se enviaría y con qué texto. No envía ni escribe nada. `fecha` opcional
+   (AAAA-MM-DD) para ver cómo saldría otro día (p. ej. el 1 del mes que entra); sin ella, hoy. */
+async function simularRecordatorioPago(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || (perfil.rol !== 'master' && perfil.rol !== 'admin')) throw httpErr(403, 'Solo master y admin');
+  const { fecha } = await req.json().catch(() => ({}));
+  let ahora = ahoraHermosillo();
+  if (fecha !== undefined && fecha !== null && fecha !== '') {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(fecha));
+    const d = m && new Date(Date.UTC(+m[1], +m[2] - 1, +m[3]));
+    if (!d || isNaN(d) || d.getUTCDate() !== +m[3]) throw httpErr(400, 'fecha inválida (AAAA-MM-DD)');
+    ahora = d;
+  }
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const plan = await planRecordatoriosPago(env, at, ahora);
+  const casas = [];
+  for (const c of plan.casas) {
+    const ya = plan.texto ? !!(await getDoc(env, at, `recordatorios_pago/${c.id}_${plan.fecha}`)) : false;
+    casas.push({ id: c.id, nombre: c.nombre, domicilio: c.domicilio, adeudo: c.adeudo, push: c.push, yaEnviado: ya });
+  }
+  return json({ ok:true, fecha: plan.fecha, dia: plan.dia, texto: plan.texto, casas });
 }
 
 /* Reactivación automática al pagar — la llama registrarFinanza justo después de escribir un
