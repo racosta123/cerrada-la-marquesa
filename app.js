@@ -768,6 +768,18 @@ function refrescarGestion(){
 }
 $('#refreshPersonasBtn')?.addEventListener('click', () => refrescarGestion());
 
+/* Compartir app (staff): wa.me sin número para que quien comparte elija el contacto. */
+const APP_URL = 'https://racosta123.github.io/cerrada-la-marquesa/';
+const APP_SHARE_MSG = 'Hola, este es el enlace de la app de Cerrada La Marquesa:\n' + APP_URL +
+  '\nÁbrelo en Chrome (Android) o Safari (iPhone) y entra con tu mismo correo y contraseña.\nDespués agrégala a tu pantalla de inicio.';
+$('#shareAppWaBtn')?.addEventListener('click', () => {
+  window.open('https://wa.me/?text=' + encodeURIComponent(APP_SHARE_MSG), '_blank', 'noopener');
+});
+$('#shareAppCopyBtn')?.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(APP_URL); toast('Enlace copiado'); }
+  catch { window.prompt('Copia el enlace:', APP_URL); }
+});
+
 /* -------- Pendientes de activar: altas sin cuenta (staff). El Worker decide todo; aquí solo se pinta. -------- */
 let pendientesCache = [];
 let pendientesError = '';
@@ -3458,7 +3470,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v19';
+const APP_VERSION = 'v20';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
