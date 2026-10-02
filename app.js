@@ -729,7 +729,8 @@ function watchInvites(){
    jefeId (hereda el domicilio del jefe). Admin/master = sin domicilio. usuarios/{uid} es solo
    un índice que sincroniza el Worker; aquí NO se lee/escribe esa colección directo. */
 const normDom = s => String(s||'').trim().replace(/\s+/g,' ').toUpperCase();
-function esJefeP(p){ return p.rol === 'residente' && !p.jefeId; }
+const esBajaP = p => p.estado === 'baja';
+function esJefeP(p){ return p.rol === 'residente' && !p.jefeId && !esBajaP(p); }
 /* jefes() = TODAS las casas (activas y suspendidas) — también el dropdown de registro de
    ingreso: se puede cobrar a una casa suspendida. El termómetro y las listas de cobranza
    usan el conteo del Worker (todas las casas). */
@@ -761,6 +762,7 @@ let gestionCargando = null;
 function refrescarGestion(){
   if (gestionCargando) return gestionCargando;
   const btn = $('#refreshPersonasBtn'); if (btn) btn.disabled = true;
+  if (ME.rol === 'master') cargarDispositivos();   // solo lista (no consulta a Shelly Cloud)
   gestionCargando = refrescarPersonas(true).finally(() => { gestionCargando = null; if (btn) btn.disabled = false; });
   return gestionCargando;
 }
@@ -954,11 +956,11 @@ function renderPersonas(){
   const match = p => !q || normDom(p.nombre).includes(q)
     || (p.domicilioNorm||'').includes(q) || (p.telefono||'').includes(raw);
 
-  const familiaresDe = id => personasCache.filter(p => p.jefeId === id)
+  const familiaresDe = id => personasCache.filter(p => p.jefeId === id && !esBajaP(p))
     .sort((a,b)=>normDom(a.nombre).localeCompare(normDom(b.nombre),'es'));
 
   const casas = jefes().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
-  const admins = personasCache.filter(p => p.rol==='admin' || p.rol==='master')
+  const admins = personasCache.filter(p => (p.rol==='admin' || p.rol==='master') && !esBajaP(p))
     .sort((a,b)=>normDom(a.nombre).localeCompare(normDom(b.nombre),'es'));
 
   let html = '';
@@ -980,6 +982,24 @@ function renderPersonas(){
       + visAdmins.map(personaRow).join('') + `</div>`;
   }
   list.innerHTML = html || '<div class="empty">Sin personas en el padrón</div>';
+  renderBajas();
+}
+
+/* -------- Bajas: SOLO consulta (nadie las edita ni reactiva desde aquí) -------- */
+function renderBajas(){
+  const sec = $('#bajasSection'); if (!sec) return;
+  const bajas = personasCache.filter(esBajaP)
+    .sort((a,b)=>String(b.bajaEn||'').localeCompare(String(a.bajaEn||'')));
+  $('#bajasCount').textContent = String(bajas.length);
+  sec.classList.toggle('hidden', !bajas.length);
+  $('#bajasList').innerHTML = bajas.map(p => {
+    const dom = p.domicilio ? p.domicilio + ' · ' : '';
+    const cuando = p.bajaEn ? new Date(p.bajaEn).toLocaleDateString('es-MX', { timeZone:'America/Hermosillo', day:'numeric', month:'short', year:'numeric' }) : '—';
+    return `<div class="row"><div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
+      + `<div class="rt"><div class="a">${esc(p.nombre)}</div>`
+      + `<div class="b">${esc(dom)}baja el ${esc(cuando)} · por ${esc(p.bajaNombre||'—')} · ${esc(p.bajaMotivo||'sin motivo')}</div></div>`
+      + `<div class="tags"><span class="tag susp">Baja</span></div></div>`;
+  }).join('');
 }
 
 /* -------- una fila de persona: identidad + tags + botones de acción (según rol/estado) -------- */
@@ -1017,7 +1037,8 @@ function personaRow(p){
     if (ME.rol === 'master' && !esFam && !esAdmin)
       acts += `<button class="row-act" data-act="admin" data-id="${p.id}">${p.esAdmin ? 'Quitar admin' : '🛡 Hacer admin'}</button>`;
     if (ME.rol === 'master')
-      acts += `<button class="row-act danger" data-act="borrar" data-id="${p.id}">Borrar</button>`;
+      acts += `<button class="row-act danger" data-act="baja" data-id="${p.id}">Dar de baja</button>`
+            + `<button class="row-act danger" data-act="borrar" data-id="${p.id}">Borrar</button>`;
   }
 
   // Motivo de la suspensión MANUAL, visible sin tener que preguntar (ausente si la suspendió
@@ -1100,6 +1121,7 @@ $('#personasList')?.addEventListener('click', e => {
     case 'reactivar': cambiarEstadoPersona(p, 'reactivar', b); break;
     case 'admin':     cambiarAdminPersona(p, b); break;
     case 'borrar':    abrirPersonaDelSheet(p); break;
+    case 'baja':      abrirPersonaBajaSheet(p); break;
     case 'revisar-alerta': revisarAlertaFamiliar(p, b); break;
     case 'revisar-dup': revisarDuplicado(p, b); break;
   }
@@ -1256,6 +1278,214 @@ async function cambiarEstadoPersona(p, accion, btn){
     btn.disabled = false; btn.textContent = orig;
   }
 }
+
+/* ====================== DISPOSITIVOS (Shelly) — SOLO master ======================
+   La pantalla solo PIDE: el Worker valida master, contraseña reciente, formato, y que el Shelly
+   nuevo exista y esté en línea ANTES de guardar. La apertura de puertas no se toca desde aquí. */
+const DISP_NOMBRE = { visitantes:'Visitantes', residentes:'Residentes', peatones:'Peatonal', salida:'Salida' };
+let dispCache = [];
+let dispEstado = {};   // puerta -> { online, existe } (solo si el master pulsó "Verificar estado")
+async function cargarDispositivos(){
+  const sec = $('#dispSection'); if (!sec) return;
+  if (ME.rol !== 'master'){ sec.classList.add('hidden'); return; }
+  sec.classList.remove('hidden');
+  try {
+    const r = await authedFetch('/dispositivos/listar', {});
+    dispCache = r.puertas || [];
+    renderDispositivos();
+  } catch(e){
+    $('#dispList').innerHTML = `<div class="empty">No se pudo cargar (${esc(e.message||'error')}). <button class="row-act" data-act="reintentar">Reintentar</button></div>`;
+  }
+}
+function renderDispositivos(){
+  $('#dispList').innerHTML = dispCache.map(d => {
+    const nom = DISP_NOMBRE[d.puerta] || d.puerta;
+    const est = dispEstado[d.puerta];
+    const tagEst = !d.id ? '<span class="tag">Sin asignar</span>'
+      : est ? (est.online ? '<span class="tag in">En línea</span>' : '<span class="tag susp">'+(est.existe===false?'No existe':'Fuera de línea')+'</span>') : '<span class="tag">—</span>';
+    const sub = d.id ? `Gen${d.gen} · …${esc(String(d.id).slice(-6))} · ${d.origen==='documento'?'cambiado desde la app':'original (respaldo)'}${d.ultimoCambio?' · último cambio: '+esc(d.ultimoCambio.nombre||''):''}` : 'Sin dispositivo asignado';
+    let acts = '';
+    if (d.id) acts += `<button class="row-act" data-act="estado" data-p="${d.puerta}">Verificar estado</button>`;
+    acts += `<button class="row-act" data-act="cambiar" data-p="${d.puerta}">Cambiar Shelly</button>`;
+    if (d.puedeRegresar) acts += `<button class="row-act" data-act="regresar" data-p="${d.puerta}">↩ Regresar al anterior</button>`;
+    if (d.id) acts += `<button class="row-act danger" data-act="probar" data-p="${d.puerta}">Pulso de prueba</button>`;
+    return `<div class="row"><div class="ri">${esc(nom[0])}</div><div class="rt"><div class="a">${esc(nom)}</div><div class="b">${sub}</div></div><div class="tags">${tagEst}</div></div><div class="persona-acts">${acts}</div>`;
+  }).join('');
+}
+$('#dispList')?.addEventListener('click', async e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  if (b.dataset.act === 'reintentar'){ cargarDispositivos(); return; }
+  const p = b.dataset.p;
+  if (b.dataset.act === 'estado'){
+    const orig = b.textContent; b.disabled = true; b.innerHTML = '<span class="spinner"></span>';
+    try {
+      const r = await authedFetch('/dispositivos/estado', { puerta: p });
+      dispEstado[p] = { online: r.online === true, existe: r.existe };
+      if (r.error) toast('No se pudo consultar Shelly Cloud (' + r.error + ')', 'bad');
+    } catch(err){ toast(err.message || 'No se pudo consultar', 'bad'); }
+    renderDispositivos();
+  } else abrirDispSheet(b.dataset.act, p);
+});
+
+let dispModo = null, dispPuerta = null, dispValidado = null, dispForzar = false;
+function abrirDispSheet(modo, puerta){
+  dispModo = modo; dispPuerta = puerta; dispValidado = null; dispForzar = false;
+  const d = dispCache.find(x => x.puerta === puerta) || {};
+  const nom = DISP_NOMBRE[puerta] || puerta;
+  $('#dispTitle').textContent = modo === 'cambiar' ? 'Cambiar Shelly · ' + nom : modo === 'regresar' ? 'Regresar al anterior · ' + nom : 'Pulso de prueba · ' + nom;
+  $('#dispInfo').innerHTML = `<b>${esc(nom)}</b>${d.id ? ' · actual …' + esc(String(d.id).slice(-6)) + ' (Gen' + d.gen + ')' : ' · sin asignar'}`;
+  $('#dispIdField').classList.toggle('hidden', modo !== 'cambiar');
+  $('#dispId').value = ''; $('#dispValid').textContent = ''; $('#dispGenField').classList.add('hidden'); $('#dispGen').value = '';
+  $('#dispLista').innerHTML = ''; $('#dispListaMsg').textContent = ''; $('#dispSel').textContent = ''; $('#dispManual').classList.add('hidden');
+  const av = $('#dispAviso');
+  av.classList.toggle('hidden', modo === 'cambiar');
+  av.textContent = modo === 'probar' ? '⚠️ Esto ABRIRÁ la puerta física ahora mismo (pasa por la ruta normal de apertura).'
+    : modo === 'regresar' ? 'Vuelve al Shelly que tenía esta puerta antes del último cambio. Se comprueba que esté en línea.' : '';
+  $('#dispPass').value = ''; $('#dispErr').textContent = '';
+  const c = $('#dispConfirmBtn'); c.disabled = false; c.textContent = modo === 'cambiar' ? 'Guardar cambio' : modo === 'regresar' ? 'Regresar al anterior' : 'Abrir ahora (prueba)';
+  c.dataset.armado = '';
+  openSheet('#dispOverlay');
+  if (modo === 'cambiar') buscarRepuestos();   // UNA consulta a Shelly Cloud por toque (manual, nunca automática en bucle)
+}
+/* Repuestos: el Worker pide a Shelly Cloud la lista de la cuenta y devuelve SOLO los EN LÍNEA y SIN asignar. La llave de
+   Shelly nunca llega aquí. Teclear el ID a mano queda como respaldo. */
+async function buscarRepuestos(){
+  const lista = $('#dispLista'), msg = $('#dispListaMsg'), b = $('#dispBuscarBtn');
+  lista.innerHTML = ''; $('#dispSel').textContent = ''; dispValidado = null; $('#dispGenField').classList.add('hidden');
+  msg.textContent = 'Buscando repuestos en línea…'; b.disabled = true;
+  try {
+    const r = await authedFetch('/dispositivos/disponibles', {});
+    if (!r.disponibles.length){
+      msg.textContent = 'No hay repuestos en línea. Revisa que el Shelly tenga corriente y WiFi de la cerrada.'
+        + (r.fueraDeLinea ? ` (Hay ${r.fueraDeLinea} sin conexión.)` : '');
+    } else {
+      msg.textContent = 'Toca el repuesto que vas a instalar:';
+      dispRepuestos = r.disponibles;
+      lista.innerHTML = r.disponibles.map((d, i) => `<div class="row" data-rep="${i}" style="cursor:pointer"><div class="ri">⚡</div><div class="rt"><div class="a">${esc(d.nombre || 'Sin nombre en la app de Shelly')}</div><div class="b">${d.gen ? 'Gen' + d.gen : 'Generación sin informar'} · ${esc(d.modelo || '')} · ID …${esc(d.id.slice(-6))}</div></div><div class="tags"><span class="tag in">En línea</span></div></div>`).join('');
+    }
+  } catch(e){ msg.textContent = e.message || 'No se pudo consultar Shelly Cloud'; }
+  finally { b.disabled = false; }
+}
+let dispRepuestos = [], dispGenSel = null;
+$('#dispLista')?.addEventListener('click', e => {
+  const row = e.target.closest('[data-rep]'); if (!row) return;
+  const d = dispRepuestos[+row.dataset.rep]; if (!d) return;
+  $('#dispId').value = d.id; dispValidado = d.id; dispGenSel = d.gen;
+  $$('#dispLista .row').forEach(x => x.style.outline = ''); row.style.outline = '2px solid var(--gold)';
+  $('#dispSel').textContent = `Seleccionado: ${d.nombre || 'sin nombre'} · ${d.gen ? 'Gen' + d.gen : 'elige la generación abajo'} · …${d.id.slice(-6)}`;
+  $('#dispGenField').classList.toggle('hidden', !!d.gen);
+});
+$('#dispBuscarBtn')?.addEventListener('click', () => buscarRepuestos());
+$('#dispManualBtn')?.addEventListener('click', () => $('#dispManual').classList.toggle('hidden'));
+$('#dispCancelBtn')?.addEventListener('click', () => closeSheet('#dispOverlay'));
+$('#dispOverlay')?.addEventListener('click', e => { if(e.target.id==='dispOverlay') closeSheet('#dispOverlay'); });
+$('#dispId')?.addEventListener('input', () => { dispValidado = null; $('#dispValid').textContent = ''; $('#dispGenField').classList.add('hidden'); });
+$('#dispValidarBtn')?.addEventListener('click', async () => {
+  const id = $('#dispId').value.trim(); $('#dispErr').textContent = '';
+  if (!id){ $('#dispErr').textContent = 'Pega el ID del Shelly nuevo'; return; }
+  const b = $('#dispValidarBtn'); const orig = b.textContent; b.disabled = true; b.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/dispositivos/verificar', { id, puerta: dispPuerta });
+    dispValidado = id;
+    $('#dispValid').innerHTML = r.online
+      ? `✅ Existe y está en línea · ${r.gen ? 'Gen' + r.gen + ' detectado' : 'no informó su generación'}`
+      : '⚠️ Existe pero está FUERA DE LÍNEA: no se podrá asignar hasta que se conecte.';
+    $('#dispGenField').classList.toggle('hidden', !!r.gen);
+  } catch(e){ dispValidado = null; $('#dispValid').textContent = ''; $('#dispErr').textContent = e.message || 'No se pudo validar'; }
+  finally { b.disabled = false; b.textContent = orig; }
+});
+/* Contraseña de nuevo: se reautentica con Firebase y se pide un token fresco (el Worker exige auth_time <= 5 min). */
+async function reautenticarMaster(pass){
+  const u = auth.currentUser;
+  const cred = firebase.auth.EmailAuthProvider.credential(u.email, pass);
+  await u.reauthenticateWithCredential(cred);
+  await u.getIdToken(true);
+}
+$('#dispConfirmBtn')?.addEventListener('click', async () => {
+  if (ME.rol !== 'master' || !dispModo) return;
+  const btn = $('#dispConfirmBtn'); $('#dispErr').textContent = '';
+  const pass = $('#dispPass').value;
+  if (!pass){ $('#dispErr').textContent = 'Escribe tu contraseña'; return; }
+  const id = $('#dispId').value.trim();
+  if (dispModo === 'cambiar'){
+    if (!id){ $('#dispErr').textContent = 'Pega el ID del Shelly nuevo'; return; }
+    if (dispValidado !== id){ $('#dispErr').textContent = 'Primero toca "Validar" con este ID'; return; }
+  }
+  if (btn.dataset.armado !== '1'){   // confirmación en 2 toques
+    btn.dataset.armado = '1'; const t0 = btn.textContent; btn.textContent = '¿Seguro? Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = t0; } }, 5000);
+    return;
+  }
+  btn.dataset.armado = ''; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    try { await reautenticarMaster(pass); }
+    catch(e){ throw new Error('Contraseña incorrecta'); }
+    if (dispModo === 'cambiar'){
+      const body = { puerta: dispPuerta, id };
+      const g = parseInt($('#dispGen').value, 10); if (g) body.genManual = g;
+      const r = await authedFetch('/dispositivos/cambiar', body);
+      toast(`Shelly de ${DISP_NOMBRE[dispPuerta]} cambiado (Gen${r.gen})`, 'ok');
+    } else if (dispModo === 'regresar'){
+      try { await authedFetch('/dispositivos/revertir', dispForzar ? { puerta: dispPuerta, forzar: true } : { puerta: dispPuerta }); toast('Regresó al Shelly anterior', 'ok'); }
+      catch(e){
+        if (e.data && e.data.anteriorFueraDeLinea){
+          // Sin confirm() nativo: se avisa en la hoja y el siguiente intento va con forzar.
+          dispForzar = true;
+          const av = $('#dispAviso'); av.classList.remove('hidden');
+          av.textContent = '⚠️ El Shelly anterior está FUERA DE LÍNEA. Si regresas ahora la puerta podría no abrir. Para regresar de todos modos, vuelve a escribir tu contraseña y confirma otra vez.';
+          throw new Error('Shelly anterior fuera de línea');
+        } else throw e;
+      }
+    } else {
+      await authedFetch('/dispositivos/probar', { puerta: dispPuerta, confirmar: true });
+      toast('Pulso enviado a ' + DISP_NOMBRE[dispPuerta], 'ok');
+    }
+    closeSheet('#dispOverlay');
+    delete dispEstado[dispPuerta];
+    await cargarDispositivos();
+  } catch(e){
+    $('#dispErr').textContent = e.message || 'No se pudo completar';
+  } finally { btn.disabled = false; btn.textContent = dispModo === 'cambiar' ? 'Guardar cambio' : dispModo === 'regresar' ? 'Regresar al anterior' : 'Abrir ahora (prueba)'; }
+});
+
+/* -------- DAR DE BAJA (solo master): motivo obligatorio + confirmación en 2 pasos (mismo botón).
+   El Worker revalida master, motivo y que no sea master/uno mismo; aquí solo se pide. -------- */
+let personaBajaId = null;
+function abrirPersonaBajaSheet(p){
+  personaBajaId = p.id;
+  const fam = esJefeP(p) ? personasCache.filter(x => x.jefeId === p.id && !esBajaP(x)).length : 0;
+  $('#personaBajaInfo').innerHTML = esJefeP(p)
+    ? `<b>${esc(p.domicilio||'')}</b> · ${esc(p.nombre||'')}${fam ? ` · y sus ${fam} familiar(es)` : ''}`
+    : `<b>${esc(p.nombre||'')}</b>${p.domicilio?' · '+esc(p.domicilio):''}`;
+  $('#personaBajaMotivo').value = '';
+  $('#personaBajaErr').textContent = '';
+  const b = $('#personaBajaConfirm'); b.dataset.armado = ''; b.disabled = false; b.textContent = 'Dar de baja';
+  openSheet('#personaBajaOverlay');
+}
+$('#personaBajaCancel')?.addEventListener('click', () => closeSheet('#personaBajaOverlay'));
+$('#personaBajaOverlay')?.addEventListener('click', e => { if(e.target.id==='personaBajaOverlay') closeSheet('#personaBajaOverlay'); });
+$('#personaBajaMotivo')?.addEventListener('input', () => { const b = $('#personaBajaConfirm'); b.dataset.armado = ''; b.textContent = 'Dar de baja'; });
+$('#personaBajaConfirm')?.addEventListener('click', async () => {
+  if (!personaBajaId || ME.rol !== 'master') return;
+  const btn = $('#personaBajaConfirm');
+  const motivo = $('#personaBajaMotivo').value.trim();
+  $('#personaBajaErr').textContent = '';
+  if (motivo.length < 3){ $('#personaBajaErr').textContent = 'Escribe el motivo de la baja'; return; }
+  if (btn.dataset.armado !== '1'){
+    btn.dataset.armado = '1'; btn.textContent = '¿Seguro? Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = 'Dar de baja'; } }, 5000);
+    return;
+  }
+  btn.dataset.armado = ''; btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/personas/baja', { id: personaBajaId, motivo });
+    toast(`Baja registrada (${(r.bajas||[]).length} persona(s))`, 'bad');
+    closeSheet('#personaBajaOverlay');
+    await refrescarPersonas(true);
+  } catch(e){
+    $('#personaBajaErr').textContent = e.message || 'No se pudo dar de baja';
+  } finally { btn.disabled = false; btn.textContent = 'Dar de baja'; }
+});
 
 /* -------- borrado de persona (solo master) — confirmación por MODAL, no confirm nativo.
    El Worker revalida master, bloquea jefe con familiares/pagos y respalda a personas_borradas. -------- */
@@ -3211,7 +3441,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v14';
+const APP_VERSION = 'v16';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
