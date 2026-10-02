@@ -1334,9 +1334,11 @@ $('#dispDiagBtn')?.addEventListener('click', async () => {
   b.disabled = true; b.innerHTML = '<span class="spinner"></span>'; out.classList.remove('hidden'); out.textContent = 'Consultando Shelly Cloud…';
   try {
     const r = await authedFetch('/dispositivos/disponibles', { diagnostico: true });
-    out.textContent = `Consulta correcta.\nDispositivos en la cuenta: ${r.totalCuenta}\nRepuestos EN LÍNEA y sin asignar: ${r.disponibles.length}\n`
-      + (r.disponibles.map(d => `  • ${d.nombre || '(sin nombre)'} · ${d.gen ? 'Gen' + d.gen : 'gen ?'} · ${d.modelo || ''} · …${String(d.id).slice(-6)}`).join('\n') || '  (ninguno)')
-      + `\nSin asignar y fuera de línea: ${r.fueraDeLinea}\n\nFORMA de la respuesta de Shelly Cloud:\n${JSON.stringify(r.forma, null, 1)}`;
+    const etiqueta = c => `  • ${c.nombre || '(sin nombre)'} · ${c.gen ? 'Gen' + c.gen : 'gen ?'} · ${c.modelo || ''} · …${c.id6} · ${c.online ? 'EN LÍNEA' : 'fuera de línea'} · asignado a: ${c.asignadoA ? (DISP_NOMBRE[c.asignadoA] || c.asignadoA) : 'nadie (repuesto)'}\n      criterios → gen: ${c.criterioGen || '?'} · línea: ${c.criterioOnline || '?'}`;
+    out.textContent = `Consulta correcta.\nDispositivos en la cuenta: ${r.totalCuenta}\n` + (r.cuenta || []).map(etiqueta).join('\n')
+      + `\n\nRepuestos EN LÍNEA y sin asignar: ${r.disponibles.length}\nSin asignar y fuera de línea: ${r.fueraDeLinea}`
+      + (r.errorV2 ? `\n(Aviso: la consulta de nombres (v2) falló: ${r.errorV2})` : '')
+      + `\n\nFORMA de /device/all_status (todas las llaves, sin valores):\n${JSON.stringify(r.forma)}\n\nFORMA de /v2/devices/api/get:\n${JSON.stringify(r.formaV2)}`;
   } catch(e){
     out.textContent = 'No se pudo consultar: ' + (e.message || 'error') + (e.data && e.data.forma ? '\n\nFORMA de la respuesta:\n' + JSON.stringify(e.data.forma, null, 1) : '');
   } finally { b.disabled = false; b.textContent = orig; }
@@ -3456,7 +3458,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v17';
+const APP_VERSION = 'v18';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

@@ -27,7 +27,7 @@
 // Lógica de Shelly Cloud (selector Gen1/Gen2+, llamada, triggerShelly) en módulo aparte.
 import { triggerShelly, callShellyOnce, shellyCfg, shellySleep } from './shelly-core.js';
 // Módulo "Dispositivos" (cambiar un Shelly desde la app): lógica pura aparte, igual que shelly-core.
-import { PUERTAS_DISP, idShellyValido, parsearDispositivos, mapaParaTrigger, dispositivoEfectivo, consultarShelly, listarDispositivosCuenta, HISTORIAL_MAX } from './dispositivos-core.js';
+import { PUERTAS_DISP, idShellyValido, parsearDispositivos, mapaParaTrigger, dispositivoEfectivo, consultarShelly, listarDispositivosCuenta, criterioAutoritativo, HISTORIAL_MAX } from './dispositivos-core.js';
 
 // Nombres de puerta válidos. Los IDs reales de cada Shelly YA NO viven en el código (repo
 // público): se leen en tiempo de petición del secret SHELLY_DEVICES vía resolveShellyDevice()
@@ -2360,8 +2360,22 @@ async function disponiblesDispositivos(req, env) {
     return json({ error: msg, codigo: q.error, ...(diagnostico === true && q.forma ? { forma: q.forma } : {}) }, 503);
   }
   const libres = q.dispositivos.filter(x => idShellyValido(x.id) && !asignados.has(x.id.toLowerCase()));
+  // Un repuesto cuyo "en línea" solo viene de una PISTA (all_status devuelve el último estado conocido) se confirma con la consulta
+  // por dispositivo antes de ofrecerlo. Máx. 4 confirmaciones por toque (cada una gasta del límite de 1 req/s).
+  for (const x of libres.filter(x => !criterioAutoritativo(x.criterioOnline)).slice(0, 4)) {
+    const c = await consultarShelly(env, x.id);
+    if (c.existe) { x.online = c.online; x.criterioOnline = 'v1.status'; if (!x.gen && c.gen) { x.gen = c.gen; x.criterioGen = 'v1.status'; } }
+    else { x.online = false; x.criterioOnline = 'sin-confirmar:' + (c.error || '?'); }
+  }
   const disponibles = libres.filter(x => x.online).map(x => ({ id: x.id, nombre: x.nombre, gen: x.gen, modelo: x.modelo }));
-  return json({ ok: true, disponibles, fueraDeLinea: libres.length - disponibles.length, totalCuenta: q.dispositivos.length, ...(diagnostico === true ? { forma: q.forma } : {}) });
+  const extra = diagnostico !== true ? {} : {
+    forma: q.forma, formaV2: q.formaV2, errorV2: q.errorV2,
+    // TODA la cuenta (solo últimos 6 del ID): a qué puerta está asignado cada uno y con qué criterio se decidió generación y línea
+    cuenta: q.dispositivos.map(x => ({ id6: x.id.slice(-6), nombre: x.nombre, gen: x.gen, modelo: x.modelo, online: x.online,
+      criterioGen: x.criterioGen, criterioOnline: x.criterioOnline,
+      asignadoA: PUERTAS_DISP.find(p => (dispositivoEfectivo(d.parsed, env.SHELLY_DEVICES, p)?.id || '').toLowerCase() === x.id.toLowerCase()) || null })),
+  };
+  return json({ ok: true, disponibles, fueraDeLinea: libres.length - disponibles.length, totalCuenta: q.dispositivos.length, ...extra });
 }
 
 /* /dispositivos/verificar — SOLO master. Valida un ID candidato SIN guardar: formato, existencia, línea y generación. */

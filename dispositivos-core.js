@@ -111,12 +111,47 @@ export async function consultarShelly(env, id, { timeoutMs = 6000 } = {}) {
 }
 
 /* ---- Lista de dispositivos de la cuenta (SOLO LECTURA) — para elegir el repuesto sin teclear su ID ----
-   Endpoint usado: POST {SHELLY_HOST}/device/all_status  (form: auth_key, show_info=true)  — Cloud Control API v1,
-   "estado de todos los dispositivos de la cuenta". OJO: la forma exacta de la respuesta NO está verificada contra la
-   nube real (no se consultó). Por eso el parser acepta varias formas y, con diagnostico:true, el Worker devuelve la
-   FORMA (nombres de campos y tipos, sin valores ni llaves) para corregirlo antes de cualquier cambio de ID. */
+   Dos consultas de lectura, manuales y espaciadas (el límite de Shelly Cloud es ~1 req/s por cuenta):
+     1) POST {SHELLY_HOST}/device/all_status  (form: auth_key, show_info=true) — Cloud Control API v1: TODOS los
+        dispositivos de la cuenta y su estado. NO trae el nombre que el usuario le puso en la app de Shelly.
+     2) POST {SHELLY_HOST}/v2/devices/api/get?auth_key=...  (Cloud Control API v2, documentada; máx. 10 ids por petición)
+        con body { ids:[...], select:["settings"], pick:{ settings:["name"] } } — devuelve, por id: id, type, code,
+        gen ("G1"/"G2"/"G3"), online (0|1) y settings.name (el nombre de la app). Si esta consulta falla o un id no
+        aparece (p. ej. un Gen1 que la v2 no cubra), se muestra ID + generación, sin inventar el nombre.
+   La forma EXACTA de las respuestas reales se valida con diagnostico:true (campos y tipos, sin valores/IDs/llaves). */
 const ALL_STATUS_PATH = '/device/all_status';
 const objOrNull = o => (o && typeof o === 'object' && !Array.isArray(o)) ? o : null;
+
+/* Generación por la FORMA del estado (cuando no la informa ningún campo): Gen1 trae wifi_sta/update/inputs;
+   Gen2+ trae sys / "switch:0" / wifi. Gen2 y Gen3 se tratan igual en la nube (API v2): 3 si el modelo es "S3…". */
+export function genPorForma(st, modelo) {
+  const s = objOrNull(st) || {};
+  const gen2 = 'sys' in s || 'switch:0' in s || (objOrNull(s.wifi) && !('wifi_sta' in s));
+  const gen1 = 'wifi_sta' in s || 'inputs' in s || ('update' in s && !('sys' in s));
+  if (gen2 && !gen1) return /^S3/i.test(String(modelo || '')) ? 3 : 2;
+  if (gen1 && !gen2) return 1;
+  return null;
+}
+
+/* ¿En línea?, con el criterio usado (para el diagnóstico). Prioridad:
+   1) online de la API v2 (0|1) — autoritativo; 2) _dev_info.online / online — autoritativos;
+   3) PISTAS cloud.connected (Gen1/Gen2) y ws.connected (Gen2+/Gen3): NO autoritativas (la nube devuelve el último estado
+      conocido aunque el aparato ya esté apagado) => el Worker las confirma con la consulta por dispositivo.
+   wifi_sta.connected / wifi.status / mqtt.connected NO cuentan: WiFi o MQTT sin nube no se puede controlar.
+   Forma REAL observada de all_status (cuenta de La Marquesa, 2026-10-02): Gen1 = _updated, uptime, update, inputs[], mac, wifi_sta…;
+   Gen3 = code, serial, ws, wifi, switch:0, sys, input:0… (sin _dev_info, sin nombre). */
+export const criterioAutoritativo = c => c === 'v2.online' || c === '_dev_info.online' || c === 'online';
+export function enLinea(st, inf, v2) {
+  if (v2 && (v2.online === 0 || v2.online === 1 || typeof v2.online === 'boolean')) return { online: v2.online === 1 || v2.online === true, criterio: 'v2.online' };
+  const di = objOrNull(st && st._dev_info) || objOrNull(inf && inf._dev_info) || {};
+  for (const [c, v] of [['_dev_info.online', di.online], ['online', st && st.online], ['online', inf && inf.online]]) if (v !== undefined) return { online: v === true || v === 1, criterio: c };
+  // PISTAS (no autoritativas): all_status devuelve el ÚLTIMO estado conocido aunque el Shelly ya esté apagado. El Worker
+  // confirma con la consulta por dispositivo antes de ofrecer cualquier repuesto cuyo estado venga solo de una pista.
+  const cc = objOrNull(st && st.cloud), ws = objOrNull(st && st.ws);
+  if (cc && cc.connected !== undefined) return { online: cc.connected === true || cc.connected === 1, criterio: 'pista:cloud.connected' };
+  if (ws && ws.connected !== undefined) return { online: ws.connected === true || ws.connected === 1, criterio: 'pista:ws.connected' };
+  return { online: false, criterio: 'sin-dato' };
+}
 
 export function parsearListaShelly(j) {
   const root = objOrNull(j && j.data) || objOrNull(j) || {};
@@ -130,50 +165,92 @@ export function parsearListaShelly(j) {
   for (const id of ids) {
     const st = objOrNull(estados[id]) || {}, inf = objOrNull(mapaInfos[id]) || {};
     const di = objOrNull(st._dev_info) || objOrNull(inf._dev_info) || {};
-    const flags = [st._dev_info && st._dev_info.online, st.online, inf.online, di.online, st.cloud && st.cloud.connected].filter(v => v !== undefined);
-    const online = flags.length ? (flags[0] === true || flags[0] === 1) : false;
-    const nombre = [inf.name, inf.device_name, di.name, st.name].find(v => typeof v === 'string' && v.trim()) || null;
-    const gen = genDesdeInfo(di) ?? genDesdeInfo(inf) ?? null;
     const modelo = [di.code, inf.code, inf.type, st.code].find(v => typeof v === 'string' && v) || null;
-    out.push({ id: String(di.id || inf.id || id), nombre, gen, modelo, online });
+    const nombre = [inf.name, inf.device_name, di.name, st.name].find(v => typeof v === 'string' && v.trim()) || null;
+    let gen = genDesdeInfo(di) ?? genDesdeInfo(inf), criterioGen = gen ? 'campo-gen' : null;
+    if (!gen) { gen = genPorForma(st, modelo); criterioGen = gen ? 'forma' : null; }
+    const l = enLinea(st, inf, null);
+    out.push({ id: String(di.id || inf.id || id), nombre, gen, modelo, online: l.online, criterioOnline: l.criterio, criterioGen });
   }
   return out;
 }
 
-/* Estructura de la respuesta (tipos y nombres de campos hasta 5 niveles; NUNCA valores) para depurar el parser. */
+/* Estructura de la respuesta (nombres de campos y tipos; NUNCA valores) para depurar el parser. Lista TODAS las llaves
+   (tope de seguridad 400 por objeto y 6 niveles). Las llaves que parecen ids de dispositivo se anonimizan. */
 export function formaDe(v, depth = 0) {
-  if (Array.isArray(v)) return depth >= 5 ? 'array' : { _array: v.length, _item: v.length ? formaDe(v[0], depth + 1) : null };
+  if (Array.isArray(v)) return depth >= 6 ? 'array' : { _array: v.length, _item: v.length ? formaDe(v[0], depth + 1) : null };
   if (v && typeof v === 'object') {
-    if (depth >= 5) return 'objeto';
-    const ks = Object.keys(v), muestra = ks.slice(0, 12), o = {};
-    // las llaves que parecen ids de dispositivo (hex) se normalizan para no exponerlos
+    if (depth >= 6) return 'objeto';
+    const ks = Object.keys(v), muestra = ks.slice(0, 400), o = {};
     muestra.forEach((k, i) => { o[/^[0-9a-f]{6,16}$/i.test(k) ? '<id-' + i + '>' : k] = formaDe(v[k], depth + 1); });
-    if (ks.length > 12) o['…'] = ks.length - 12 + ' más';
+    if (ks.length > 400) o['…'] = ks.length - 400 + ' más';
     return o;
   }
   return v === null ? 'null' : typeof v;
 }
 
-/* -> { ok, dispositivos, forma, error } ; nunca lanza ni devuelve la llave. */
-export async function listarDispositivosCuenta(env, { timeoutMs = 8000 } = {}) {
-  if (!env.SHELLY_HOST || !env.SHELLY_AUTH_KEY) return { ok: false, dispositivos: [], forma: null, error: 'sin-credenciales' };
+async function peticionShelly(env, ruta, init, timeoutMs) {
   const espera = ultimaConsulta + Number(env.SHELLY_STATUS_SPACING_MS ?? ESPACIO_DEF_MS) - Date.now();
   if (espera > 0) await dormir(espera);
   ultimaConsulta = Date.now();
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const r = await fetch(`${env.SHELLY_HOST}${ALL_STATUS_PATH}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ auth_key: env.SHELLY_AUTH_KEY, show_info: 'true' }), signal: ctrl.signal,
-    });
+    const r = await fetch(`${env.SHELLY_HOST}${ruta}`, { ...init, signal: ctrl.signal });
     const txt = await r.text().catch(() => '');
-    if (r.status === 429 || /max_req/i.test(txt)) return { ok: false, dispositivos: [], forma: null, error: 'limite' };
     let j = null; try { j = JSON.parse(txt); } catch (e) { /* no JSON */ }
-    if (!r.ok || !j) return { ok: false, dispositivos: [], forma: null, error: 'respuesta' };
-    if (j.isok === false) return { ok: false, dispositivos: [], forma: formaDe(j), error: 'rechazado' };
-    return { ok: true, dispositivos: parsearListaShelly(j), forma: formaDe(j), error: null };
-  } catch (e) {
-    return { ok: false, dispositivos: [], forma: null, error: ctrl.signal.aborted ? 'timeout' : 'red' };
-  } finally { clearTimeout(timer); }
+    return { status: r.status, j, limitado: r.status === 429 || /max_req/i.test(txt) };
+  } catch (e) { return { error: ctrl.signal.aborted ? 'timeout' : 'red' }; }
+  finally { clearTimeout(timer); }
+}
+
+/* Nombres/estado/generación por la API v2 (máx. 10 ids por petición). -> { mapa: Map(id -> {nombre, gen, online, modelo}), forma, error } */
+export async function consultarV2(env, ids, { timeoutMs = 8000 } = {}) {
+  const mapa = new Map(); let forma = null, error = null;
+  for (let i = 0; i < ids.length; i += 10) {
+    const r = await peticionShelly(env, `/v2/devices/api/get?auth_key=${encodeURIComponent(env.SHELLY_AUTH_KEY)}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids: ids.slice(i, i + 10), select: ['settings'], pick: { settings: ['name'] } }),
+    }, timeoutMs);
+    if (r.error || r.limitado || !r.j) { error = r.error || (r.limitado ? 'limite' : 'respuesta'); continue; }
+    forma = forma || formaDe(r.j);
+    const lista = Array.isArray(r.j) ? r.j : (Array.isArray(r.j.data) ? r.j.data : []);
+    for (const it of lista) {
+      if (!it || typeof it.id !== 'string') continue;
+      const nombre = it.settings && typeof it.settings.name === 'string' && it.settings.name.trim() ? it.settings.name.trim() : null;
+      mapa.set(it.id.toLowerCase(), { nombre, gen: genDesdeInfo(it), online: it.online, modelo: typeof it.code === 'string' ? it.code : null });
+    }
+  }
+  return { mapa, forma, error };
+}
+
+/* -> { ok, dispositivos, forma, formaV2, errorV2, error } ; nunca lanza ni devuelve la llave. */
+export async function listarDispositivosCuenta(env, { timeoutMs = 8000 } = {}) {
+  if (!env.SHELLY_HOST || !env.SHELLY_AUTH_KEY) return { ok: false, dispositivos: [], forma: null, error: 'sin-credenciales' };
+  const r = await peticionShelly(env, ALL_STATUS_PATH, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({ auth_key: env.SHELLY_AUTH_KEY, show_info: 'true' }),
+  }, timeoutMs);
+  if (r.error) return { ok: false, dispositivos: [], forma: null, error: r.error };
+  if (r.limitado) return { ok: false, dispositivos: [], forma: null, error: 'limite' };
+  if (r.status < 200 || r.status >= 300 || !r.j) return { ok: false, dispositivos: [], forma: null, error: 'respuesta' };
+  if (r.j.isok === false) return { ok: false, dispositivos: [], forma: formaDe(r.j), error: 'rechazado' };
+  const dispositivos = parsearListaShelly(r.j);
+  const forma = formaDe(r.j);
+  // Enriquecer con la API v2: nombre de la app, generación ("G1/G2/G3") y online (0|1) — autoritativos si están.
+  const estados = objOrNull(objOrNull(r.j.data) ? r.j.data.devices_status : r.j.devices_status) || {};
+  let formaV2 = null, errorV2 = null;
+  if (dispositivos.length) {
+    const v2 = await consultarV2(env, dispositivos.map(d => d.id), { timeoutMs });
+    formaV2 = v2.forma; errorV2 = v2.error;
+    for (const d of dispositivos) {
+      const x = v2.mapa.get(d.id.toLowerCase()); if (!x) continue;
+      if (x.nombre) d.nombre = x.nombre;
+      if (x.gen) { d.gen = x.gen; d.criterioGen = 'v2.gen'; }
+      if (x.modelo && !d.modelo) d.modelo = x.modelo;
+      const l = enLinea(objOrNull(estados[d.id]) || {}, null, x);
+      if (l.criterio === 'v2.online') { d.online = l.online; d.criterioOnline = 'v2.online'; }
+    }
+  }
+  return { ok: true, dispositivos, forma, formaV2, errorV2, error: null };
 }

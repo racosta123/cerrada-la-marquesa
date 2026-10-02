@@ -8,7 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createSign } from 'node:crypto';
 import worker from '../worker.js';
-import { parsearListaShelly, formaDe } from '../dispositivos-core.js';
+import { parsearListaShelly, formaDe, criterioAutoritativo } from '../dispositivos-core.js';
 
 // ---------- llaves de prueba ----------
 const dir = mkdtempSync(join(tmpdir(), 'mqd-')); const sh = c => execSync(c, { cwd: dir, stdio: 'pipe' });
@@ -35,7 +35,7 @@ const base = `/v1/projects/${PROJ}/databases/(default)/documents`;
 const docOut = (path, fields) => ({ name: `projects/${PROJ}/databases/(default)/documents/${path}`, fields, updateTime: ut.get(path) });
 // ---------- Shelly Cloud simulado ----------
 const shellyDevices = new Map();   // id -> { gen: 'G1'|'G2'|'G3'|undefined, online }
-let shellyCalls = [], shellyMode = 'normal';
+let shellyCalls = [], shellyMode = 'normal', shellyForma = 'dev_info', shellyV2 = true;
 const gateCalls = [];
 const dormir = ms => new Promise(r => setTimeout(r, ms));
 globalThis.fetch = async (url, opts = {}) => {
@@ -56,9 +56,24 @@ globalThis.fetch = async (url, opts = {}) => {
       shellyCalls.push({ tipo: 'lista' });
       if (shellyMode === 'red') throw new Error('red');
       if (shellyMode === 'rechazo') return R({ isok: false, errors: { invalid_token: 'x' } });
+      if (shellyForma === 'real') {
+        const st = {};
+        for (const [id, d] of shellyDevices) {
+          const gen1 = d.gen === 'G1', cloudOk = d.cloudMiente ? true : d.online;
+          st[id] = gen1 ? { wifi_sta: { connected: true }, update: { status: 'idle' }, inputs: [{ input: 0 }], cloud: { enabled: true, connected: cloudOk }, _updated: '2026-10-02 07:00:00' }
+                        : { sys: { mac: 'X' }, 'switch:0': { output: false }, wifi: { status: 'got ip' }, cloud: { connected: cloudOk }, _updated: '2026-10-02 07:00:00' };
+        }
+        return R({ isok: true, data: { devices_status: st } });
+      }
       const st = {}, inf = {};
       for (const [id, d] of shellyDevices) { st[id] = { _dev_info: { id, online: d.online, ...(d.gen ? { gen: d.gen } : {}), code: d.modelo || 'SHSW-1' } }; if (d.nombre) inf[id] = { name: d.nombre }; }
       return R({ isok: true, data: { devices_status: st, devices: inf } });
+    }
+    if (u.pathname === '/v2/devices/api/get') {
+      const body = JSON.parse(opts.body); shellyCalls.push({ tipo: 'v2', body });
+      if (shellyV2 === false) return R({}, 404);
+      if (shellyV2 === 'falla') throw new Error('red');
+      return R(body.ids.filter(id => shellyDevices.has(id) && !shellyDevices.get(id).sinV2).map(id => { const d = shellyDevices.get(id); return { id, type: 'relay', code: d.modelo || 'SHSW-1', gen: d.gen, online: d.online ? 1 : 0, settings: d.nombre ? { name: d.nombre } : {} }; }));
     }
     if (u.pathname === '/device/relay/control') { const p = new URLSearchParams(String(opts.body)); shellyCalls.push({ tipo: 'pulso', gen: 1, id: p.get('id') }); return new Response('ok'); }
     if (u.pathname === '/v2/devices/api/set/switch') { shellyCalls.push({ tipo: 'pulso', gen: 3, id: JSON.parse(opts.body).id }); return new Response('ok'); }
@@ -99,7 +114,7 @@ const pulsos = () => shellyCalls.filter(c => c.tipo === 'pulso');
 
 const reset = () => {
   skew += 120000;   // vence la caché del Worker (TTL 30 s)
-  store.clear(); ut.clear(); shellyCalls = []; gateCalls.length = 0; reads = { disp: 0 }; failDisp = 0; slowDisp = 0; force412 = false; shellyMode = 'normal';
+  store.clear(); ut.clear(); shellyCalls = []; gateCalls.length = 0; reads = { disp: 0 }; failDisp = 0; slowDisp = 0; force412 = false; shellyMode = 'normal'; shellyForma = 'dev_info'; shellyV2 = true;
   env = envBase();
   shellyDevices.clear();
   for (const id of ['aaaaaaaaaaaa', 'bbbbbbbbbbbb', 'cccccccccccc']) shellyDevices.set(id, { gen: id === 'bbbbbbbbbbbb' ? 'G3' : 'G1', online: true });
@@ -312,6 +327,90 @@ await t('parser tolerante: arreglo de dispositivos, solo estados y basura', asyn
   assert.deepEqual(parsearListaShelly({ data: { devices_status: { '1a2b3c4d5e6f': { cloud: { connected: false } } } } }).map(d => [d.id, d.online]), [['1a2b3c4d5e6f', false]]);
   for (const basura of [null, 5, 'x', [], {}, { data: 5 }, { data: { devices: 5, devices_status: [] } }]) assert.deepEqual(parsearListaShelly(basura), []);
   assert.ok(!JSON.stringify(formaDe({ data: { devices_status: { abcdef123456: { a: 1 } } } })).includes('abcdef123456'));
+});
+
+console.log('\n[6] Forma REAL de la cuenta (2 Gen1 + 1 Gen3 asignados): generación por forma, nombres por API v2, en línea por v2/cloud');
+const cuentaReal = () => {   // aaaa=Gen1 residentes, cccc=Gen1 peatones, bbbb=Gen3 visitantes, ya asignados por el secret
+  shellyForma = 'real'; shellyV2 = true;
+  shellyDevices.clear();
+  shellyDevices.set('aaaaaaaaaaaa', { gen: 'G1', online: true, nombre: 'RESIDENTES' });
+  shellyDevices.set('cccccccccccc', { gen: 'G1', online: true, nombre: 'PEATONAL' });
+  shellyDevices.set('bbbbbbbbbbbb', { gen: 'G3', online: true, nombre: 'VISITAS', modelo: 'S3SW-001X16EU' });
+};
+await t('3 en la cuenta, los 3 asignados: 0 repuestos; la generación sale por la FORMA (Gen1 wifi_sta/update/inputs; Gen2+ sys/switch:0/wifi) y el criterio queda a la vista', async () => {
+  cuentaReal(); shellyV2 = false;   // sin la v2: solo forma
+  const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true }); assert.equal(r.status, 200);
+  assert.equal(r.body.totalCuenta, 3); assert.deepEqual(r.body.disponibles, []);
+  const por = Object.fromEntries(r.body.cuenta.map(c => [c.id6, c]));
+  assert.deepEqual([por['aaaaaa'].gen, por['cccccc'].gen, por['bbbbbb'].gen], [1, 1, 2], 'solo por forma: Gen2+ se reporta como 2 (se opera igual que Gen3); la v2 lo afina a G3');
+  assert.ok(['aaaaaa', 'cccccc', 'bbbbbb'].every(k => por[k].criterioGen === 'forma'));
+  assert.deepEqual([por['aaaaaa'].asignadoA, por['cccccc'].asignadoA, por['bbbbbb'].asignadoA], ['residentes', 'peatones', 'visitantes']);
+  assert.ok(r.body.cuenta.every(c => c.online && c.criterioOnline === 'pista:cloud.connected'), 'sin v2 el estado es solo una PISTA');
+});
+await t('con la API v2 la generación se afina: el Gen3 queda como 3 (criterio v2.gen)', async () => {
+  cuentaReal();
+  const c = (await call('/dispositivos/disponibles', 'uM', { diagnostico: true })).body.cuenta.find(x => x.id6 === 'bbbbbb'); assert.deepEqual([c.gen, c.criterioGen], [3, 'v2.gen']);
+});
+await t('API v2: trae el NOMBRE de la app de Shelly, la generación G1/G3 y online 0/1 (autoritativos)', async () => {
+  cuentaReal(); shellyDevices.set('dddddddddddd', { gen: 'G1', online: true, nombre: 'REPUESTO 1' });
+  const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
+  assert.deepEqual(r.body.disponibles.map(d => [d.nombre, d.gen]), [['REPUESTO 1', 1]]);
+  const v2 = shellyCalls.filter(c => c.tipo === 'v2'); assert.equal(v2.length, 1); assert.deepEqual(v2[0].body.select, ['settings']); assert.deepEqual(v2[0].body.pick, { settings: ['name'] }); assert.ok(v2[0].body.ids.length <= 10);
+  assert.ok(r.body.cuenta.every(c => c.criterioOnline === 'v2.online' && c.nombre));
+  assert.ok(!JSON.stringify(r.body).includes('LLAVE_TEST'));
+});
+await t('un Gen1 que la v2 no devuelve: se muestra sin nombre (ID + generación por forma), sin inventar', async () => {
+  cuentaReal(); shellyDevices.set('dddddddddddd', { gen: 'G1', online: true, nombre: 'REPUESTO 1', sinV2: true });
+  const d = (await call('/dispositivos/disponibles', 'uM')).body.disponibles[0]; assert.deepEqual([d.id, d.nombre, d.gen], ['dddddddddddd', null, 1]);
+});
+await t('en línea: la v2 (online 0) manda sobre cloud.connected; sin v2 se usa cloud.connected', async () => {
+  cuentaReal(); shellyDevices.set('dddddddddddd', { gen: 'G1', online: false, nombre: 'REPUESTO 1', cloudMiente: true });   // cloud.connected=true pero v2.online=0
+  let r = await call('/dispositivos/disponibles', 'uM'); assert.deepEqual(r.body.disponibles, []); assert.equal(r.body.fueraDeLinea, 1);
+  skew += 20000; shellyV2 = false; r = await call('/dispositivos/disponibles', 'uM'); assert.deepEqual(r.body.disponibles, [], 'la pista dice en línea pero la consulta por dispositivo dice que NO: no se ofrece');
+  skew += 20000; shellyDevices.set('dddddddddddd', { gen: 'G1', online: true, nombre: 'R' }); r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
+  assert.equal(r.body.disponibles.length, 1); assert.equal(r.body.cuenta.find(c => c.id6 === 'dddddd').criterioOnline, 'v1.status');
+});
+await t('la v2 caída NO rompe la lista: sigue con ID + generación por forma y avisa en el diagnóstico', async () => {
+  cuentaReal(); shellyDevices.set('dddddddddddd', { gen: 'G1', online: true, nombre: 'REPUESTO 1' }); shellyV2 = 'falla';
+  const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true }); assert.equal(r.status, 200); assert.equal(r.body.disponibles.length, 1); assert.equal(r.body.disponibles[0].nombre, null); assert.ok(r.body.errorV2);
+});
+await t('diagnóstico amplio: lista TODAS las llaves (sin el "N más"), sin valores ni IDs', async () => {
+  cuentaReal(); const r = await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
+  const txt = JSON.stringify(r.body.forma); assert.ok(!txt.includes('más') && txt.includes('wifi_sta') && txt.includes('switch:0') && txt.includes('cloud'));
+  assert.ok(!/aaaaaaaaaaaa|bbbbbbbbbbbb|cccccccccccc|LLAVE_TEST|RESIDENTES|VISITAS/.test(txt + JSON.stringify(r.body.formaV2)), 'sin ids ni nombres ni llaves en las formas');
+});
+await t('nada se escribe: ni documento ni bitácora ni pulsos', async () => {
+  cuentaReal(); await call('/dispositivos/disponibles', 'uM', { diagnostico: true });
+  assert.equal(store.has('config/dispositivos'), false); assert.equal(pulsos().length, 0); assert.ok(![...store.keys()].some(k => k.startsWith('aperturas/')));
+});
+
+const respuestaReal = (conCloud) => ({ isok: true, data: { devices_status: {
+  '34945479a1b2': { _updated: '2026-10-02 07:00:00', uptime: 10, update: { status: 'idle', has_update: false, new_version: 'x', old_version: 'y', beta_version: 'z' }, inputs: [{ input: 0 }], unixtime: 1, mqtt: { connected: false }, ext_sensors: {}, mac: 'AA', cfg_changed_cnt: 0, wifi_sta: { connected: true, ssid: 's', ip: '1.1.1.1', rssi: -50 }, actions_stats: { skipped: 0 }, ext_temperature: {}, ...(conCloud ? { cloud: { enabled: true, connected: true } } : {}) },
+  'e8d1a2b3c4d5': { code: 'S3SW-001X16EU', serial: 1, _updated: '2026-10-02 07:00:00', ws: { connected: true }, wifi: { sta_ip: '1.1.1.2', status: 'got ip', ssid: 's', rssi: -40 }, 'switch:0': { id: 0, source: 'x', output: false, temperature: { tC: 30 } }, ble: {}, mqtt: { connected: false }, 'input:0': { id: 0, state: false }, ts: 1, sys: { mac: 'BB', restart_required: false, time: '00:00', unixtime: 1, uptime: 1, ram_size: 1, ram_free: 1, fs_size: 1, fs_free: 1, cfg_rev: 1, kvs_rev: 0, schedule_rev: 0 }, 'v_eve:0': { ev: 'x', ttl: 1, id: 0 } },
+  'aabbccddeeff': { _updated: '2026-10-02 07:00:00', uptime: 10, update: { status: 'idle', has_update: false }, inputs: [{ input: 0 }], unixtime: 1, mac: 'CC', wifi_sta: { connected: true, ssid: 's', ip: '1.1.1.3', rssi: -60 } },
+}, pending_notifications: {} } });
+await t('RESPUESTA REAL de la cuenta (pegada por McRub): 3 dispositivos, 2 Gen1 por forma y 1 Gen3 por forma+code S3SW; sin cloud/online visibles => "sin-dato", NO se inventa', async () => {
+  for (const conCloud of [false, true]) {
+    const l = parsearListaShelly(respuestaReal(conCloud)); assert.equal(l.length, 3);
+    const por = Object.fromEntries(l.map(d => [d.id, d]));
+    assert.deepEqual([por['34945479a1b2'].gen, por['e8d1a2b3c4d5'].gen, por['aabbccddeeff'].gen], [1, 3, 1]);
+    assert.equal(por['e8d1a2b3c4d5'].modelo, 'S3SW-001X16EU'); assert.ok(l.every(d => d.nombre === null), 'all_status no trae nombres');
+    assert.equal(por['e8d1a2b3c4d5'].criterioOnline, 'pista:ws.connected');
+    assert.equal(por['aabbccddeeff'].criterioOnline, 'sin-dato');   // sin cloud ni online: desconocido, no "en línea"
+    assert.equal(por['34945479a1b2'].criterioOnline, conCloud ? 'pista:cloud.connected' : 'sin-dato');
+    assert.ok(l.every(d => !criterioAutoritativo(d.criterioOnline)), 'ninguno es autoritativo => el Worker confirma');
+  }
+});
+await t('con la forma real y 3 asignados: "Dispositivos en la cuenta: 3 · Repuestos: 0"; un 4º Gen1 encendido se ofrece SOLO tras confirmar su línea con la consulta por dispositivo', async () => {
+  shellyForma = 'real'; shellyV2 = false;
+  shellyDevices.clear();
+  shellyDevices.set('aaaaaaaaaaaa', { gen: 'G1', online: true }); shellyDevices.set('cccccccccccc', { gen: 'G1', online: true }); shellyDevices.set('bbbbbbbbbbbb', { gen: 'G3', online: true, modelo: 'S3SW-001X16EU' });
+  let r = await call('/dispositivos/disponibles', 'uM'); assert.equal(r.body.totalCuenta, 3); assert.deepEqual(r.body.disponibles, []);
+  assert.equal(shellyCalls.filter(c => c.tipo === 'status').length, 0, 'los asignados no gastan consultas de confirmación');
+  skew += 20000; shellyDevices.set('dddddddddddd', { gen: 'G1', online: true });
+  r = await call('/dispositivos/disponibles', 'uM'); assert.deepEqual(r.body.disponibles.map(d => d.id), ['dddddddddddd']); assert.equal(shellyCalls.filter(c => c.tipo === 'status').length, 1);
+  skew += 20000; shellyDevices.set('dddddddddddd', { gen: 'G1', online: false });
+  r = await call('/dispositivos/disponibles', 'uM'); assert.deepEqual(r.body.disponibles, []); assert.equal(r.body.fueraDeLinea, 1);
 });
 
 console.log(`\n${pass} pruebas OK`);
