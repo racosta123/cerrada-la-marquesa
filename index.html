@@ -519,11 +519,17 @@
 
   <!-- TAB: ADMIN (master/admin) — Personas (FASE 6.5): padrón unificado -->
   <div id="tab-admin" class="tabpane hidden">
+    <div id="pendSection" class="hidden">
+      <div class="section-title">Pendientes de activar <span class="tag" id="pendCount">0</span></div>
+      <div class="list" id="pendList"></div>
+    </div>
     <div class="section-title">Personas</div>
     <div class="list">
       <button class="btn-primary" id="newPersonaBtn" style="margin-top:0">Alta de persona</button>
+      <button class="btn-ghost" id="refreshPersonasBtn" style="width:100%;margin-top:8px">↻ Actualizar</button>
     </div>
     <div class="field"><input id="personaSearch" placeholder="Buscar por nombre, domicilio o teléfono…"></div>
+    <div id="personasErr" class="vbanner hidden" style="margin:0 0 10px"></div>
     <div class="list" id="personasList"><div class="empty">Cargando…</div></div>
 
     <!-- Configuración de cobranza — cuota/fecha: staff (master/admin/jefe-admin). Link de pago: SOLO master (#ccLinkField, oculto al resto) -->
@@ -617,6 +623,7 @@
     </div>
     <div class="field" id="peDomField"><label>Domicilio</label><input id="peDom" placeholder="Ej. Ajoya 12"></div>
     <p id="peHint" style="font-size:12px;color:var(--muted-2);line-height:1.5;margin:0 0 14px 2px">La cuenta de acceso la crea la propia persona al registrarse con la invitación. Aquí no se captura correo ni contraseña.</p>
+    <div id="peDupWarn" class="vbanner hidden" style="margin:0 0 10px"></div>
     <button class="btn-primary" id="savePersonaBtn">Guardar</button>
     <button class="btn-ghost hidden" id="delPersonaBtn" style="width:100%;margin-top:10px;color:var(--bad);border-color:rgba(248,113,113,.4)">Borrar persona</button>
     <div id="peErr" class="err"></div>

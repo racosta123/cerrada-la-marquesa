@@ -65,9 +65,10 @@ async function authedFetch(path, body){
   } catch(e){}
   const res = await fetch(WORKER + path, { method:'POST', headers, body: JSON.stringify(body||{}) });
   if (!res.ok){
-    let m = 'Error '+res.status;
-    try { m = (await res.json()).error || m; } catch(e){}
-    throw new Error(m);
+    let m = 'Error '+res.status, data = null;
+    try { data = await res.json(); m = data.error || m; } catch(e){}
+    const err = new Error(m); err.status = res.status; err.data = data;
+    throw err;
   }
   return res.json().catch(()=> ({}));
 }
@@ -251,6 +252,7 @@ function switchTab(id, btn){
   if (id !== 'votaciones' && votUnsub){ votUnsub(); votUnsub = null; }
   if (id === 'finanzas') resizeFinCharts();
   if (id === 'votaciones') loadVotaciones();
+  if (id === 'admin') refrescarGestion();   // padrón al día cada vez que se abre Gestión
 }
 
 /* ====================== PUERTAS ====================== */
@@ -733,20 +735,105 @@ function esJefeP(p){ return p.rol === 'residente' && !p.jefeId; }
    usan el conteo del Worker (todas las casas). */
 function jefes(){ return personasCache.filter(esJefeP); }
 
+let personasError = '';   // texto del último fallo de /personas/listar ('' = sin error)
 async function cargarPersonas(){
   try {
     const r = await authedFetch('/personas/listar', {});
     personasCache = Array.isArray(r.personas) ? r.personas : [];
-  } catch(e){ console.error('cargarPersonas', e); personasCache = []; }
+    personasError = '';
+  } catch(e){
+    // No se vacía la lista en silencio: se conserva lo último bueno y se avisa con Reintentar.
+    console.error('cargarPersonas', e);
+    personasError = (e && e.message) || 'No se pudo cargar';
+  }
 }
 /* recarga el padrón y refresca TODO lo que depende de él: la lista y, si Finanzas ya se
    pintó, la cobranza (termómetro + listas pagaron/sin pago, conteo del Worker). */
-async function refrescarPersonas(){
-  await cargarPersonas();
+async function refrescarPersonas(sinCobranza){
+  await Promise.all([cargarPersonas(), cargarPendientes()]);
   renderPersonas();
-  if (finMonths.length) cargarCobranza();
+  renderPendientes();
+  if (!sinCobranza && finMonths.length) cargarCobranza();
 }
 async function loadPersonas(){ await refrescarPersonas(); }
+/* Gestión: una sola carga por apertura/clic. Si ya hay una en vuelo se reutiliza (sin cadenas). */
+let gestionCargando = null;
+function refrescarGestion(){
+  if (gestionCargando) return gestionCargando;
+  const btn = $('#refreshPersonasBtn'); if (btn) btn.disabled = true;
+  gestionCargando = refrescarPersonas(true).finally(() => { gestionCargando = null; if (btn) btn.disabled = false; });
+  return gestionCargando;
+}
+$('#refreshPersonasBtn')?.addEventListener('click', () => refrescarGestion());
+
+/* -------- Pendientes de activar: altas sin cuenta (staff). El Worker decide todo; aquí solo se pinta. -------- */
+let pendientesCache = [];
+let pendientesError = '';
+async function cargarPendientes(){
+  try {
+    const r = await authedFetch('/personas/pendientes', {});
+    pendientesCache = Array.isArray(r.pendientes) ? r.pendientes : [];
+    pendientesError = '';
+  } catch(e){
+    console.error('cargarPendientes', e);
+    pendientesError = (e && e.message) || 'No se pudo cargar';
+  }
+}
+const fmtPend = iso => iso ? new Date(iso).toLocaleString('es-MX', { timeZone:'America/Hermosillo', day:'numeric', month:'short', hour:'2-digit', minute:'2-digit' }) : '—';
+function renderPendientes(){
+  const sec = $('#pendSection'); if (!sec) return;
+  const lista = $('#pendList');
+  $('#pendCount').textContent = String(pendientesCache.length);
+  if (pendientesError){
+    sec.classList.remove('hidden');
+    lista.innerHTML = `<div class="empty">No se pudieron cargar los pendientes (${esc(pendientesError)}). <button class="row-act" data-act="reintentar-pend">Reintentar</button></div>`;
+    return;
+  }
+  sec.classList.toggle('hidden', !pendientesCache.length);
+  lista.innerHTML = pendientesCache.map(p => {
+    const esAdm = p.rol === 'admin';
+    const titulo = esAdm ? p.nombre : (p.domicilio || p.nombre);
+    const liga = p.liga.estado === 'viva' ? `liga viva hasta ${fmtPend(p.liga.expiraEn)}`
+      : p.liga.estado === 'vencida' ? `liga vencida (${fmtPend(p.liga.expiraEn)})` : 'sin liga';
+    const sub = (esAdm ? 'Administrador' : p.nombre) + ` · alta por ${p.creadoPorNombre || '—'} · ${fmtPend(p.creadoEn)} · ${liga}`;
+    let acts = '';
+    if (p.estado !== 'suspendido') acts += `<button class="row-act" data-act="reenviar" data-id="${p.id}">📲 Reenviar liga</button>`;
+    if (!esAdm || ME.rol === 'master') acts += `<button class="row-act danger" data-act="cancelar-alta" data-id="${p.id}">Cancelar alta</button>`;
+    return `<div class="row${p.duplicadoEstado==='activa'?' alerta':''}"><div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
+      + `<div class="rt"><div class="a">${esc(titulo)}</div><div class="b">${esc(sub)}</div></div>`
+      + `<div class="tags"><span class="tag${p.liga.estado==='viva'?' in':''}">${p.liga.estado==='viva'?'Liga viva':p.liga.estado==='vencida'?'Vencida':'Sin liga'}</span></div></div>`
+      + (acts ? `<div class="persona-acts">${acts}</div>` : '');
+  }).join('');
+}
+$('#pendList')?.addEventListener('click', async e => {
+  const b = e.target.closest('[data-act]'); if (!b) return;
+  if (b.dataset.act === 'reintentar-pend'){ refrescarGestion(); return; }
+  const p = pendientesCache.find(x => x.id === b.dataset.id); if (!p) return;
+  if (b.dataset.act === 'reenviar'){
+    await invitarPersona(p, b);
+    await cargarPendientes(); renderPendientes();   // la liga nueva cambia el estado
+  } else if (b.dataset.act === 'cancelar-alta'){
+    cancelarAltaPendiente(p, b);
+  }
+});
+/* Cancelar alta: confirmación en 2 pasos (mismo patrón que "Revisado"); el Worker revalida todo. */
+async function cancelarAltaPendiente(p, btn){
+  if (btn.dataset.armado !== '1'){
+    btn.dataset.armado = '1'; btn.textContent = '¿Seguro? Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = 'Cancelar alta'; } }, 4000);
+    return;
+  }
+  btn.dataset.armado = '';
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/personas/alta-cancelar', { id: p.id });
+    toast(`Alta cancelada: ${p.nombre}`, 'ok');
+    await refrescarPersonas(true);
+  } catch(e){
+    toast(e.message || 'No se pudo cancelar el alta', 'bad');
+    btn.disabled = false; btn.textContent = 'Cancelar alta';
+  }
+}
 
 /* ====================== CONFIGURACIÓN DE COBRANZA (cuota/fecha: staff · link: SOLO master) ==
    Pantalla en Gestión que solo LLAMA a /config/cobranza (leer) y /config/cobranza-actualizar
@@ -855,6 +942,13 @@ $('#susAplicarBtn')?.addEventListener('click', () => ejecutarSuspensionAutomatic
 /* -------- lista agrupada por casa: jefe + sus familiares anidados; admins aparte -------- */
 function renderPersonas(){
   const list = $('#personasList');
+  const eb = $('#personasErr');
+  if (eb){
+    eb.classList.toggle('hidden', !personasError);
+    eb.innerHTML = personasError
+      ? `⚠️ No se pudo cargar el padrón (${esc(personasError)})${personasCache.length ? ' — se muestra la última lista cargada.' : '.'} <button class="row-act" id="personasRetryBtn">Reintentar</button>` : '';
+  }
+  if (personasError && !personasCache.length){ list.innerHTML = ''; return; }
   const raw = $('#personaSearch').value.trim();
   const q = normDom(raw);
   const match = p => !q || normDom(p.nombre).includes(q)
@@ -939,11 +1033,18 @@ function personaRow(p){
       + `${alFam.dadoDeAltaNombre ? ' · dado de alta por ' + esc(alFam.dadoDeAltaNombre) : ''}</div>` : '';
   if (alFam) acts = `<button class="row-act" data-act="revisar-alerta" data-id="${p.id}">✓ Revisado, es correcto</button>` + acts;
 
-  return `<div class="row${alFam ? ' alerta' : ''}">`
+  // Alta con teléfono o nombre ya existentes (confirmada por el staff): en rojo hasta que el comité la revise.
+  const dup = p.duplicadoEstado === 'activa';
+  const dupLine = dup
+    ? `<div class="mov-liga bad" style="padding:0 2px 6px">⚠️ Posible duplicado · coincide con ${esc(p.duplicadoCon || '')}`
+      + `${p.dadoDeAltaNombre ? ' · dado de alta por ' + esc(p.dadoDeAltaNombre) : ''}</div>` : '';
+  if (dup) acts = `<button class="row-act" data-act="revisar-dup" data-id="${p.id}">✓ Revisado, es correcto</button>` + acts;
+
+  return `<div class="row${(alFam || dup) ? ' alerta' : ''}">`
       + `<div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
       + `<div class="rt"><div class="a">${titulo}</div>${sub?`<div class="b">${sub}</div>`:''}</div>`
       + `<div class="tags">${tagEstado}${tagAdmin}${tagCuenta}</div>`
-    + `</div>` + alertaLine + motivoLine + (acts ? `<div class="persona-acts">${acts}</div>` : '');
+    + `</div>` + alertaLine + dupLine + motivoLine + (acts ? `<div class="persona-acts">${acts}</div>` : '');
 }
 
 /* "Revisado, es correcto": el Worker revalida staff, marca la alerta como revisada y deja
@@ -967,8 +1068,28 @@ async function revisarAlertaFamiliar(p, btn){
   }
 }
 
+/* Mismo patrón que "Revisado" de familiares: dos toques; el Worker revalida staff y deja bitácora. */
+async function revisarDuplicado(p, btn){
+  if (btn.dataset.armado !== '1'){
+    btn.dataset.armado = '1'; btn.textContent = '¿Seguro? Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = '✓ Revisado, es correcto'; } }, 4000);
+    return;
+  }
+  btn.dataset.armado = '';
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/personas/duplicado-revisar', { id: p.id });
+    toast(`Marca quitada: ${p.nombre}`, 'ok');
+    await refrescarPersonas(true);
+  } catch(e){
+    toast(e.message || 'No se pudo marcar como revisado', 'bad');
+    btn.disabled = false; btn.textContent = '✓ Revisado, es correcto';
+  }
+}
+
 $('#personaSearch')?.addEventListener('input', renderPersonas);
 /* Delegación: cada botón de fila lleva data-act + data-id. */
+$('#personasErr')?.addEventListener('click', e => { if (e.target.closest('#personasRetryBtn')) refrescarGestion(); });
 $('#personasList')?.addEventListener('click', e => {
   const b = e.target.closest('[data-act]'); if (!b) return;
   const p = personasCache.find(x => x.id === b.dataset.id); if (!p) return;
@@ -980,6 +1101,7 @@ $('#personasList')?.addEventListener('click', e => {
     case 'admin':     cambiarAdminPersona(p, b); break;
     case 'borrar':    abrirPersonaDelSheet(p); break;
     case 'revisar-alerta': revisarAlertaFamiliar(p, b); break;
+    case 'revisar-dup': revisarDuplicado(p, b); break;
   }
 });
 
@@ -1011,7 +1133,12 @@ $('#peRolSeg')?.addEventListener('click', e => {
   setPersonaRol(b.dataset.r);
 });
 
+let peDupOk = false;   // el staff ya vio el aviso de duplicado y eligió continuar
+function peResetDup(){ peDupOk = false; $('#peDupWarn')?.classList.add('hidden'); }
+$('#peName')?.addEventListener('input', peResetDup);
+$('#peTel')?.addEventListener('input', peResetDup);
 function abrirPersonaSheet(p){
+  peResetDup();
   personaEditId = p ? p.id : null;
   const esFam = p && !!p.jefeId;
   const esAdmin = p && p.rol === 'admin';
@@ -1059,15 +1186,26 @@ async function guardarPersona(){
     } else {
       const body = { nombre, telefono, rol };
       if (rol === 'residente') body.domicilio = domicilio;
-      await authedFetch('/personas/crear', body);
-      toast(rol==='admin' ? 'Administrador dado de alta' : 'Casa dada de alta', 'ok');
+      if (peDupOk) body.confirmarDuplicado = true;
+      const r = await authedFetch('/personas/crear', body);
+      toast(r && r.duplicado ? 'Alta registrada y marcada para revisión' : (rol==='admin' ? 'Administrador dado de alta' : 'Casa dada de alta'), r && r.duplicado ? 'bad' : 'ok');
+      peResetDup();
     }
     closeSheet('#personaOverlay');
     await refrescarPersonas();
   } catch(e){
+    if (e && e.data && e.data.requiereConfirmacion){
+      // Duplicado: no se bloquea. Se avisa y, si el staff continúa, el alta queda marcada en rojo.
+      peDupOk = true;
+      $('#peDupWarn').innerHTML = (e.data.duplicados || []).map(t => `Ya existe <b>${esc(t)}</b>.`).join('<br>')
+        + '<br>¿Continuar? Si sí, el alta quedará marcada en rojo para que el comité la revise.';
+      $('#peDupWarn').classList.remove('hidden');
+      return;
+    }
     $('#peErr').textContent = e.message || 'No se pudo guardar';
   } finally {
-    btn.disabled = false; btn.textContent = esEdicion ? 'Guardar cambios' : 'Guardar';
+    btn.disabled = false;
+    btn.textContent = peDupOk ? 'Continuar de todos modos' : (esEdicion ? 'Guardar cambios' : 'Guardar');
   }
 }
 
@@ -3073,7 +3211,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v13';
+const APP_VERSION = 'v14';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

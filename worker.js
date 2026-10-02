@@ -115,6 +115,9 @@ export default {
         case '/personas/mis-familiares': out = await misFamiliares(req, env); break;
         case '/personas/familiar-cancelar': out = await cancelarFamiliar(req, env); break;
         case '/personas/alerta-revisar': out = await revisarAlertaFamiliar(req, env); break;
+        case '/personas/pendientes':     out = await pendientesPersonas(req, env); break;
+        case '/personas/alta-cancelar':  out = await cancelarAlta(req, env); break;
+        case '/personas/duplicado-revisar': out = await revisarDuplicadoPersona(req, env); break;
         case '/invitaciones/familiar': out = await crearInvitacionFamiliar(req, env); break;
         case '/invitaciones/familiar-reenviar': out = await reenviarInvitacionFamiliar(req, env); break;
         case '/votaciones/crear':         out = await crearVotacion(req, env); break;
@@ -1717,7 +1720,7 @@ async function crearPersona(req, env) {
   const perfil = await getPerfil(env, user.uid);
   if (!esStaff(perfil)) throw httpErr(403, 'Solo staff da de alta personas');
 
-  const { nombre, telefono, domicilio, rol } = await req.json();
+  const { nombre, telefono, domicilio, rol, confirmarDuplicado } = await req.json();
   const nom = String(nombre || '').trim().slice(0, 80);
   const tel = String(telefono || '').trim().slice(0, 30);
   if (!nom) throw httpErr(400, 'Falta el nombre');
@@ -1735,6 +1738,15 @@ async function crearPersona(req, env) {
     if (jefes.some(j => j.domicilioNorm === domNorm)) throw httpErr(409, `Ya existe una casa con el domicilio "${dom}"`);
   }
 
+  // Mismo teléfono o mismo nombre completo que alguien del padrón: NO bloquea. Sin confirmación
+  // explícita responde 409 con la lista para que el staff decida; con confirmación crea el alta
+  // MARCADA (roja en Gestión) para que el comité la revise. Solo marca, nunca impide.
+  const todas = await personasList(env);
+  const dup = duplicadosAlta(nom, tel, todas);
+  if (dup.length && confirmarDuplicado !== true) {
+    return json({ error: 'Ya existe ' + dup.map(d => d.texto).join('; '), requiereConfirmacion: true, duplicados: dup.map(d => d.texto) }, 409);
+  }
+
   const id = crypto.randomUUID();
   await firestoreSet(env, `personas/${id}`, {
     nombre:{stringValue:nom},
@@ -1750,8 +1762,33 @@ async function crearPersona(req, env) {
     suspendidoPor:{nullValue:null},
     creadoPor:{stringValue:user.uid},
     creadoEn:{timestampValue:new Date().toISOString()},
+    dadoDeAltaNombre:{stringValue: perfil.nombre || ''},
+    ...(dup.length ? {
+      duplicadoEstado:{stringValue:'activa'},
+      duplicadoCon:{stringValue: dup.map(d => d.texto).join('; ').slice(0, 300)},
+    } : {}),
   });
-  return json({ ok:true, id });
+  if (dup.length) {
+    await pushStaff(env, '⚠️ Alta duplicada · Cerrada La Marquesa',
+      `${nom}${dom ? ' (' + dom + ')' : ''} dada de alta por ${perfil.nombre || 'staff'}: coincide con ${dup.map(d => d.texto).join('; ')}`);
+  }
+  return json({ ok:true, id, duplicado: dup.length > 0 });
+}
+
+/* Coincidencias de un alta con el padrón: mismo teléfono (últimos 10 dígitos) o mismo nombre
+   completo (sin acentos/mayúsculas/espacios extra). Cualquier rol cuenta. */
+function duplicadosAlta(nombre, telefono, all) {
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const tel = normTel(telefono), nom = normNombre(nombre);
+  const out = [];
+  for (const p of all) {
+    const porTel = !!tel && normTel(p.telefono) === tel;
+    const porNombre = !!nom && normNombre(p.nombre) === nom;
+    if (!porTel && !porNombre) continue;
+    const dom = domicilioDe(p, byId);
+    out.push({ id: p.id, motivo: porTel ? 'telefono' : 'nombre', texto: `${p.nombre}${dom ? ' · ' + dom : ''}` });
+  }
+  return out;
 }
 
 /* /personas/actualizar — SOLO staff. Edita nombre/teléfono/domicilio. El familiar no
@@ -1985,9 +2022,115 @@ async function listarPersonas(req, env) {
     registrado: !!p.uid,
     esAdmin: p.esAdmin === true,   // FASE 7: para la etiqueta y el botón de master en Gestión
     dadoDeAltaNombre: p.dadoDeAltaNombre || '',   // v13: quién dio de alta al familiar
+    duplicadoEstado: p.duplicadoEstado ?? null,   // 'activa' = alta con teléfono/nombre repetido, pendiente de revisar
+    duplicadoCon: p.duplicadoCon ?? null,
   }));
   const casasActivas = all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
   return json({ personas, casasActivas });
+}
+
+/* ---- Altas PENDIENTES de activar (persona dada de alta que aún no crea su cuenta) ----
+   /personas/pendientes — SOLO staff. Personas sin uid y sin jefeId (los familiares los invita y
+   cancela su jefe). Para cada una: quién la dio de alta, cuándo y el estado de su liga de
+   registro (viva con vencimiento / vencida / sin liga). Todo se resuelve en el servidor. */
+async function pendientesPersonas(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff consulta altas pendientes');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const nombrePorUid = {}; all.forEach(p => { if (p.uid) nombrePorUid[p.uid] = p.nombre || ''; });
+  const invs = (await firestoreList(env, 'registro_invitaciones')).map(d => readDoc(d.fields)).filter(Boolean);
+  const ahora = Date.now();
+
+  const pendientes = all.filter(p => !p.uid && !p.jefeId && p.rol !== 'master').map(p => {
+    const mias = invs.filter(i => i.personaId === p.id && !i.usado);
+    const viva = mias.filter(i => i.expiraEn && new Date(i.expiraEn).getTime() > ahora)
+      .sort((a, b) => String(b.expiraEn).localeCompare(String(a.expiraEn)))[0];
+    const liga = viva ? { estado: 'viva', expiraEn: viva.expiraEn }
+      : mias.length ? { estado: 'vencida', expiraEn: mias.map(i => i.expiraEn).sort().pop() || null }
+      : { estado: 'sin-liga', expiraEn: null };
+    return {
+      id: p.id, nombre: p.nombre || '', rol: p.rol || 'residente', estado: p.estado || 'activo',
+      domicilio: domicilioDe(p, byId),
+      creadoPorNombre: p.dadoDeAltaNombre || nombrePorUid[p.creadoPor] || '',
+      creadoEn: p.creadoEn || null,
+      liga,
+      duplicadoEstado: p.duplicadoEstado ?? null,
+    };
+  }).sort((a, b) => String(b.creadoEn || '').localeCompare(String(a.creadoEn || '')));
+  return json({ pendientes });
+}
+
+/* /personas/alta-cancelar — CUALQUIER staff. Cancela un alta que nunca se activó: la persona NO
+   tiene cuenta (uid null), ni familiares, ni pagos de su casa. Borra la persona y sus ligas sin
+   usar, deja respaldo en personas_borradas y registro en la bitácora (quién, cuándo, a quién).
+   Un admin (rol) solo lo cancela el master, igual que su alta. /personas/borrar sigue siendo
+   exclusivo de master y es el único camino para personas con cuenta. */
+async function cancelarAlta(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff cancela altas');
+
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const p = all.find(x => x.id === id);
+  if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.rol === 'master') throw httpErr(403, 'No se puede cancelar un master');
+  if (p.uid) throw httpErr(409, 'Esta persona ya tiene cuenta: no es un alta pendiente');
+  if (esStaffPersona(p) && perfil.rol !== 'master') throw httpErr(403, 'Solo master cancela el alta de un administrador');
+  const nFam = all.filter(x => x.jefeId === id).length;
+  if (nFam) throw httpErr(409, `Tiene ${nFam} familiar(es) asociados: no se puede cancelar el alta`);
+  if (esJefe(p)) {
+    // Incluye movimientos CANCELADOS a propósito: un recibo cancelado sigue amarrado a su casa.
+    const finanzas = (await firestoreList(env, 'finanzas')).map(d => readDoc(d.fields));
+    if (finanzas.some(m => m.casa && normDomicilio(m.casa) === p.domicilioNorm)) {
+      throw httpErr(409, 'Esta casa tiene pagos registrados: no se puede cancelar el alta.');
+    }
+  }
+
+  const rGet = await fetch(`${fsBase(env)}/personas/${id}`, { headers:{ Authorization:'Bearer '+at } });
+  const doc = rGet.ok ? await rGet.json() : null;
+  await firestoreSet(env, `personas_borradas/${id}`, {
+    ...(doc?.fields || {}),
+    borradoPor:{stringValue:user.uid}, borradoNombre:{stringValue:perfil.nombre||''}, borradoTs:{timestampValue:new Date().toISOString()},
+    motivoBorrado:{stringValue:'alta-cancelada'},
+  }, at);
+  for (const iv of (await firestoreList(env, 'registro_invitaciones')).filter(d => { const x = readDoc(d.fields); return x.personaId === id && !x.usado; })) {
+    await fetch(`${fsBase(env)}/registro_invitaciones/${iv.name.split('/').pop()}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } }).catch(() => {});
+  }
+  const rDel = await fetch(`${fsBase(env)}/personas/${id}`, { method:'DELETE', headers:{ Authorization:'Bearer '+at } });
+  if (!rDel.ok) throw httpErr(500, 'No se pudo cancelar el alta');
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Staff'} canceló el alta de ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''}` });
+  return json({ ok:true, id });
+}
+
+/* /personas/duplicado-revisar — SOLO staff. "Revisado, es correcto" sobre un alta marcada por
+   teléfono/nombre repetido (mismo criterio que las alertas de familiares): quita lo rojo, deja
+   quién y cuándo en el registro y en la bitácora. No borra ni bloquea nada. */
+async function revisarDuplicadoPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff revisa altas duplicadas');
+  const { id } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const doc = await getDoc(env, at, `personas/${id}`);
+  const p = doc && readDoc(doc.fields);
+  if (!p) throw httpErr(404, 'Persona no existe');
+  if (p.duplicadoEstado !== 'activa') throw httpErr(409, 'Esa alta no está marcada');
+  await firestoreActualizarCampos(env, `personas/${id}`, {
+    duplicadoEstado:{stringValue:'revisada'},
+    duplicadoRevisadoPor:{stringValue:user.uid},
+    duplicadoRevisadoNombre:{stringValue:perfil.nombre || ''},
+    duplicadoRevisadoEn:{timestampValue:new Date().toISOString()},
+  }, 'Persona');
+  await logBitacora(env, at, { uid:user.uid, nombre: `${perfil.nombre || 'Staff'} revisó el alta duplicada de ${p.nombre}: es correcto` });
+  return json({ ok:true, id });
 }
 
 /* /personas/mis-familiares — el JEFE lista SOLO a su propia familia (self-service:
