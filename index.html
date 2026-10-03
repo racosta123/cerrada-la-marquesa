@@ -85,6 +85,8 @@
   .btn-primary:active{transform:scale(.985)}
   .btn-primary:disabled{filter:grayscale(.6) brightness(.7);cursor:default}
   .err{color:var(--bad);font-size:13px;margin-top:12px;text-align:center;min-height:18px}
+  .link-btn{display:block;margin:14px auto 0;background:none;border:0;padding:6px 10px;color:var(--gold-soft);font-size:13px;text-decoration:underline;cursor:pointer}
+  .ok-msg{color:var(--text);font-size:13px;line-height:1.45;margin-top:12px;text-align:center;min-height:18px}
 
   /* ---------- APP SHELL ---------- */
   .app{max-width:560px;margin:0 auto;padding:0 16px 110px;min-height:100dvh}
@@ -361,6 +363,16 @@
     </div>
     <button id="loginBtn" class="btn-primary">Entrar</button>
     <div id="loginErr" class="err"></div>
+    <button id="forgotBtn" type="button" class="link-btn">¿Olvidaste tu contraseña?</button>
+    <div id="forgotBox" class="hidden">
+      <div class="field">
+        <label>Correo para recuperar tu contraseña</label>
+        <input id="forgotEmail" type="email" autocomplete="email" placeholder="tu@correo.com">
+      </div>
+      <button id="forgotSend" type="button" class="btn-primary">Enviar enlace</button>
+      <div id="forgotMsg" class="ok-msg"></div>
+      <button id="forgotBack" type="button" class="link-btn">Volver</button>
+    </div>
   </div>
 </div>
 
