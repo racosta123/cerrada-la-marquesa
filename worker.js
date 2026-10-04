@@ -166,30 +166,46 @@ async function abrir(req, env) {
 
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
-  // Un residente suspendido (por mora) no puede abrir, salvo peatonal y salida (nadie debe
-  // quedar atrapado sin poder salir, ni en coche ni a pie); tampoco sus esclavos.
-  if (perfil.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw httpErr(403, 'Residente suspendido por mora');
-  if (perfil.rol === 'esclavo' && perfil.residenteUid) {
-    const padre = await getPerfil(env, perfil.residenteUid);
-    if (padre && padre.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw httpErr(403, 'Residente del hogar suspendido por mora');
-  }
-  // master, admin, residente y esclavo pueden abrir las 4 puertas.
-  await triggerShelly(env, puerta, await mapaDispositivos(env));
-
   const hogar = perfil.rol === 'residente' ? user.uid : (perfil.residenteUid || user.uid);
-  if (perfil.rol === 'residente' && perfil.jefeId && perfil.personaId) {
-    // FAMILIAR: "Familiar de <Jefe> · <Casa> · dado de alta por <quien>" + posible alerta.
-    // Se calcula DESPUÉS del pulso (la puerta ya abrió) y todo sale del servidor.
-    const extra = await datosAperturaFamiliar(env, perfil);
-    await logAperturaFamiliar(env, { uid: user.uid, nombre: perfil.nombre, puerta, hogar, ...extra });
-  } else {
-    await logApertura(env, {
-      uid: user.uid, nombre: perfil.nombre, puerta, hogar, tipo:'app',
-    });
+
+  // Desde aquí TODO intento queda en la bitácora (resultado 'ok' o 'error' + motivo), salga bien
+  // o mal. Un fallo del propio log NUNCA impide abrir ni cambia la respuesta de la puerta.
+  let fallo = null;
+  try {
+    // Un residente suspendido (por mora) no puede abrir, salvo peatonal y salida (nadie debe
+    // quedar atrapado sin poder salir, ni en coche ni a pie); tampoco sus esclavos.
+    if (perfil.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw Object.assign(httpErr(403, 'Residente suspendido por mora'), { motivo: 'suspendido' });
+    if (perfil.rol === 'esclavo' && perfil.residenteUid) {
+      const padre = await getPerfil(env, perfil.residenteUid);
+      if (padre && padre.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw Object.assign(httpErr(403, 'Residente del hogar suspendido por mora'), { motivo: 'hogar_suspendido' });
+    }
+    // master, admin, residente y esclavo pueden abrir las 4 puertas.
+    await triggerShelly(env, puerta, await mapaDispositivos(env));
+  } catch (e) {
+    fallo = e;
   }
+  const resultado = fallo ? 'error' : 'ok';
+  const motivo = fallo ? String(fallo.motivo || (fallo.status ? 'http_' + fallo.status : 'excepcion')).slice(0, 60) : '';
+
+  try {
+    if (perfil.rol === 'residente' && perfil.jefeId && perfil.personaId) {
+      // FAMILIAR: "Familiar de <Jefe> · <Casa> · dado de alta por <quien>" + posible alerta.
+      // Se calcula DESPUÉS del pulso y todo sale del servidor.
+      const extra = await datosAperturaFamiliar(env, perfil);
+      await logAperturaFamiliar(env, { uid: user.uid, nombre: perfil.nombre, puerta, hogar, resultado, motivo, ...extra });
+    } else {
+      await logApertura(env, {
+        uid: user.uid, nombre: perfil.nombre, puerta, hogar, tipo:'app', resultado, motivo,
+      });
+    }
+  } catch (e) {
+    console.error('[bitacora] excepción al registrar la apertura:', e && e.name);
+  }
+  if (fallo) throw fallo;
+
   // Notifica al residente si quien abrió es su esclavo
   if (perfil.rol === 'esclavo' && perfil.residenteUid) {
-    await notificarResidente(env, perfil.residenteUid, `${perfil.nombre} usó ${puerta}`);
+    try { await notificarResidente(env, perfil.residenteUid, `${perfil.nombre} usó ${puerta}`); } catch (e) { /* aviso opcional */ }
   }
   return json({ ok:true });
 }
@@ -390,7 +406,7 @@ async function logVisita(env, o) {
     method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
     body: JSON.stringify({ writes }),
   });
-  if (!r.ok) console.error(`[bitacora] no se pudo registrar la visita (HTTP ${r.status})`);
+  await avisarSiFalla(r, 'visita');
 }
 
 /* ---- Bitácora de aperturas desde la app hechas por un FAMILIAR ----
@@ -423,8 +439,9 @@ async function logAperturaFamiliar(env, o) {
   const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
   const id = crypto.randomUUID();
   const comun = {
-    nombre: { stringValue: o.nombre || 'Usuario' }, puerta: { stringValue: o.puerta },
+    nombre: { stringValue: nombreConResultado(o.nombre, o.resultado, o.motivo) }, puerta: { stringValue: o.puerta },
     hogar: { stringValue: o.hogar }, tipo: { stringValue: 'app' },
+    resultado: { stringValue: o.resultado || 'ok' }, ...(o.motivo ? { motivo: { stringValue: o.motivo } } : {}),
     personaId: { stringValue: o.personaId || '' }, familiarDe: { stringValue: o.familiarDe || '' },
     casa: { stringValue: o.casa || '' }, dadoDeAltaNombre: { stringValue: o.dadoDeAltaNombre || '' },
     ts: { timestampValue: new Date().toISOString() },
@@ -433,7 +450,7 @@ async function logAperturaFamiliar(env, o) {
     update: { name: docName(env, `aperturas/${id}`), fields: { uid: { stringValue: o.uid }, ...comun } },
     currentDocument: { exists: false },
   }];
-  if (o.alerta) {
+  if (o.alerta && o.resultado !== 'error') {   // la alerta es de aperturas reales, no de intentos fallidos
     writes.push({
       update: { name: docName(env, `alertas_bitacora/${id}`), fields: {
         aperturaId: { stringValue: id }, tipoAlerta: { stringValue: 'posible-otra-casa' },
@@ -446,7 +463,7 @@ async function logAperturaFamiliar(env, o) {
     method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
     body: JSON.stringify({ writes }),
   });
-  if (!r.ok) console.error(`[bitacora] no se pudo registrar la apertura del familiar (HTTP ${r.status})`);
+  await avisarSiFalla(r, 'apertura del familiar');
 }
 
 /* Reserva ATÓMICA de un uso (entrada con usos limitados). Transacción de Firestore REST (los
@@ -761,7 +778,7 @@ async function avisarLimiteFinanzas(env, req, user, perfil, movId) {
       }).catch(() => {});
     }
   } catch (e) {
-    console.error('avisarLimiteFinanzas', e);
+    console.error('avisarLimiteFinanzas', e && e.name);
   }
 }
 
@@ -1249,17 +1266,20 @@ async function borrarVecino(req, env) {
    la distingue de aperturas de puertas; hogar = uid del staff que actúa, así los
    residentes (que filtran su bitácora por hogar) no la ven — solo staff. */
 async function logBitacora(env, at, { uid, nombre }) {
-  await fetch(`${fsBase(env)}/aperturas`, {
-    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
-    body: JSON.stringify({ fields: {
-      uid:{stringValue:uid},
-      nombre:{stringValue:nombre},
-      puerta:{stringValue:'gestion'},
-      hogar:{stringValue:uid},
-      tipo:{stringValue:'gestion'},
-      ts:{timestampValue:new Date().toISOString()},
-    }}),
-  });
+  try {
+    const r = await fetch(`${fsBase(env)}/aperturas`, {
+      method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+      body: JSON.stringify({ fields: {
+        uid:{stringValue:uid},
+        nombre:{stringValue:nombre},
+        puerta:{stringValue:'gestion'},
+        hogar:{stringValue:uid},
+        tipo:{stringValue:'gestion'},
+        ts:{timestampValue:new Date().toISOString()},
+      }}),
+    });
+    await avisarSiFalla(r, 'gestión');
+  } catch (e) { console.error('[bitacora] excepción en logBitacora:', e && e.name); }
 }
 
 /* ===========================================================
@@ -2858,7 +2878,7 @@ async function enviarRecordatoriosPago(env, ahora = ahoraHermosillo()) {
     }
     return { ...res, dia: plan.dia };
   } catch (e) {
-    console.error('enviarRecordatoriosPago', e);
+    console.error('enviarRecordatoriosPago', e && e.name);
     return res;
   }
 }
@@ -2954,7 +2974,7 @@ async function intentarReactivarPorPago(env, casaCanon) {
     await logBitacora(env, at, { uid:'sistema', nombre:
       `Sistema reactivó a ${jefe.nombre}${jefe.domicilio ? ' ('+jefe.domicilio+')' : ''} tras registrar pago que salda su adeudo` });
   } catch (e) {
-    console.error('intentarReactivarPorPago', e);
+    console.error('intentarReactivarPorPago', e && e.name);
   }
 }
 
@@ -3862,16 +3882,34 @@ async function firestoreActualizarCampos(env, path, fields, label = 'Documento')
   if (r.status === 404 || r.status === 400) throw httpErr(404, `${label} no existe`);
   if (!r.ok) throw httpErr(500, 'Firestore update falló');
 }
+/* Revisa la respuesta de una escritura de bitácora: si falló, deja en el log de Cloudflare el
+   status y el cuerpo del error de Firestore (nunca el token ni secrets). */
+async function avisarSiFalla(r, etiqueta) {
+  if (r && r.ok) return;
+  const cuerpo = r ? String(await r.text().catch(() => '')).slice(0, 300) : '';
+  console.error(`[bitacora] ${etiqueta} falló: HTTP ${r ? r.status : '?'} ${cuerpo}`);
+}
+/* La bitácora actual pinta `nombre`: un intento fallido se marca ahí para no verse como éxito. */
+function nombreConResultado(nombre, resultado, motivo) {
+  const n = nombre || 'Usuario';
+  return resultado === 'error' ? `${n} · intento fallido (${motivo || 'error'})` : n;
+}
 async function logApertura(env, o) {
-  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
-  await fetch(`${fsBase(env)}/aperturas`, {
-    method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
-    body: JSON.stringify({ fields: {
-      uid:{stringValue:o.uid}, nombre:{stringValue:o.nombre||'Usuario'},
+  try {
+    const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+    const campos = {
+      uid:{stringValue:o.uid}, nombre:{stringValue:nombreConResultado(o.nombre, o.resultado, o.motivo)},
       puerta:{stringValue:o.puerta}, hogar:{stringValue:o.hogar},
       tipo:{stringValue:o.tipo}, ts:{timestampValue:new Date().toISOString()},
-    }}),
-  });
+      resultado:{stringValue:o.resultado || 'ok'},
+    };
+    if (o.motivo) campos.motivo = { stringValue: o.motivo };
+    const r = await fetch(`${fsBase(env)}/aperturas`, {
+      method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
+      body: JSON.stringify({ fields: campos }),
+    });
+    await avisarSiFalla(r, 'apertura');
+  } catch (e) { console.error('[bitacora] excepción en logApertura:', e && e.name); }
 }
 async function notificarResidente(env, residenteUid, mensaje) {
   const perfil = await getPerfil(env, residenteUid);

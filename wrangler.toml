@@ -36,3 +36,8 @@ crons = ["0 16 * * *"]
 # Secrets (NO van aquí, se cargan con: wrangler secret put NOMBRE):
 #   SHELLY_HOST  SHELLY_AUTH_KEY  SHELLY_DEVICES  FIREBASE_PROJECT
 #   SA_EMAIL  SA_PRIVATE_KEY  QR_SECRET  READER_KEY  READER_SYNC_URL
+
+# Workers Logs: guarda los console.log/error del Worker (retención de Cloudflare) para poder
+# contar llamadas a /abrir y errores de bitácora. Los logs NO llevan secrets (ver avisarSiFalla).
+[observability]
+enabled = true

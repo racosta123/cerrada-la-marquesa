@@ -81,7 +81,11 @@ export async function triggerShelly(env, puerta, mapaVigente) {
   const ok = !!(out && out.ok === true);
   console.log(`[shelly] modo=${directo ? 'directo' : 'portero'}, puerta=${puerta}, ms=${ms}, resultado=${ok ? 'ok' : 'error'}${out?.limitado ? ', max_req=si' : ''}`);
 
-  if (!ok) throw httpErr(out?.status || 502, out?.error || 'La cerradura no respondió');
+  if (!ok) {
+    const e = httpErr(out?.status || 502, out?.error || 'La cerradura no respondió');
+    e.motivo = out?.motivo || 'sin_respuesta';   // para que /abrir lo guarde en la bitácora
+    throw e;
+  }
 }
 
 export const SHELLY_GATE_NAME = 'shelly-gate';
@@ -111,7 +115,8 @@ export async function callShellyOnce(env, device, label) {
   const gen = (device && device.gen) || 1;
   const offSec = (device && device.offSec) || 0;
   let sawLimitado = false;
-  const fail = () => ({ ok:false, status:502, error:'La cerradura no respondió', limitado: sawLimitado });
+  let motivo = 'sin_respuesta';   // por qué falló (solo para la bitácora; nunca host/id/llave)
+  const fail = () => ({ ok:false, status:502, error:'La cerradura no respondió', limitado: sawLimitado, motivo: sawLimitado ? 'max_req' : motivo });
   for (let attempt = 1; attempt <= 2; attempt++) {
     if (attempt === 2) await shellySleep(shellyCfg(env, 'SHELLY_RETRY_DELAY_MS'));
     const ctrl = new AbortController();
@@ -152,6 +157,7 @@ export async function callShellyOnce(env, device, label) {
       }
       txt = await r.text().catch(() => '');
     } catch (e) {
+      motivo = ctrl.signal.aborted ? 'timeout' : 'red';
       if (ctrl.signal.aborted) console.warn(`[shelly] TIMEOUT de llamada puerta=${label} intento=${attempt} tras ${timeoutMs}ms`);
       else console.warn(`[shelly] error de red puerta=${label} intento=${attempt}`);
       return fail();
@@ -165,6 +171,7 @@ export async function callShellyOnce(env, device, label) {
       console.warn(`[shelly] max_req/429 puerta=${label} status=${r.status}; reintento en ${shellyCfg(env, 'SHELLY_RETRY_DELAY_MS')}ms`);
       continue;
     }
+    motivo = `shelly_http_${r.status}`;
     console.warn(`[shelly] Shelly falló puerta=${label} status=${r.status} intento=${attempt}`);
     return fail();
   }
