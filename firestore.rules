@@ -75,10 +75,14 @@ service cloud.firestore {
 
     // ---- invitaciones ----
     match /invitaciones/{jti} {
+      // Igual que aperturas: hogar del documento y residenteUid del perfil deben existir y no
+      // estar vacíos; una invitación con hogar vacío/ausente solo la lee el staff.
       allow read: if signedIn() && (
         staff() ||
-        resource.data.hogar == request.auth.uid ||
-        resource.data.hogar == get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data.get('residenteUid','')
+        (resource.data.get('hogar', '') != '' && (
+          resource.data.hogar == request.auth.uid ||
+          (perfil().get('residenteUid', '') != '' && resource.data.hogar == perfil().get('residenteUid', ''))
+        ))
       );
       // creación/consumo de usos: SOLO el Worker
       allow write: if false;
