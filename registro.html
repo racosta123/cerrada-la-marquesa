@@ -14,7 +14,11 @@
     --gold:#d4af37; --gold-soft:#e8c468; --text:#f5f5f4; --muted:#a1a1aa; --muted-2:#71717a;
     --bad:#f87171; --ok:#4ade80; --r:18px; --r-sm:13px;
   }
-  *{box-sizing:border-box}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  /* Los textos informativos no se seleccionan al tocar ni arrastrar (regla GLOBAL: lo heredan todas las pantallas,
+     hojas y avisos). Excepción: lo que se escribe (input, textarea, select, editables) y lo que se copia (.copiable). */
+  body{-webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
+  input,textarea,select,[contenteditable],[contenteditable] *,.copiable,.mov-folio{-webkit-user-select:text;user-select:text}
   html{background:#0d0d0f; color-scheme:dark}
   body{
     margin:0; min-height:100vh; background:radial-gradient(120% 90% at 50% 0%, #16130a 0%, var(--bg) 55%);
