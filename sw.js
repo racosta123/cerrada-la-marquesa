@@ -1,8 +1,8 @@
-const CACHE = 'marquesa-v25';
+const CACHE = 'marquesa-v26';
 const ASSETS = ['./','./index.html','./app.js','./config.js','./manifest.json',
   './vendor/qrcode.min.js','./vendor/jspdf.umd.min.js','./vendor/jspdf.plugin.autotable.min.js','./vendor/chart.umd.min.js',
   './assets/marquesa-mobile.webp','./assets/marquesa-desktop.webp','./assets/logo-marquesa.jpg',
-  './icons/icon-192.png','./icons/icon-512.png','./icons/icon-maskable-512.png','./icons/apple-touch-icon.png'];
+  './icons/icon-192.png','./icons/icon-512.png','./icons/icon-maskable-512.png','./icons/apple-touch-icon.png','./icons/favicon-32.png'];
 
 // cache:'reload' — GitHub Pages manda Cache-Control max-age=600: con addAll(ASSETS) a secas el
 // precache de una versión NUEVA podía llenarse con el app.js/index.html VIEJO que el navegador
