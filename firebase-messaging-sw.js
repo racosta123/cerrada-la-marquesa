@@ -11,6 +11,6 @@ firebase.initializeApp({
 const messaging = firebase.messaging();
 messaging.onBackgroundMessage(p => {
   self.registration.showNotification(p.notification?.title || 'Cerrada La Marquesa', {
-    body: p.notification?.body || '', icon: 'icons/icon-192.png',
+    body: p.notification?.body || '', icon: 'icons/icon-m-192.png',
   });
 });
