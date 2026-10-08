@@ -308,6 +308,8 @@
   .vchip.warn{color:var(--warn);border-color:rgba(251,191,36,.4);background:rgba(251,191,36,.1)}
   .vbanner{background:rgba(251,191,36,.1);border:1px solid rgba(251,191,36,.35);border-radius:var(--r-sm);padding:13px 15px;margin:14px 0;font-size:13px;line-height:1.55;color:var(--warn)}
   .vbanner b{color:var(--warn)}
+  /* Sin conexión: las puertas se ven desactivadas (el bloqueo real está en app.js) */
+  html.sin-conexion .door{opacity:.45}
   .vopts{display:flex;flex-direction:column;gap:10px;margin:16px 0}
   .vopt{display:flex;align-items:center;gap:12px;padding:15px 16px;border-radius:var(--r-sm);background:var(--surface);border:1px solid var(--line);width:100%;color:var(--text);text-align:left;transition:border-color .15s,transform .1s}
   .vopt:active{transform:scale(.99)}
@@ -429,6 +431,12 @@
       </button>
     </div>
   </div>
+
+  <!-- SIN CONEXIÓN — lo muestra/oculta ponerSinConexion() (app.js). La sesión se conserva; las
+       acciones que necesitan internet quedan bloqueadas (nunca se encolan). -->
+  <div id="sinConexionBanner" class="vbanner hidden" role="status" style="margin:0 0 14px"><b>Sin conexión.</b> Tu sesión sigue activa. Mientras no haya internet no se pueden abrir puertas ni hacer cambios; te reconectamos solo.</div>
+  <!-- Se ve solo si la app abrió sin internet: aún no hay perfil confirmado por el servidor. -->
+  <div id="sinPerfilAun" class="empty hidden">Conectando… En cuanto regrese el internet cargamos tu información.</div>
 
   <!-- AVISO DE CORTE POR MORA — global, fuera de las tabpanes: visible en cualquier pestaña.
        Lo llena/oculta renderAvisoCorte() (app.js), recalculado cada vez que carga la app. -->
