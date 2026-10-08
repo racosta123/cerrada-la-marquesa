@@ -66,6 +66,10 @@
   .brand{display:flex;flex-direction:column;align-items:center;gap:8px;margin-bottom:22px;text-align:center}
   .brand h1{margin:0;font-size:24px;font-weight:600;letter-spacing:.3px;text-shadow:0 2px 4px rgba(0,0,0,.55),0 2px 22px rgba(0,0,0,.7)}
   .brand p{margin:0;color:#ececeb;font-size:13px;letter-spacing:.4px;text-shadow:0 1px 3px rgba(0,0,0,.6),0 1px 14px rgba(0,0,0,.65)}
+  /* ---------- CARGA (mientras Firebase Auth restaura la sesión) ---------- */
+  .boot-wrap{min-height:100dvh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:18px;padding:28px}
+  .boot-wrap .brand{margin-bottom:0}
+  .boot-spin{width:26px;height:26px;border:2.5px solid rgba(255,255,255,.22);border-top-color:var(--gold-soft);border-radius:50%;animation:spin .8s linear infinite}
   .card{
     width:100%;max-width:380px;
     background:rgba(24,24,27,.82);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
@@ -352,8 +356,31 @@
 <div id="bgLayer"></div>
 <div id="bgOverlay"></div>
 
+<!-- ============ CARGA ============ -->
+<!-- Login y panel arrancan ocultos; app.js decide cuál mostrar cuando responde Firebase Auth. -->
+<div id="bootView" class="boot-wrap" role="status" aria-label="Cargando">
+  <div class="brand">
+    <h1>Cerrada La Marquesa</h1>
+    <p>Control de acceso residencial</p>
+  </div>
+  <div class="boot-spin" aria-hidden="true"></div>
+</div>
+<script>
+  /* Límite de seguridad del arranque: vive aquí (y no en app.js) para que funcione aunque Firebase
+     o app.js no carguen. Si a los 8 s nada decidió, se muestra el login. app.js lo cancela en
+     cuanto muestra el login o el panel. No guarda nada: solo cambia qué pantalla se ve. */
+  window.__arranqueTimer = setTimeout(function () {
+    window.__arranqueTimer = null;
+    var boot = document.getElementById('bootView');
+    if (!boot || boot.classList.contains('hidden')) return;
+    if (typeof window.showLogin === 'function') { try { window.showLogin(); return; } catch (e) {} }
+    boot.classList.add('hidden');
+    document.getElementById('loginView').classList.remove('hidden');
+  }, 8000);
+</script>
+
 <!-- ============ LOGIN ============ -->
-<div id="loginView" class="login-wrap">
+<div id="loginView" class="login-wrap hidden">
   <div class="brand">
     <h1>Cerrada La Marquesa</h1>
     <p>Control de acceso residencial</p>

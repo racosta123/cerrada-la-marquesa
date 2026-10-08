@@ -142,6 +142,17 @@ $('#forgotSend').addEventListener('click', async () => {
   }, 1000);
 });
 
+/* ====================== ARRANQUE ======================
+   Login y panel arrancan ocultos y se ve #bootView hasta que onAuthStateChanged (y la lectura del
+   perfil) decide. NO se guarda nada en localStorage para adelantar esa decisión: la única fuente
+   de verdad es Firebase Auth + el perfil. El límite de 8 s está en index.html (script en línea,
+   funciona aunque este archivo falle); si salta y luego llega un usuario válido, enterApp() cambia
+   al panel. Aquí solo se cancela ese límite al decidir. */
+function terminarArranque(){
+  if (window.__arranqueTimer){ clearTimeout(window.__arranqueTimer); window.__arranqueTimer = null; }
+  $('#bootView').classList.add('hidden');
+}
+
 /* ====================== SESIÓN ====================== */
 auth.onAuthStateChanged(async user => {
   if (!user){ showLogin(); return; }
@@ -160,6 +171,7 @@ auth.onAuthStateChanged(async user => {
 });
 
 function showLogin(){
+  terminarArranque();
   avisoPago = null; pintarAvisoPago();
   document.body.classList.remove('in-app');   // fondo con capa suave en el login
   $('#appView').classList.add('hidden');
@@ -175,6 +187,7 @@ function showLogin(){
 }
 
 function enterApp(){
+  terminarArranque();
   document.body.classList.add('in-app');   // fondo con capa ~85% en pantallas internas
   $('#loginView').classList.add('hidden');
   $('#appView').classList.remove('hidden');
@@ -3577,7 +3590,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v28';
+const APP_VERSION = 'v29';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
