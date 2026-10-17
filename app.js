@@ -358,10 +358,10 @@ function enterApp(){
   refrescarAvisoPago(true);
 }
 
-/* Logo de la cerrada (assets/logo-marquesa.jpg, 662x300) para el banner del recibo PDF.
-   Solo lo usan los recibos (staff): se pide al abrir la hoja del recibo y los botones del recibo
-   lo esperan antes de armar el PDF. construirReciboPDF() es síncrona a propósito (ver su
-   comentario): si aun así el logo no llegó (p.ej. sin red), el recibo sale sin el banner. */
+/* Logo de la cerrada (assets/logo-marquesa.jpg, 662x300) para el banner del recibo PDF y del
+   reporte financiero del mes (staff): se pide al abrir la hoja del recibo o la pestaña Finanzas,
+   y los botones lo esperan antes de armar el PDF. construirReciboPDF() es síncrona a propósito
+   (ver su comentario): si aun así el logo no llegó (p.ej. sin red), el PDF sale sin el banner. */
 let logoMarquesaDataUrl = null;
 async function cargarLogoMarquesa(){
   if (logoMarquesaDataUrl) return logoMarquesaDataUrl;
@@ -2080,6 +2080,7 @@ let finStaffActivo = false;   // el listener de finanzas (staff) ya está corrie
 function activarFinanzasStaff(){
   if (finStaffActivo || !ME || !enModoStaff()) return;
   finStaffActivo = true;
+  cargarLogoMarquesa();   // se adelanta el logo del reporte PDF; no bloquea nada
   // FASE 6.5: el padrón alimenta los dropdowns; la cobranza (termómetro + listas pagaron/
   // sin pago) la calcula el Worker y se pide en renderFinanzas(). El padrón normalmente ya
   // lo cargó buildTabs(); solo si no hay se pide (cargarPersonas reutiliza una en curso).
@@ -2914,7 +2915,9 @@ $('#pdfBtn').addEventListener('click', generarPDF);
 /* construye el PDF premium (FASE 0) y devuelve {doc, filename} sin descargar ni compartir —
    generarPDF() y compartirReportePDF() comparten esta misma construcción. */
 async function construirReportePDF(){
-    await Promise.all([cargarLib('pdf'), cargarLib('chart')]);   // bajo demanda (las gráficas del PDF usan Chart.js)
+    // bajo demanda (las gráficas del PDF usan Chart.js); el logo casi siempre ya está (se adelanta al
+    // abrir Finanzas) y cargarLogoMarquesa nunca falla: si no llega, devuelve null y el PDF sale sin logo.
+    await Promise.all([cargarLib('pdf'), cargarLib('chart'), cargarLogoMarquesa()]);
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit:'pt', format:'letter' });
     const W = doc.internal.pageSize.getWidth();
@@ -2945,7 +2948,17 @@ async function construirReportePDF(){
     /* ===== 1. Filete dorado + encabezado ===== */
     doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
 
-    let y = M - 10;
+    // Banner del logo, igual que el recibo (construirReciboPDF): centrado, proporción 662x300 intacta.
+    // Sin logo, el encabezado arranca donde siempre (y = M - 10).
+    const LOGO_W = 220, LOGO_H = LOGO_W * (300 / 662);
+    let y;
+    if (logoMarquesaDataUrl) {
+      const logoY = 4 + 16;
+      doc.addImage(logoMarquesaDataUrl, 'JPEG', (W - LOGO_W) / 2, logoY, LOGO_W, LOGO_H);
+      y = logoY + LOGO_H + 16;
+    } else {
+      y = M - 10;
+    }
     doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
     doc.text('E S T A D O   D E   C U E N T A   R E S I D E N C I A L', M, y + 14);
 
@@ -3030,6 +3043,9 @@ async function construirReportePDF(){
     y = Math.max(donutY + donutSize + 14, legendEnd) + 10;
 
     /* ===== 6. Tabla "03 · Historial de transacciones" ===== */
+    // Con el banner del logo, el título puede quedar sobre el pie (H - 24): si no caben el título
+    // y el encabezado de la tabla antes del margen inferior (50), la sección empieza en otra página.
+    if (y + 20 + 40 > H - 50){ doc.addPage(); y = M; }
     doc.setFillColor(...PDF.gold); doc.rect(M, y, 20, 3, 'F');
     doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(...PDF.text);
     doc.text('03 · Historial de transacciones', M + 28, y + 6);
@@ -3774,7 +3790,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v31';
+const APP_VERSION = 'v32';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
