@@ -9,6 +9,12 @@
 <link rel="apple-touch-icon" href="icons/apple-touch-icon-m.png">
 <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-m-32.png">
 <link rel="icon" type="image/png" sizes="48x48" href="icons/favicon-m-48.png">
+<!-- Conexiones adelantadas (solo abren el canal TLS, no mandan datos): SDK de Firebase, Firestore,
+     renovación del token de sesión y el Worker. Las tres últimas sin cookies → crossorigin. -->
+<link rel="preconnect" href="https://www.gstatic.com">
+<link rel="preconnect" href="https://firestore.googleapis.com" crossorigin>
+<link rel="preconnect" href="https://securetoken.googleapis.com" crossorigin>
+<link rel="preconnect" href="https://la-marquesa-proxy.acosta4770.workers.dev" crossorigin>
 <!-- Fondo (letrero La Marquesa): precarga solo la variante del viewport para no retrasar el render -->
 <link rel="preload" as="image" href="assets/marquesa-mobile.webp" media="(max-width:699px)">
 <link rel="preload" as="image" href="assets/marquesa-desktop.webp" media="(min-width:700px)">
@@ -935,16 +941,14 @@
 
 <div class="toast" id="toast"></div>
 
-<!-- ====== Firebase (compat) + QR lib ====== -->
+<!-- ====== Firebase (compat): solo lo que se usa al abrir ======
+     Mensajes (push) y App Check, y las librerías de vendor/ (QR, PDF, gráficas), las carga app.js
+     cuando hacen falta (cargarScript/cargarLib). Si cambias la versión 10.12.2, cámbiala también
+     en app.js (FIREBASE_SDK) y en sw.js (FIREBASE_SDK). -->
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-check-compat.js"></script>
-<script src="vendor/qrcode.min.js"></script>
-<script src="vendor/jspdf.umd.min.js"></script>
-<script src="vendor/jspdf.plugin.autotable.min.js"></script>
-<script src="vendor/chart.umd.min.js"></script><script src="config.js"></script>
+<script src="config.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

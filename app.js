@@ -10,10 +10,41 @@ firebase.initializeApp(CONFIG.firebase);
 const auth = firebase.auth();
 const db   = firebase.firestore();
 
-/* App Check (reCAPTCHA v3) — protege Firestore y el Worker de abuso */
-if (CONFIG.appCheckSiteKey) {
-  firebase.appCheck().activate(CONFIG.appCheckSiteKey, true);
+/* ---- Carga diferida de scripts ----
+   Las librerías pesadas (QR, PDF, gráficas) y los SDK de Firebase que no se usan al abrir NO van
+   en index.html: se piden aquí solo cuando hacen falta. Mismos archivos de vendor/ (y de gstatic
+   con la versión fijada), que el service worker deja en caché para que funcionen sin red. */
+const FIREBASE_SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
+const LIBS = {
+  qr:    ['vendor/qrcode.min.js'],
+  pdf:   ['vendor/jspdf.umd.min.js', 'vendor/jspdf.plugin.autotable.min.js'],   // autotable necesita jsPDF antes
+  chart: ['vendor/chart.umd.min.js'],
+};
+const scriptsCargando = new Map();   // src → Promise
+function cargarScript(src){
+  if (scriptsCargando.has(src)) return scriptsCargando.get(src);
+  const p = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => { scriptsCargando.delete(src); s.remove(); reject(new Error('No se pudo cargar ' + src)); };
+    document.head.appendChild(s);
+  });
+  scriptsCargando.set(src, p);
+  return p;
 }
+async function cargarLib(nombre){
+  for (const src of LIBS[nombre]) await cargarScript(src);   // en orden
+}
+
+/* App Check (reCAPTCHA v3) — protege Firestore y el Worker de abuso. Mientras appCheckSiteKey
+   esté vacío no se descarga su SDK; al poner la clave se carga y se activa ANTES de que la app
+   lea Firestore o llame al Worker (onAuthStateChanged, login y authedFetch esperan a appCheckListo). */
+const appCheckListo = CONFIG.appCheckSiteKey
+  ? cargarScript(FIREBASE_SDK + 'firebase-app-check-compat.js')
+      .then(() => firebase.appCheck().activate(CONFIG.appCheckSiteKey, true))
+      .catch(e => console.error('App Check', e))
+  : Promise.resolve();
 
 const WORKER = CONFIG.workerUrl;        // ej. https://la-marquesa-proxy.acosta4770.workers.dev
 const DOORS = [
@@ -60,6 +91,7 @@ async function authedFetch(path, body){
   const headers = { 'Content-Type':'application/json', 'Authorization':'Bearer '+token };
   // App Check token (si está activo) para el Worker
   try {
+    await appCheckListo;
     if (firebase.appCheck && CONFIG.appCheckSiteKey){
       const ac = await firebase.appCheck().getToken();
       if (ac?.token) headers['X-Firebase-AppCheck'] = ac.token;
@@ -94,6 +126,7 @@ async function doLogin(){
   if (!email || !pass){ $('#loginErr').textContent = 'Completa correo y contraseña'; return; }
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
+    await appCheckListo;
     await auth.signInWithEmailAndPassword(email, pass);
   } catch(e){
     $('#loginErr').textContent = mapAuthError(e.code);
@@ -276,6 +309,7 @@ auth.onAuthStateChanged(async user => {
   if (!user){ showLogin(); return; }
   cancelarLimiteArranque();   // ya hay sesión: el límite de 8 s ya no debe mandar al login
   if (!navigator.onLine){ entrarSinConexion(user); return; }
+  await appCheckListo;
   await validarYEntrar(user, false);
 });
 
@@ -322,14 +356,12 @@ function enterApp(){
   setupMiFamilia();
   registerPush();
   refrescarAvisoPago(true);
-  cargarLogoMarquesa();   // dispara la precarga del logo del recibo; no bloquea nada
 }
 
 /* Logo de la cerrada (assets/logo-marquesa.jpg, 662x300) para el banner del recibo PDF.
-   Se precarga en cuanto arranca la app y de nuevo al abrir un recibo (por si el primer intento
-   falló, p.ej. sin conexión antes de que el SW lo precacheara). construirReciboPDF() es
-   síncrona a propósito (ver su comentario) así que esto nunca puede bloquearla: si no está
-   lista a tiempo, el recibo se genera igual, solo que sin el banner. */
+   Solo lo usan los recibos (staff): se pide al abrir la hoja del recibo y los botones del recibo
+   lo esperan antes de armar el PDF. construirReciboPDF() es síncrona a propósito (ver su
+   comentario): si aun así el logo no llegó (p.ej. sin red), el recibo sale sin el banner. */
 let logoMarquesaDataUrl = null;
 async function cargarLogoMarquesa(){
   if (logoMarquesaDataUrl) return logoMarquesaDataUrl;
@@ -423,7 +455,7 @@ function switchTab(id, btn){
   $$('.tab').forEach(t => t.classList.remove('active'));
   btn.classList.add('active');
   if (id !== 'votaciones' && votUnsub){ votUnsub(); votUnsub = null; }
-  if (id === 'finanzas') resizeFinCharts();
+  if (id === 'finanzas'){ activarFinanzasStaff(); resizeFinCharts(); }
   if (id === 'votaciones') loadVotaciones();
   if (id === 'admin') refrescarGestion();   // padrón al día cada vez que se abre Gestión
 }
@@ -702,6 +734,7 @@ function segPick(e, sel, set, attr){
 }
 
 function openInviteSheet(){
+  cargarLib('qr').catch(() => {});   // se adelanta mientras escribe el nombre; generateInvite la espera
   $('#inviteForm').classList.remove('hidden');
   $('#inviteResult').classList.add('hidden');
   $('#visitorName').value = '';
@@ -723,6 +756,7 @@ async function generateInvite(){
       hogar: ME.rol==='residente' ? ME.uid : (ME.residenteUid || ME.uid),
     });
     // r.payload = token opaco (cadena aleatoria sin datos) que va dentro del QR; los datos reales viven en Firestore
+    await cargarLib('qr');
     const dataUrl = await QRCode.toDataURL(r.payload, { margin:1, width:460, errorCorrectionLevel:'M' });
     $('#qrImg').src = dataUrl;
     $('#qrMeta').textContent = `${name} · válido ${inviteDur} h`;
@@ -840,6 +874,7 @@ async function buildInviteCard({ payload, name, dur, uses, expira, pin }){
   roundRectPath(ctx, boxX, boxY, boxW, boxH, 40); ctx.fill();
   const pad = 70, qs = boxW - pad * 2;
   // QR generado al tamaño exacto del recuadro → nítido y escaneable.
+  await cargarLib('qr');
   const qrUrl = await QRCode.toDataURL(payload, { margin: 1, width: qs, errorCorrectionLevel: 'M' });
   const qr = await loadImage(qrUrl);
   ctx.imageSmoothingEnabled = false;
@@ -899,6 +934,7 @@ async function shareQR({ payload, name, dur, uses, expira, pin }){
   let img = file;
   if (!img){   // si la tarjeta falló, al menos el QR crudo
     try {
+      await cargarLib('qr');
       const qrUrl = await QRCode.toDataURL(payload, { margin: 1, width: 560, errorCorrectionLevel: 'M' });
       const b = await (await fetch(qrUrl)).blob();
       img = new File([b], 'acceso-la-marquesa.png', { type: 'image/png' });
@@ -952,24 +988,29 @@ function esJefeP(p){ return p.rol === 'residente' && !p.jefeId && !esBajaP(p); }
 function jefes(){ return personasCache.filter(esJefeP); }
 
 let personasError = '';   // texto del último fallo de /personas/listar ('' = sin error)
-async function cargarPersonas(){
-  try {
-    const r = await authedFetch('/personas/listar', {});
-    personasCache = Array.isArray(r.personas) ? r.personas : [];
-    personasError = '';
-  } catch(e){
-    // No se vacía la lista en silencio: se conserva lo último bueno y se avisa con Reintentar.
-    console.error('cargarPersonas', e);
-    personasError = (e && e.message) || 'No se pudo cargar';
-  }
+let personasEnVuelo = null;   // si ya hay una /personas/listar en curso, se reutiliza (sin llamadas dobles)
+function cargarPersonas(){
+  if (personasEnVuelo) return personasEnVuelo;
+  personasEnVuelo = (async () => {
+    try {
+      const r = await authedFetch('/personas/listar', {});
+      personasCache = Array.isArray(r.personas) ? r.personas : [];
+      personasError = '';
+    } catch(e){
+      // No se vacía la lista en silencio: se conserva lo último bueno y se avisa con Reintentar.
+      console.error('cargarPersonas', e);
+      personasError = (e && e.message) || 'No se pudo cargar';
+    }
+  })().finally(() => { personasEnVuelo = null; });
+  return personasEnVuelo;
 }
 /* recarga el padrón y refresca TODO lo que depende de él: la lista y, si Finanzas ya se
-   pintó, la cobranza (termómetro + listas pagaron/sin pago, conteo del Worker). */
+   abrió, la cobranza (termómetro + listas pagaron/sin pago, conteo del Worker). */
 async function refrescarPersonas(sinCobranza){
   await Promise.all([cargarPersonas(), cargarPendientes()]);
   renderPersonas();
   renderPendientes();
-  if (!sinCobranza && finMonths.length) cargarCobranza();
+  if (!sinCobranza && finStaffActivo) cargarCobranza();
 }
 async function loadPersonas(){ await refrescarPersonas(); }
 /* Gestión: una sola carga por apertura/clic. Si ya hay una en vuelo se reutiliza (sin cadenas). */
@@ -2025,24 +2066,33 @@ function watchFinanzas(){
   const { label } = monthRange();
   $('#finMonth').textContent = 'Finanzas · ' + label;
 
-  if (isStaff){
-    // FASE 6.5: el padrón alimenta los dropdowns; la cobranza (termómetro + listas pagaron/
-    // sin pago) la calcula el Worker. Carga el padrón primero (para el dropdown de detalle)
-    // y luego la cobranza.
-    cargarPersonas().then(() => cargarCobranza());
-    unsubFin = db.collection('finanzas')
-      .where('ts','>=',finMonths[0].start)
-      .orderBy('ts','desc').limit(1200)
-      .onSnapshot(snap => {
-        finTodos = [];
-        snap.forEach(doc => finTodos.push({ id: doc.id, ...doc.data() }));
-        finCache = finTodos.filter(m => !esCanceladoMov(m));
-        renderFinanzas();
-      }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
-  } else {
+  // Staff: los movimientos (hasta 1 200 docs), las gráficas y la cobranza NO se cargan al abrir
+  // la app, sino la primera vez que se entra a la pestaña Finanzas (activarFinanzasStaff).
+  unsubFin = null;
+  finStaffActivo = false;
+  if (!isStaff){
     loadResumenResidente();
     cargarMiEstadoCuenta();
   }
+}
+
+let finStaffActivo = false;   // el listener de finanzas (staff) ya está corriendo
+function activarFinanzasStaff(){
+  if (finStaffActivo || !ME || !enModoStaff()) return;
+  finStaffActivo = true;
+  // FASE 6.5: el padrón alimenta los dropdowns; la cobranza (termómetro + listas pagaron/
+  // sin pago) la calcula el Worker y se pide en renderFinanzas(). El padrón normalmente ya
+  // lo cargó buildTabs(); solo si no hay se pide (cargarPersonas reutiliza una en curso).
+  if (!personasCache.length) cargarPersonas().then(() => renderCobranza());
+  unsubFin = db.collection('finanzas')
+    .where('ts','>=',finMonths[0].start)
+    .orderBy('ts','desc').limit(1200)
+    .onSnapshot(snap => {
+      finTodos = [];
+      snap.forEach(doc => finTodos.push({ id: doc.id, ...doc.data() }));
+      finCache = finTodos.filter(m => !esCanceladoMov(m));
+      renderFinanzas();
+    }, err => { console.error(err); $('#movList').innerHTML='<div class="empty">Sin acceso a finanzas</div>'; });
 }
 
 /* -------- resumen agregado para residentes/esclavos (vía Worker) -------- */
@@ -2304,7 +2354,13 @@ function mesesConMovimientos(byMonth){
 
 /* -------- gráficas (Chart.js) -------- */
 function renderFinCharts(byMonth, curKey){
-  if (typeof Chart === 'undefined') return;
+  if (typeof Chart === 'undefined'){
+    // Chart.js se carga bajo demanda: al llegar se pintan con los datos de ese momento.
+    cargarLib('chart')
+      .then(() => { if (typeof Chart !== 'undefined' && finStaffActivo) renderFinCharts(groupByMonth(), finMonths[finMonths.length-1].key); })
+      .catch(e => console.error('Chart.js', e));
+    return;
+  }
   const gold='#d4af37', goldSoft='#e8c468', ok='#34d399', bad='#f87171', muted='#a1a1aa', text='#f5f5f4', line='#2a2a30';
 
   const labels = finMonths.map(m => m.label);
@@ -2858,6 +2914,7 @@ $('#pdfBtn').addEventListener('click', generarPDF);
 /* construye el PDF premium (FASE 0) y devuelve {doc, filename} sin descargar ni compartir —
    generarPDF() y compartirReportePDF() comparten esta misma construcción. */
 async function construirReportePDF(){
+    await Promise.all([cargarLib('pdf'), cargarLib('chart')]);   // bajo demanda (las gráficas del PDF usan Chart.js)
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit:'pt', format:'letter' });
     const W = doc.internal.pageSize.getWidth();
@@ -3187,7 +3244,8 @@ function construirReciboPDF(mov){
 let reciboActual = null;
 function abrirReciboSheet(mov){
   reciboActual = mov;
-  cargarLogoMarquesa();   // reintento silencioso por si la precarga de enterApp() falló
+  cargarLogoMarquesa();             // se adelantan logo y jsPDF mientras se lee la hoja;
+  cargarLib('pdf').catch(() => {}); // los botones los esperan antes de armar el PDF
   const cancelado = esCanceladoMov(mov);
   $('#reciboTitle').textContent = `Recibo ${mov.folioRecibo}${cancelado ? ' · CANCELADO' : ''}`;
   $('#reciboErr').textContent = '';
@@ -3214,6 +3272,7 @@ $('#reciboWaBtn').addEventListener('click', async () => {
   const btn = $('#reciboWaBtn'); const original = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generando…';
   try {
+    await Promise.all([cargarLib('pdf'), cargarLogoMarquesa()]);   // casi siempre ya listos (abrirReciboSheet)
     const { doc, filename } = construirReciboPDF(mov);
     const file = new File([doc.output('blob')], filename, { type:'application/pdf' });
     if (navigator.canShare && navigator.canShare({ files:[file] })){
@@ -3241,6 +3300,7 @@ $('#reciboDlBtn').addEventListener('click', async () => {
   const btn = $('#reciboDlBtn'); const original = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generando…';
   try {
+    await Promise.all([cargarLib('pdf'), cargarLogoMarquesa()]);
     const { doc, filename } = construirReciboPDF(mov);
     doc.save(filename);
     toast('Recibo descargado', 'ok');
@@ -3278,6 +3338,7 @@ $('#casaRepGo').addEventListener('click', async () => {
       .filter(m => m.tipo === 'ingreso' && !esCanceladoMov(m))   // un pago cancelado no es un pago
       .sort((a,b) => tsADate(b.ts) - tsADate(a.ts));
     if (!movs.length){ $('#casaRepErr').textContent = `Sin pagos registrados para "${casa}"`; return; }
+    await cargarLib('pdf');
     const { doc, filename } = construirReporteCasaPDF(casa, movs);
     doc.save(filename);
     toast('Reporte descargado', 'ok');
@@ -3374,7 +3435,11 @@ async function registerPush(){
   // si una cuenta choca con el límite de cancelaciones/correcciones de Finanzas.
   if (ME.rol!=='residente' && ME.rol!=='master') return;
   try {
-    if (!('serviceWorker' in navigator) || !firebase.messaging.isSupported()) return;
+    if (!('serviceWorker' in navigator)) return;
+    // SDK de mensajes bajo demanda (no va en index.html): ya con el panel pintado, no retrasa el arranque.
+    // OJO: con vapidKey vacío el SDK usa la clave VAPID por defecto de Firebase, así que se sigue registrando igual que antes.
+    await cargarScript(FIREBASE_SDK + 'firebase-messaging-compat.js');
+    if (!firebase.messaging.isSupported()) return;
     const perm = await Notification.requestPermission();
     if (perm !== 'granted') return;
     // Scope PROPIO para el worker de push. Solo puede haber un service worker por scope: antes
@@ -3709,7 +3774,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v30';
+const APP_VERSION = 'v31';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
