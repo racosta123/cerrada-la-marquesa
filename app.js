@@ -354,6 +354,7 @@ function enterApp(){
   watchFinanzas();
   if (ME.rol==='residente' || ME.rol==='esclavo') watchInvites();
   setupMiFamilia();
+  setupVoz();
   registerPush();
   refrescarAvisoPago(true);
 }
@@ -442,6 +443,8 @@ function buildTabs(){
   $('#susAutoSection').classList.toggle('hidden', !isStaff);
   $('#recSimularBtn').classList.toggle('hidden', !(ME.rol === 'master' || ME.rol === 'admin'));   // cosmético; el Worker revalida
   $('#ccLinkField').classList.toggle('hidden', ME.rol !== 'master');
+  $('#vozAdminSection').classList.toggle('hidden', !isStaff);          // llaves de voz: staff (el Worker revalida)
+  $('#vozAtajoField').classList.toggle('hidden', ME.rol !== 'master');  // link del atajo: solo master
   if (isStaff) cargarConfigCobranza();
 }
 
@@ -677,7 +680,10 @@ function filaBitacora(a, alerta){
       ? `<div class="mov-liga">Invitado por ${esc(a.invitadoPor || '—')}${a.casa ? ' · ' + esc(a.casa) : ''}</div>` : '')
     : (a.familiarDe
       ? `<div class="mov-liga">Familiar de ${esc(a.familiarDe)}${a.casa ? ' · ' + esc(a.casa) : ''}`
-        + `${a.dadoDeAltaNombre ? ' · dado de alta por ' + esc(a.dadoDeAltaNombre) : ''}</div>` : '');
+        + `${a.dadoDeAltaNombre ? ' · dado de alta por ' + esc(a.dadoDeAltaNombre) : ''}</div>` : '')
+    // Apertura con la llave de voz: "por voz (Siri) · <dispositivo> · <casa>".
+    + (a.via === 'voz'
+      ? `<div class="mov-liga">🎙️ Por voz (Siri)${a.dispositivo ? ' · ' + esc(a.dispositivo) : ''}${a.casa && !a.familiarDe ? ' · ' + esc(a.casa) : ''}</div>` : '');
   const alertaHtml = alerta
     ? `<div class="mov-liga bad">⚠️ ${alerta.tipoAlerta === 'posible-otra-casa' ? 'Posible residente de otra casa' : 'Posible residente suspendido'}`
       + ` · coincide con ${esc(alerta.coincideCon || '')}</div>` : '';
@@ -1019,6 +1025,7 @@ function refrescarGestion(){
   if (gestionCargando) return gestionCargando;
   const btn = $('#refreshPersonasBtn'); if (btn) btn.disabled = true;
   if (ME.rol === 'master') cargarDispositivos();   // solo lista (no consulta a Shelly Cloud)
+  cargarVozAdmin();
   gestionCargando = refrescarPersonas(true).finally(() => { gestionCargando = null; if (btn) btn.disabled = false; });
   return gestionCargando;
 }
@@ -3484,6 +3491,154 @@ async function registerPush(){
   } catch(e){ console.warn('Push no disponible', e); }
 }
 
+/* ====================== ABRIR CON SIRI (llaves personales de voz) ======================
+   El Worker hace todo (genera la llave, guarda solo su hash, revalida rol/suspensión, límites).
+   Aquí solo se pinta. La llave en claro llega UNA vez (al generarla), se muestra en la hoja y se
+   borra del DOM y de la memoria al cerrarla: nunca se guarda en localStorage ni se vuelve a pedir. */
+const esIPhone = () => /iPhone|iPad|iPod/.test(navigator.userAgent)
+  || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);   // iPad con iPadOS se anuncia como Mac
+const puedeVoz = () => !!ME && ME.rol === 'residente' && ME.suspendido !== true && (ME.estado || 'activo') === 'activo';
+let vozAtajoUrl = '';
+function setupVoz(){
+  $('#vozSection').classList.toggle('hidden', !(puedeVoz() && esIPhone()));
+}
+function armarConfirmacion(btn, texto, fn){
+  if (btn.dataset.armado !== '1'){
+    btn.dataset.armado = '1'; btn.textContent = '¿Seguro? Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = texto; } }, 4000);
+    return;
+  }
+  btn.dataset.armado = '';
+  fn();
+}
+const fechaCorta = iso => iso ? new Date(iso).toLocaleDateString('es-MX', { day:'2-digit', month:'short', year:'2-digit' }) : '';
+function limpiarLlaveMostrada(){
+  $('#vozLlave').textContent = '';
+  $('#vozResultado').classList.add('hidden');
+  $('#vozForm').classList.remove('hidden');
+}
+async function abrirVozSheet(){
+  if (!puedeVoz()) return;
+  limpiarLlaveMostrada();
+  $('#vozDispositivo').value = '';
+  $('#vozErr').textContent = '';
+  openSheet('#vozOverlay');
+  try { vozAtajoUrl = (await authedFetch('/config/voz', {})).atajoUrl || ''; } catch(e){ vozAtajoUrl = ''; }
+  pintarBotonAtajo();
+  await cargarMisLlavesVoz();
+}
+function pintarBotonAtajo(){
+  const a = $('#vozAtajoBtn');
+  if (vozAtajoUrl){ a.href = vozAtajoUrl; a.classList.remove('hidden'); }
+  else { a.removeAttribute('href'); a.classList.add('hidden'); }
+  $('#vozAtajoNota').textContent = vozAtajoUrl
+    ? 'Al agregar el atajo, el iPhone te pedirá la llave: pégala. Luego di «Oye Siri, abre la puerta de residentes».'
+    : 'La administración todavía no publica el atajo. Guarda tu llave en un lugar seguro o revócala y genera otra cuando esté listo.';
+}
+async function cargarMisLlavesVoz(){
+  const lista = $('#vozLista');
+  try {
+    const r = await authedFetch('/voz/llaves/mias', {});
+    const llaves = r.llaves || [];
+    $('#vozCount').textContent = `(${llaves.length}/${r.max || 2})`;
+    $('#vozGenerarBtn').disabled = llaves.length >= (r.max || 2);
+    $('#vozGenerarBtn').textContent = llaves.length >= (r.max || 2) ? `Máximo ${r.max || 2} llaves: revoca una` : 'Generar mi llave';
+    if (!llaves.length){ lista.innerHTML = '<div class="empty">Aún no tienes llaves de voz</div>'; return; }
+    lista.innerHTML = '';
+    llaves.forEach(k => {
+      const row = document.createElement('div'); row.className = 'row';
+      row.innerHTML = `<div class="ri">🎙️</div><div class="rt"><div class="a">${esc(k.dispositivo)}</div>`
+        + `<div class="b">Creada ${esc(fechaCorta(k.creadoEn))}${k.ultimoUso ? ' · último uso ' + esc(fmtTime(k.ultimoUso)) : ' · sin usar'}</div></div>`;
+      const b = document.createElement('button'); b.className = 'row-act danger'; b.textContent = 'Revocar';
+      b.addEventListener('click', () => armarConfirmacion(b, 'Revocar', () => revocarLlaveVoz(k.id, b, cargarMisLlavesVoz)));
+      row.appendChild(b); lista.appendChild(row);
+    });
+  } catch(e){
+    lista.innerHTML = `<div class="empty">No se pudieron cargar tus llaves (${esc(e.message || 'error')})</div>`;
+  }
+}
+async function revocarLlaveVoz(id, btn, despues){
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/voz/llaves/revocar', { id });
+    toast('Llave revocada: ese atajo ya no abre', 'ok');
+    await despues();
+  } catch(e){
+    toast(e.message || 'No se pudo revocar', 'bad');
+    btn.disabled = false; btn.textContent = 'Revocar';
+  }
+}
+$('#vozAbrirBtn').addEventListener('click', abrirVozSheet);
+$('#vozCerrarBtn').addEventListener('click', () => { limpiarLlaveMostrada(); closeSheet('#vozOverlay'); });
+$('#vozOverlay').addEventListener('click', e => { if (e.target.id === 'vozOverlay'){ limpiarLlaveMostrada(); closeSheet('#vozOverlay'); } });
+$('#vozGenerarBtn').addEventListener('click', async () => {
+  const disp = $('#vozDispositivo').value.trim();
+  $('#vozErr').textContent = '';
+  if (disp.length < 2){ $('#vozErr').textContent = 'Escribe el nombre del dispositivo (ej. iPhone de Ana)'; return; }
+  const btn = $('#vozGenerarBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/voz/llaves/crear', { dispositivo: disp });
+    $('#vozLlave').textContent = r.llave;   // única vez que existe en claro fuera del atajo
+    $('#vozForm').classList.add('hidden');
+    $('#vozResultado').classList.remove('hidden');
+    pintarBotonAtajo();
+    await cargarMisLlavesVoz();
+  } catch(e){
+    $('#vozErr').textContent = e.message || 'No se pudo generar la llave';
+    btn.disabled = false; btn.textContent = 'Generar mi llave';
+  }
+});
+$('#vozCopiarBtn').addEventListener('click', async () => {
+  const llave = $('#vozLlave').textContent;
+  if (!llave) return;
+  try { await navigator.clipboard.writeText(llave); toast('Llave copiada', 'ok'); }
+  catch(e){
+    // Plan B: deja la llave seleccionada para "Copiar" del menú del iPhone.
+    const sel = window.getSelection(), rango = document.createRange();
+    rango.selectNodeContents($('#vozLlave')); sel.removeAllRanges(); sel.addRange(rango);
+    toast('Mantén presionado y elige Copiar', 'ok');
+  }
+});
+
+/* Gestión (staff): todas las llaves activas por casa; revocar cualquiera. Master: link del atajo. */
+async function cargarVozAdmin(){
+  if (!enModoStaff()) return;
+  const lista = $('#vozAdminList');
+  if (ME.rol === 'master'){
+    authedFetch('/config/voz', {}).then(r => { $('#vozAtajoUrl').value = r.atajoUrl || ''; }).catch(() => {});
+  }
+  try {
+    const r = await authedFetch('/voz/llaves/listar', {});
+    if (!r.casas || !r.casas.length){ lista.innerHTML = '<div class="empty">Nadie tiene llaves de voz activas</div>'; return; }
+    lista.innerHTML = '';
+    r.casas.forEach(c => {
+      const t = document.createElement('div'); t.className = 'vnote'; t.style.margin = '10px 4px 4px';
+      t.innerHTML = `<b>${esc(c.casa)}</b>`; lista.appendChild(t);
+      c.llaves.forEach(k => {
+        const row = document.createElement('div'); row.className = 'row';
+        row.innerHTML = `<div class="ri">🎙️</div><div class="rt"><div class="a">${esc(k.nombre || '—')}</div>`
+          + `<div class="b">${esc(k.dispositivo)} · creada ${esc(fechaCorta(k.creadoEn))}${k.ultimoUso ? ' · último uso ' + esc(fmtTime(k.ultimoUso)) : ' · sin usar'}</div>`
+          + `${k.cuentaInactiva ? '<div class="mov-liga bad">Cuenta dada de baja o borrada: la llave ya no abre</div>' : ''}</div>`;
+        const b = document.createElement('button'); b.className = 'row-act danger'; b.textContent = 'Revocar';
+        b.addEventListener('click', () => armarConfirmacion(b, 'Revocar', () => revocarLlaveVoz(k.id, b, cargarVozAdmin)));
+        row.appendChild(b); lista.appendChild(row);
+      });
+    });
+  } catch(e){
+    lista.innerHTML = `<div class="empty">No se pudieron cargar las llaves (${esc(e.message || 'error')})</div>`;
+  }
+}
+$('#vozAtajoGuardar').addEventListener('click', async () => {
+  const btn = $('#vozAtajoGuardar'); $('#vozAtajoErr').textContent = '';
+  btn.disabled = true;
+  try {
+    const r = await authedFetch('/config/voz-actualizar', { atajoUrl: $('#vozAtajoUrl').value.trim() });
+    $('#vozAtajoUrl').value = r.atajoUrl || '';
+    toast(r.atajoUrl ? 'Link del atajo guardado' : 'Link del atajo quitado', 'ok');
+  } catch(e){ $('#vozAtajoErr').textContent = e.message || 'No se pudo guardar'; }
+  finally { btn.disabled = false; }
+});
+
 /* ====================== VOTACIONES (FASE V3) ======================
    El front SOLO consume los 7 endpoints + un listener de Firestore sobre el doc
    PÚBLICO votaciones/{id} (permitido por reglas) para el marcador en vivo. No valida
@@ -3790,7 +3945,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v32';
+const APP_VERSION = 'v33';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

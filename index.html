@@ -454,6 +454,14 @@
     <div id="avisoPagoBanner" class="vbanner hidden" style="margin:0 0 14px"></div>
     <div class="section-title">Abrir puertas</div>
     <div class="doors" id="doorsGrid"></div>
+    <!-- Abrir con Siri: solo residentes activos en iPhone (setupVoz en app.js). -->
+    <div id="vozSection" class="hidden" style="margin-top:22px">
+      <div class="section-title">Abrir con Siri</div>
+      <p class="vnote" style="margin:0 0 10px">Di «Oye Siri, abre la puerta de residentes» y se abre la barrera de Residentes, sin tocar el teléfono.</p>
+      <div class="list">
+        <button class="btn-primary" id="vozAbrirBtn" style="margin-top:0">🎙️ Configurar Abrir con Siri</button>
+      </div>
+    </div>
     <!-- Versión visible para TODOS (mismo estilo y misma fuente que la de Gestión; el diagnóstico
          técnico #appDiag se queda solo en Gestión, para staff) -->
     <div class="app-version" style="margin:26px 0 18px;text-align:center;color:var(--text);font-size:14px;line-height:1.5"></div>
@@ -651,6 +659,18 @@
       <div id="dispDiag" class="vnote hidden" style="margin-top:10px;white-space:pre-wrap;word-break:break-word"></div>
     </div>
 
+    <!-- Llaves de voz (Siri) — staff: todas las activas por casa, revocar cualquiera. El link del
+         atajo plantilla lo cambia SOLO el master (#vozAtajoField). -->
+    <div id="vozAdminSection" class="hidden" style="margin-top:22px">
+      <div class="section-title">Llaves de voz (Siri)</div>
+      <div id="vozAtajoField" class="hidden">
+        <div class="field"><label>Link de iCloud del atajo plantilla</label><input id="vozAtajoUrl" placeholder="https://www.icloud.com/shortcuts/…" autocomplete="off"></div>
+        <button class="btn-ghost" id="vozAtajoGuardar" style="width:100%;margin-top:0">Guardar link del atajo</button>
+        <div id="vozAtajoErr" class="err"></div>
+      </div>
+      <div class="list" id="vozAdminList"><div class="empty">Cargando…</div></div>
+    </div>
+
     <div class="section-title" style="margin-top:22px">Compartir app</div>
     <div class="list">
       <button class="btn-primary" id="shareAppWaBtn" style="margin-top:0">📲 Compartir app</button>
@@ -690,6 +710,30 @@
       <div class="qr-count" id="qrCount"></div>
       <button class="btn-primary" id="shareQrBtn">Compartir código</button>
     </div>
+  </div>
+</div>
+
+<!-- ============ ABRIR CON SIRI (llave personal de voz) ============ -->
+<div class="overlay" id="vozOverlay">
+  <div class="sheet" id="vozSheet">
+    <div class="grab"></div>
+    <h3>Abrir con Siri</h3>
+    <div class="vbanner" style="margin:0 0 14px"><b>🔒 Esta llave es personal. No compartas tu atajo.</b><br>Quien tenga tu atajo puede abrir la barrera de Residentes a tu nombre. Si pierdes o cambias de iPhone, revoca su llave.</div>
+    <div id="vozForm">
+      <div class="field"><label>Nombre de este dispositivo</label><input id="vozDispositivo" maxlength="40" placeholder="Ej. iPhone de Ana" autocomplete="off"></div>
+      <button class="btn-primary" id="vozGenerarBtn">Generar mi llave</button>
+    </div>
+    <div id="vozResultado" class="hidden">
+      <p class="vnote" style="margin:0 0 6px">Tu llave. <b>Solo se muestra esta vez</b>: cópiala y pégala al agregar el atajo.</p>
+      <div id="vozLlave" style="font-family:ui-monospace,Menlo,monospace;font-size:13px;word-break:break-all;padding:12px;border:1px solid var(--line);border-radius:12px;background:var(--surface-2);user-select:all;-webkit-user-select:all"></div>
+      <button class="btn-primary" id="vozCopiarBtn">Copiar llave</button>
+      <a class="btn-primary" id="vozAtajoBtn" href="#" target="_blank" rel="noopener" style="display:block;text-align:center;text-decoration:none;margin-top:10px">Agregar atajo</a>
+      <p class="vnote" id="vozAtajoNota" style="margin:8px 0 0">Al agregar el atajo, el iPhone te pedirá la llave: pégala. Luego di «Oye Siri, abre la puerta de residentes».</p>
+    </div>
+    <div class="section-title" style="margin-top:18px">Mis llaves <span class="fam-count" id="vozCount"></span></div>
+    <div class="list" id="vozLista"><div class="empty">Cargando…</div></div>
+    <div id="vozErr" class="err"></div>
+    <button class="btn-ghost" id="vozCerrarBtn" style="width:100%;margin-top:10px">Cerrar</button>
   </div>
 </div>
 

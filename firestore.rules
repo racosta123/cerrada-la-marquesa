@@ -93,6 +93,15 @@ service cloud.firestore {
     match /controlPin/{readerId} {
       allow read, write: if false;
     }
+    // ---- Abrir con Siri: llaves de voz (solo su hash) y candado por IP ----
+    // NADIE las lee ni escribe desde el cliente: crear, listar, revocar y abrir pasan por el
+    // Worker (service account). Explícito aunque la regla por defecto ya lo niega.
+    match /tokensVoz/{id} {
+      allow read, write: if false;
+    }
+    match /vozCandado/{id} {
+      allow read, write: if false;
+    }
     // ---- finanzas ----
     match /finanzas/{id} {
       // Solo staff lee el detalle de movimientos (incluye el campo "casa" por cuota).

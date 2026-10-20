@@ -28,6 +28,8 @@
 import { triggerShelly, callShellyOnce, shellyCfg, shellySleep } from './shelly-core.js';
 // Módulo "Dispositivos" (cambiar un Shelly desde la app): lógica pura aparte, igual que shelly-core.
 import { PUERTAS_DISP, idShellyValido, parsearDispositivos, mapaParaTrigger, dispositivoEfectivo, consultarShelly, listarDispositivosCuenta, criterioAutoritativo, HISTORIAL_MAX } from './dispositivos-core.js';
+// Abrir con Siri (llaves personales de voz): lógica pura aparte, igual que shelly-core.
+import { VOZ_PUERTA, VOZ_MAX_ACTIVAS, VOZ_MENSAJES, generarLlaveVoz, idLlaveValido, llaveDeEncabezado, hashLlave, limpiarDispositivo, puertaPedidaPermitida, evaluarLimiteLlave, ipBloqueada, registrarFalloIp, atajoUrlValido } from './voz-core.js';
 
 // Nombres de puerta válidos. Los IDs reales de cada Shelly YA NO viven en el código (repo
 // público): se leen en tiempo de petición del secret SHELLY_DEVICES vía resolveShellyDevice()
@@ -84,6 +86,13 @@ export default {
       let out;
       switch (url.pathname) {
         case '/abrir':             out = await abrir(req, env); break;
+        case '/abrir-voz':         out = await abrirVoz(req, env); break;   // Siri: llave de voz, responde texto
+        case '/voz/llaves/crear':    out = await crearLlaveVoz(req, env); break;
+        case '/voz/llaves/mias':     out = await misLlavesVoz(req, env); break;
+        case '/voz/llaves/revocar':  out = await revocarLlaveVoz(req, env); break;
+        case '/voz/llaves/listar':   out = await listarLlavesVoz(req, env); break;
+        case '/config/voz':          out = await obtenerConfigVoz(req, env); break;
+        case '/config/voz-actualizar': out = await actualizarConfigVoz(req, env); break;
         case '/invitacion/crear':  out = await crearInvitacion(req, env); break;
         case '/validar-qr':        out = await validarQR(req, env); break;  // lo llama el lector físico
         case '/validar-pin':       out = await validarPin(req, env); break; // idem, código de respaldo
@@ -208,6 +217,305 @@ async function abrir(req, env) {
     try { await notificarResidente(env, perfil.residenteUid, `${perfil.nombre} usó ${puerta}`); } catch (e) { /* aviso opcional */ }
   }
   return json({ ok:true });
+}
+
+/* ===========================================================
+   ABRIR CON SIRI — llaves personales de voz (lógica pura en voz-core.js)
+   -----------------------------------------------------------
+   tokensVoz/{sha256(llave)}: uid, personaId, casa, nombre, dispositivo, creadoEn, ultimoUso,
+     revocada (+ contadores del límite). La llave en claro NUNCA se guarda: solo su hash, que es el
+     id del doc (búsqueda directa, sin enumerar). vozCandado/{sha256(IP)}: candado por IP ante
+     llaves inválidas (la IP tampoco se guarda en claro). Ambas colecciones: solo el Worker
+     (firestore.rules las niega al cliente).
+   REGLA: nada de este bloque registra la llave ni el encabezado Authorization (ni completos ni en
+     parte): los console.error llevan solo el nombre de la excepción.
+   =========================================================== */
+const SCOPE_DS = 'https://www.googleapis.com/auth/datastore';
+
+/* Campos extra de la bitácora para una apertura por voz (los pinta la app como "por voz (Siri)"). */
+function camposVia(o) {
+  if (o.via !== 'voz') return {};
+  return {
+    via: { stringValue: 'voz' }, viaEtiqueta: { stringValue: 'por voz (Siri)' },
+    dispositivo: { stringValue: String(o.dispositivo || '').slice(0, 40) },
+    ...(o.casa ? { casa: { stringValue: o.casa } } : {}),
+  };
+}
+function textoVoz(status, msg) {
+  return new Response(msg, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
+}
+async function idIpVoz(req) {
+  return sha256b64url('voz-ip|' + (req.headers.get('CF-Connecting-IP') || 'desconocida'));
+}
+const tsCampo = v => (v ? { timestampValue: v } : { nullValue: null });
+
+/* Suma un fallo al candado de la IP (transacción: dos fallos simultáneos cuentan los dos). */
+async function falloIpVoz(env, ipId, ahora) {
+  try {
+    await conTx(env, async (at, tx) => {
+      const d = await txGet(env, at, `vozCandado/${ipId}`, tx);
+      const n = registrarFalloIp(d ? readDoc(d.fields) : null, ahora);
+      return { writes: [{ update: { name: docName(env, `vozCandado/${ipId}`), fields: {
+        fallidos: { integerValue: String(n.fallidos) }, ventanaInicio: tsCampo(n.ventanaInicio), bloqueadoHasta: tsCampo(n.bloqueadoHasta),
+      } } }] };
+    });
+  } catch (e) { console.error('[voz] no se pudo registrar el fallo de la IP:', e && e.name); }
+}
+
+/* ¿La cuenta de Firebase Auth sigue viva? 'activa' | 'inactiva' (deshabilitada o borrada).
+   Un error de red NO se toma como inactiva: lanza 503 (no abre, pero tampoco revoca). */
+async function cuentaAuthVoz(env, at, uid) {
+  const r = await fetch(`https://identitytoolkit.googleapis.com/v1/projects/${env.FIREBASE_PROJECT}/accounts:lookup`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ localId: [uid] }),
+  });
+  if (!r.ok) {
+    const err = await r.json().catch(() => ({}));
+    if (String(err.error?.message || '').includes('USER_NOT_FOUND')) return 'inactiva';
+    throw httpErr(503, 'Auth no disponible');
+  }
+  const d = await r.json().catch(() => ({}));
+  const u = (d.users || [])[0];
+  return !u || u.disabled === true ? 'inactiva' : 'activa';
+}
+
+/* Reserva ATÓMICA de una apertura: valida el límite (10 s / 30 por hora) y lo descuenta en el
+   mismo commit; dos "Oye Siri" casi simultáneos con la misma llave no abren dos veces. */
+async function reservarAperturaVoz(env, hash, ahora) {
+  return conTx(env, async (at, tx) => {
+    const d = await txGet(env, at, `tokensVoz/${hash}`, tx);
+    const t = d && readDoc(d.fields);
+    if (!t || t.revocada) throw Object.assign(httpErr(401, 'Llave no válida'), { vozMotivo: 'llave_revocada' });
+    const lim = evaluarLimiteLlave(t, ahora);
+    if (!lim.ok) throw Object.assign(httpErr(429, 'Espera'), { vozMotivo: lim.motivo });
+    return { writes: [{
+      update: { name: docName(env, `tokensVoz/${hash}`), fields: {
+        ultimaApertura: tsCampo(lim.nuevo.ultimaApertura), ventanaInicio: tsCampo(lim.nuevo.ventanaInicio),
+        aperturasVentana: { integerValue: String(lim.nuevo.aperturasVentana) }, ultimoUso: tsCampo(lim.nuevo.ultimaApertura),
+      } },
+      updateMask: { fieldPaths: ['ultimaApertura', 'ventanaInicio', 'aperturasVentana', 'ultimoUso'] },
+      currentDocument: { exists: true },
+    }] };
+  });
+}
+
+/* Bitácora de una apertura (o intento) por voz: igual que /abrir — un familiar lleva sus datos del
+   padrón y su alerta, el resto la fila normal — más "por voz (Siri)", casa y dispositivo. */
+async function logVoz(env, perfil, t, resultado, motivo) {
+  const base = { uid: t.uid, puerta: VOZ_PUERTA, hogar: t.uid, resultado, motivo, via: 'voz', dispositivo: t.dispositivo || '' };
+  try {
+    if (perfil && perfil.rol === 'residente' && perfil.jefeId && perfil.personaId) {
+      const extra = await datosAperturaFamiliar(env, perfil);
+      await logAperturaFamiliar(env, { ...base, nombre: perfil.nombre, ...extra });
+    } else {
+      await logApertura(env, { ...base, nombre: (perfil && perfil.nombre) || t.nombre || 'Residente', tipo: 'app', casa: (perfil && perfil.casa) || t.casa || '' });
+    }
+  } catch (e) { console.error('[voz] excepción al registrar en bitácora:', e && e.name); }
+}
+
+/* ============ /abrir-voz — Siri (Atajos) abre la puerta de Residentes ============
+   Authorization: Bearer <llave de voz>. Responde TEXTO corto para que Siri lo diga. */
+async function abrirVoz(req, env) {
+  if (req.method !== 'POST') return textoVoz(405, VOZ_MENSAJES.invalida);
+  const ahora = Date.now();
+  try {
+    const at = await saToken(env, `${SCOPE_DS} https://www.googleapis.com/auth/identitytoolkit`);
+    const ipId = await idIpVoz(req);
+
+    // 1) Candado por IP (5 llaves inválidas = 15 min).
+    const cand = await getDoc(env, at, `vozCandado/${ipId}`);
+    if (cand && ipBloqueada(readDoc(cand.fields), ahora)) {
+      await registrarIntentoFallido(env, at, req, 'voz_ip_bloqueada');
+      return textoVoz(429, VOZ_MENSAJES.espera);
+    }
+
+    // 2) La llave: formato, existe (por su hash) y no revocada.
+    const llave = llaveDeEncabezado(req.headers.get('Authorization'));
+    const hash = llave ? await hashLlave(llave) : '';
+    const tdoc = hash ? await getDoc(env, at, `tokensVoz/${hash}`) : null;
+    const t = tdoc ? readDoc(tdoc.fields) : null;
+    if (!t || !t.uid) {
+      await falloIpVoz(env, ipId, ahora);
+      await registrarIntentoFallido(env, at, req, 'voz_llave_invalida');   // agregado por día/IP truncada; sin llave ni hash
+      return textoVoz(401, VOZ_MENSAJES.invalida);
+    }
+    if (t.revocada) {
+      await falloIpVoz(env, ipId, ahora);
+      await logVoz(env, null, t, 'error', 'llave_revocada');
+      return textoVoz(401, VOZ_MENSAJES.invalida);
+    }
+
+    // 3) Solo Residentes. El cuerpo es opcional; si pide otra puerta (cuerpo o ?puerta=), se rechaza.
+    let body = null;
+    try { const txt = await req.text(); body = txt.trim() ? JSON.parse(txt) : null; } catch (e) { body = null; }
+    const qp = new URL(req.url).searchParams.get('puerta');
+    if (!puertaPedidaPermitida(body) || (qp !== null && qp !== VOZ_PUERTA)) {
+      await logVoz(env, null, t, 'error', 'puerta_no_permitida');
+      return textoVoz(403, VOZ_MENSAJES.otraPuerta);
+    }
+
+    // 4) La persona sigue existiendo y activa (perfil, padrón y cuenta de Auth). Si no: la llave
+    //    se revoca sola y ya no sirve nunca más.
+    const [udoc, pdoc, cuenta] = await Promise.all([
+      getDoc(env, at, `usuarios/${t.uid}`),
+      t.personaId ? getDoc(env, at, `personas/${t.personaId}`) : Promise.resolve(null),
+      cuentaAuthVoz(env, at, t.uid),
+    ]);
+    const perfil = udoc ? readDoc(udoc.fields) : null;
+    const persona = pdoc ? readDoc(pdoc.fields) : null;
+    if (!perfil || perfil.rol !== 'residente' || (t.personaId && (!persona || persona.estado === 'baja')) || cuenta === 'inactiva') {
+      await firestoreUpdate(env, `tokensVoz/${hash}`, {
+        revocada: { booleanValue: true }, revocadaEn: { timestampValue: new Date(ahora).toISOString() },
+        revocadaPor: { stringValue: 'sistema' }, motivoRevocacion: { stringValue: 'cuenta_inactiva' },
+      }, ['revocada', 'revocadaEn', 'revocadaPor', 'motivoRevocacion']);
+      await logVoz(env, null, t, 'error', 'cuenta_inactiva');
+      return textoVoz(401, VOZ_MENSAJES.invalida);
+    }
+
+    // 5) Suspensión (por mora o manual: las dos dejan suspendido/estado en el perfil y el padrón).
+    if (perfil.suspendido === true || (persona && persona.estado === 'suspendido')) {
+      await logVoz(env, perfil, t, 'error', 'suspendido');
+      return textoVoz(403, VOZ_MENSAJES.suspendido);
+    }
+
+    // 6) Límite por llave (10 s / 30 por hora). Los excesos van al registro agregado, no a la bitácora.
+    try { await reservarAperturaVoz(env, hash, ahora); }
+    catch (e) {
+      if (e && e.vozMotivo === 'llave_revocada') { await logVoz(env, perfil, t, 'error', 'llave_revocada'); return textoVoz(401, VOZ_MENSAJES.invalida); }
+      if (e && e.vozMotivo) { await registrarIntentoFallido(env, at, req, 'voz_' + e.vozMotivo); return textoVoz(429, VOZ_MENSAJES.espera); }
+      throw e;
+    }
+
+    // 7) Mismo camino que /abrir (portero de fila si está activo), SIEMPRE la puerta de Residentes.
+    let fallo = null;
+    try { await triggerShelly(env, VOZ_PUERTA, await mapaDispositivos(env)); } catch (e) { fallo = e; }
+    const motivo = fallo ? String(fallo.motivo || (fallo.status ? 'http_' + fallo.status : 'excepcion')).slice(0, 60) : '';
+    await logVoz(env, perfil, t, fallo ? 'error' : 'ok', motivo);
+    return fallo ? textoVoz(502, VOZ_MENSAJES.falloPuerta) : textoVoz(200, VOZ_MENSAJES.ok);
+  } catch (e) {
+    console.error('[voz] excepción en /abrir-voz:', e && e.name);
+    return textoVoz(503, VOZ_MENSAJES.noDisponible);
+  }
+}
+
+/* Llaves de un uid (con o sin transacción). Igualdad sobre un solo campo: sin índice compuesto. */
+async function llavesVozDe(env, at, uid, tx) {
+  const r = await fetch(`${fsBase(env)}:runQuery`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      structuredQuery: { from: [{ collectionId: 'tokensVoz' }], where: { fieldFilter: { field: { fieldPath: 'uid' }, op: 'EQUAL', value: { stringValue: uid } } } },
+      ...(tx ? { transaction: tx } : {}),
+    }),
+  });
+  if (!r.ok) throw httpErr(500, 'Firestore query falló');
+  return ((await r.json()) || []).filter(x => x.document).map(x => ({ id: x.document.name.split('/').pop(), ...readDoc(x.document.fields) }));
+}
+const vistaLlave = t => ({ id: t.id, dispositivo: t.dispositivo || '', creadoEn: t.creadoEn || null, ultimoUso: t.ultimoUso || null });
+
+/* ============ /voz/llaves/crear — el residente genera SU llave (se devuelve UNA sola vez) ============ */
+async function crearLlaveVoz(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'residente') throw httpErr(403, 'Solo los residentes pueden abrir con Siri');
+  if (perfil.suspendido === true || (perfil.estado || 'activo') !== 'activo') throw httpErr(403, 'Tu acceso está suspendido');
+  const { dispositivo } = await req.json().catch(() => ({}));
+  const disp = limpiarDispositivo(dispositivo);
+  if (disp.length < 2) throw httpErr(400, 'Escribe el nombre del dispositivo (ej. iPhone de Ana)');
+
+  const llave = generarLlaveVoz();
+  const hash = await hashLlave(llave);
+  const creadoEn = new Date().toISOString();
+  await conTx(env, async (at, tx) => {
+    const activas = (await llavesVozDe(env, at, user.uid, tx)).filter(x => !x.revocada);
+    if (activas.length >= VOZ_MAX_ACTIVAS) throw httpErr(409, `Ya tienes ${VOZ_MAX_ACTIVAS} llaves activas. Revoca una para crear otra.`);
+    return { writes: [{
+      update: { name: docName(env, `tokensVoz/${hash}`), fields: {
+        uid: { stringValue: user.uid }, personaId: { stringValue: perfil.personaId || '' },
+        casa: { stringValue: perfil.casa || '' }, nombre: { stringValue: perfil.nombre || '' },
+        dispositivo: { stringValue: disp }, creadoEn: { timestampValue: creadoEn }, ultimoUso: { nullValue: null },
+        revocada: { booleanValue: false }, aperturasVentana: { integerValue: '0' },
+      } },
+      currentDocument: { exists: false },
+    }] };
+  });
+  const at = await saToken(env, SCOPE_DS);
+  await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Residente'} creó una llave de voz (Siri) para «${disp}»` });
+  return json({ ok: true, llave, id: hash, dispositivo: disp });
+}
+
+/* ============ /voz/llaves/mias — las llaves ACTIVAS de quien llama (sin la llave, solo su id) ============ */
+async function misLlavesVoz(req, env) {
+  const user = await requireAuth(req, env);
+  const at = await saToken(env, SCOPE_DS);
+  const llaves = (await llavesVozDe(env, at, user.uid)).filter(x => !x.revocada).map(vistaLlave)
+    .sort((a, b) => String(b.creadoEn).localeCompare(String(a.creadoEn)));
+  return json({ ok: true, llaves, max: VOZ_MAX_ACTIVAS });
+}
+
+/* ============ /voz/llaves/revocar — el dueño revoca la suya; staff, cualquiera ============ */
+async function revocarLlaveVoz(req, env) {
+  const user = await requireAuth(req, env);
+  const { id } = await req.json().catch(() => ({}));
+  if (!idLlaveValido(id)) throw httpErr(400, 'id inválido');
+  const at = await saToken(env, SCOPE_DS);
+  const [doc, perfil] = await Promise.all([getDoc(env, at, `tokensVoz/${id}`), getPerfil(env, user.uid)]);
+  const t = doc && readDoc(doc.fields);
+  if (!t) throw httpErr(404, 'La llave no existe');
+  const esDueno = t.uid === user.uid;
+  if (!esDueno && !esStaff(perfil)) throw httpErr(403, 'Solo el dueño o la administración revocan una llave');
+  if (t.revocada) return json({ ok: true, id, yaEstaba: true });
+  await firestoreActualizarCampos(env, `tokensVoz/${id}`, {
+    revocada: { booleanValue: true }, revocadaEn: { timestampValue: new Date().toISOString() },
+    revocadaPor: { stringValue: user.uid }, revocadaNombre: { stringValue: (perfil && perfil.nombre) || '' },
+  }, 'Llave');
+  await logBitacora(env, at, { uid: user.uid, nombre: esDueno
+    ? `${perfil?.nombre || 'Residente'} revocó su llave de voz (Siri) «${t.dispositivo || ''}»`
+    : `${perfil?.nombre || 'Administración'} revocó la llave de voz (Siri) de ${t.nombre || 'un residente'}${t.casa ? ' (' + t.casa + ')' : ''} «${t.dispositivo || ''}»` });
+  return json({ ok: true, id });
+}
+
+/* ============ /voz/llaves/listar — SOLO staff: todas las llaves activas, por casa ============ */
+async function listarLlavesVoz(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff');
+  const [docs, all] = await Promise.all([firestoreList(env, 'tokensVoz'), personasList(env)]);
+  const byId = {}; all.forEach(p => byId[p.id] = p);
+  const porCasa = new Map();
+  for (const d of docs) {
+    const t = { id: d.name.split('/').pop(), ...readDoc(d.fields) };
+    if (t.revocada) continue;
+    const p = t.personaId ? byId[t.personaId] : null;
+    const casa = (p && domicilioDe(p, byId)) || t.casa || 'Sin casa';
+    if (!porCasa.has(casa)) porCasa.set(casa, []);
+    porCasa.get(casa).push({ ...vistaLlave(t), nombre: (p && p.nombre) || t.nombre || '', cuentaInactiva: !p || esBaja(p) });
+  }
+  const casas = [...porCasa].map(([casa, llaves]) => ({ casa, llaves }))
+    .sort((a, b) => a.casa.localeCompare(b.casa, 'es', { numeric: true }));
+  return json({ ok: true, casas, total: casas.reduce((n, c) => n + c.llaves.length, 0) });
+}
+
+/* ============ /config/voz — link de iCloud del atajo plantilla (cualquier usuario autenticado lo lee;
+   SOLO el master lo cambia desde Gestión, sin tocar código) ============ */
+async function obtenerConfigVoz(req, env) {
+  await requireAuth(req, env);
+  const at = await saToken(env, SCOPE_DS);
+  const doc = await getDoc(env, at, 'config/voz');
+  return json({ ok: true, atajoUrl: (doc && readDoc(doc.fields)?.atajoUrl) || '' });
+}
+async function actualizarConfigVoz(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master cambia el link del atajo');
+  const { atajoUrl } = await req.json().catch(() => ({}));
+  const url = String(atajoUrl || '').trim();
+  if (!atajoUrlValido(url)) throw httpErr(400, 'Pega el link de iCloud del atajo (empieza con https://www.icloud.com/shortcuts/)');
+  const at = await saToken(env, SCOPE_DS);
+  await firestoreSet(env, 'config/voz', {
+    atajoUrl: { stringValue: url }, actualizadoPor: { stringValue: user.uid }, actualizadoEn: { timestampValue: new Date().toISOString() },
+  }, at);
+  await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Master'} ${url ? 'actualizó' : 'quitó'} el link del atajo de Siri` });
+  return json({ ok: true, atajoUrl: url });
 }
 
 /* ============ /invitacion/crear — residente genera QR de visita ============ */
@@ -445,6 +753,7 @@ async function logAperturaFamiliar(env, o) {
     personaId: { stringValue: o.personaId || '' }, familiarDe: { stringValue: o.familiarDe || '' },
     casa: { stringValue: o.casa || '' }, dadoDeAltaNombre: { stringValue: o.dadoDeAltaNombre || '' },
     ts: { timestampValue: new Date().toISOString() },
+    ...camposVia(o),
   };
   const writes = [{
     update: { name: docName(env, `aperturas/${id}`), fields: { uid: { stringValue: o.uid }, ...comun } },
@@ -3969,6 +4278,7 @@ async function logApertura(env, o) {
       resultado:{stringValue:o.resultado || 'ok'},
     };
     if (o.motivo) campos.motivo = { stringValue: o.motivo };
+    Object.assign(campos, camposVia(o));
     const r = await fetch(`${fsBase(env)}/aperturas`, {
       method:'POST', headers:{ Authorization:'Bearer '+at, 'Content-Type':'application/json' },
       body: JSON.stringify({ fields: campos }),
