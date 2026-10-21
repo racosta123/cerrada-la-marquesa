@@ -35,6 +35,13 @@ service cloud.firestore {
       allow delete: if false;
     }
 
+    // ---- personas (padrón) ----
+    // NADIE la lee ni escribe desde el cliente: altas, cambios, suspensiones y la marca
+    // casaPrueba (solo master) pasan por el Worker. Explícito aunque la regla por defecto ya lo niega.
+    match /personas/{id} {
+      allow read, write: if false;
+    }
+
     // ---- aperturas (bitácora) ----
     match /aperturas/{id} {
       // staff ve todo; residente/esclavo su hogar; y TODA la casa (jefe y familiares) ve las

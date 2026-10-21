@@ -123,6 +123,7 @@ export default {
         case '/personas/reactivar': out = await reactivarPersona(req, env); break;
         case '/personas/borrar':    out = await borrarPersona(req, env); break;
         case '/personas/admin':     out = await adminPersona(req, env); break;
+        case '/personas/casa-prueba': out = await casaPruebaPersona(req, env); break;
         case '/personas/listar':    out = await listarPersonas(req, env); break;
         case '/personas/mis-familiares': out = await misFamiliares(req, env); break;
         case '/personas/familiar-cancelar': out = await cancelarFamiliar(req, env); break;
@@ -545,15 +546,17 @@ async function listarLlavesVoz(req, env) {
   const [docs, all] = await Promise.all([firestoreList(env, 'tokensVoz'), personasList(env)]);
   const byId = {}; all.forEach(p => byId[p.id] = p);
   const porCasa = new Map();
+  const casasPrueba = new Set();
   for (const d of docs) {
     const t = { id: d.name.split('/').pop(), ...readDoc(d.fields) };
     if (t.revocada) continue;
     const p = t.personaId ? byId[t.personaId] : null;
     const casa = (p && domicilioDe(p, byId)) || t.casa || 'Sin casa';
+    if (p && esCasaPrueba(p.jefeId ? byId[p.jefeId] : p)) casasPrueba.add(casa);
     if (!porCasa.has(casa)) porCasa.set(casa, []);
     porCasa.get(casa).push({ ...vistaLlave(t), nombre: (p && p.nombre) || t.nombre || '', cuentaInactiva: !p || esBaja(p) });
   }
-  const casas = [...porCasa].map(([casa, llaves]) => ({ casa, llaves }))
+  const casas = [...porCasa].map(([casa, llaves]) => ({ casa, llaves, casaPrueba: casasPrueba.has(casa) }))
     .sort((a, b) => a.casa.localeCompare(b.casa, 'es', { numeric: true }));
   return json({ ok: true, casas, total: casas.reduce((n, c) => n + c.llaves.length, 0) });
 }
@@ -1174,6 +1177,8 @@ async function validarDatosMovimiento(env, body) {
     const jefes = (await personasList(env)).filter(p => esJefe(p));
     const match = jefes.find(j => j.domicilioNorm === domNorm);
     if (!match) throw httpErr(400, `Domicilio no registrado: "${dom}"`);
+    // Una casa de prueba no paga ni entra a la caja: sus pagos ensuciarían ingresos y cobranza.
+    if (esCasaPrueba(match)) throw httpErr(400, `"${match.domicilio}" es una casa de prueba: no registra pagos`);
     casaCanon = match.domicilio;
   }
   return { tipo, concepto: String(concepto).slice(0,120), cat, m, casaCanon };
@@ -2155,6 +2160,12 @@ function domicilioDe(p, byId) {
    cuenta como casa (cobranza, cupo, anti-duplicado de domicilio: el domicilio queda libre). */
 const esBaja = p => !!p && p.estado === 'baja';
 function esJefe(p) { return p.rol === 'residente' && !p.jefeId && !esBaja(p); }
+/* Casa de prueba: un jefe que SOLO el master marca (vía /personas/casa-prueba; personas no es
+   escribible desde el cliente) para probar la app en producción. Abre puertas, usa Siri, recibe
+   avisos y se puede suspender o revocar a mano como cualquiera, pero NO cuenta en cobranza,
+   morosidad automática, recordatorios ni aviso de pago, conteo de casas activas, quórum ni votos. */
+const esCasaPrueba = p => !!p && p.casaPrueba === true;
+function esCasaCobrable(p) { return esJefe(p) && !esCasaPrueba(p); }
 
 /* Proyecta la persona a usuarios/{uid} (solo si tiene cuenta) para reglas/getPerfil/abrir.
    updateMask para NO borrar el fcmToken que escribe el cliente. */
@@ -2478,6 +2489,32 @@ async function adminPersona(req, env) {
   return json({ ok:true, id, esAdmin });
 }
 
+/* ============ /personas/casa-prueba — SOLO master: marca o desmarca una casa de prueba ============
+   Solo un jefe de familia (la casa). El cliente nunca escribe personas/{id} (reglas), así que
+   este es el único camino para poner o quitar la marca. Queda en la bitácora general. */
+async function casaPruebaPersona(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'master') throw httpErr(403, 'Solo master marca casas de prueba');
+
+  const { id, casaPrueba } = await req.json();
+  if (!id || !/^[A-Za-z0-9-]{10,64}$/.test(id)) throw httpErr(400, 'id inválido');
+  if (typeof casaPrueba !== 'boolean') throw httpErr(400, 'casaPrueba debe ser true o false');
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const all = await personasList(env, at);
+  const p = all.find(x => x.id === id);
+  if (!p) throw httpErr(404, 'Persona no existe');
+  if (!esJefe(p)) throw httpErr(400, 'Solo una casa (jefe de familia) puede ser casa de prueba');
+
+  await firestoreActualizarCampos(env, `personas/${id}`, { casaPrueba:{booleanValue:casaPrueba} }, 'Persona');
+  await logBitacora(env, at, {
+    uid: user.uid,
+    nombre: `${perfil.nombre || 'Master'} ${casaPrueba ? 'marcó como CASA DE PRUEBA' : 'quitó la marca de casa de prueba a'} ${p.nombre}${p.domicilio ? ' ('+p.domicilio+')' : ''}`,
+  });
+  return json({ ok:true, id, casaPrueba });
+}
+
 /* /personas/listar — SOLO staff. Devuelve todo el padrón con domicilio resuelto (familiar
    hereda el del jefe) + el conteo de CASAS ACTIVAS (jefes activos) para el termómetro. */
 async function listarPersonas(req, env) {
@@ -2495,12 +2532,13 @@ async function listarPersonas(req, env) {
     domicilio: domicilioDe(p, byId), domicilioNorm: p.domicilioNorm || '',
     registrado: !!p.uid,
     esAdmin: p.esAdmin === true,   // FASE 7: para la etiqueta y el botón de master en Gestión
+    casaPrueba: esCasaPrueba(p),   // etiqueta "PRUEBA" y botón de master en Gestión
     dadoDeAltaNombre: p.dadoDeAltaNombre || '',   // v13: quién dio de alta al familiar
     duplicadoEstado: p.duplicadoEstado ?? null,   // 'activa' = alta con teléfono/nombre repetido, pendiente de revisar
     duplicadoCon: p.duplicadoCon ?? null,
     bajaMotivo: p.bajaMotivo ?? null, bajaEn: p.bajaEn ?? null, bajaNombre: p.bajaNombre ?? null,
   }));
-  const casasActivas = all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
+  const casasActivas = all.filter(p => esCasaCobrable(p) && (p.estado || 'activo') === 'activo').length;
   return json({ personas, casasActivas });
 }
 
@@ -2538,6 +2576,7 @@ async function pendientesPersonas(req, env) {
       creadoEn: p.creadoEn || null,
       liga, historial,
       duplicadoEstado: p.duplicadoEstado ?? null,
+      casaPrueba: esCasaPrueba(p),
     };
   }).sort((a, b) => String(b.creadoEn || '').localeCompare(String(a.creadoEn || '')));
   return json({ pendientes });
@@ -3004,7 +3043,7 @@ async function resumenFinanzas(req, env) {
   // FASE 6.5 (corregido): el total es el # de JEFES de familia (una casa = un jefe),
   // ACTIVOS Y SUSPENDIDOS. Se revoca el criterio de FASE 5 de excluir suspendidos: si un
   // suspendido no cuenta en el denominador, el % de cobranza mentiría.
-  const totalCasas = (await personasList(env)).filter(p => esJefe(p)).length;
+  const totalCasas = (await personasList(env)).filter(p => esCasaCobrable(p)).length;   // sin casas de prueba
 
   return json({
     ingreso, egreso, balance: ingreso - egreso,
@@ -3046,8 +3085,8 @@ async function cobranzaFinanzas(req, env) {
 
   const cfg = await leerConfigCobranza(env);
 
-  // TODAS las casas (jefes), activas y suspendidas.
-  const casas = (await personasList(env)).filter(p => esJefe(p));
+  // TODAS las casas (jefes), activas y suspendidas — menos las casas de prueba.
+  const casas = (await personasList(env)).filter(p => esCasaCobrable(p));
   const pagaron = [], sinPago = [];
   for (const c of casas) {
     const estado = calcularEstadoCuenta({ altaCasa: c.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(c.domicilioNorm) });
@@ -3078,6 +3117,11 @@ async function estadoCuentaFinanzas(req, env) {
   if (!jefe) throw httpErr(404, 'Tu casa no está en el padrón');
 
   const cfg = await leerConfigCobranza(env);
+  // Casa de prueba: no paga cuota → nunca tiene adeudo ni aviso de corte.
+  if (esCasaPrueba(jefe)) {
+    return json({ ok:true, cuotaMensual: cfg.cuotaMensual, mesesTranscurridos: 0, montoEsperado: 0, montoPagado: 0,
+      adeudo: 0, alCorriente: true, avisoCorte: null, casaPrueba: true });
+  }
   const pagos = [];
   for (const doc of await firestoreList(env, 'finanzas')) {
     const d = readDoc(doc.fields);
@@ -3178,7 +3222,8 @@ async function casasConAdeudo(env, at, cfg, ahora, soloDomNorm) {
   }
   const all = await personasList(env, at);
   const morosas = [];
-  for (const jefe of all.filter(p => esJefe(p) && p.estado === 'activo' && (!soloDomNorm || p.domicilioNorm === soloDomNorm))) {
+  // Sin casas de prueba: de aquí salen el corte automático por mora, los recordatorios y el aviso de pago.
+  for (const jefe of all.filter(p => esCasaCobrable(p) && p.estado === 'activo' && (!soloDomNorm || p.domicilioNorm === soloDomNorm))) {
     const estado = calcularEstadoCuenta({ altaCasa: jefe.creadoEn, cfg, pagosCuotaPorCasa: pagosPorCasa.get(jefe.domicilioNorm), ...(ahora ? { ahora } : {}) });
     if (estado.adeudo > 0) morosas.push({ jefe, estado });
   }
@@ -3743,10 +3788,10 @@ async function conTx(env, fn, tries = 4) {
   throw httpErr(409, 'Conflicto de concurrencia, reintenta');
 }
 
-// # de casas (jefes) activas del padrón — mismo criterio que /personas/listar.
+// # de casas (jefes) activas del padrón, sin casas de prueba — mismo criterio que /personas/listar.
 async function contarCasasActivas(env, at) {
   const all = await personasList(env, at);
-  return all.filter(p => esJefe(p) && (p.estado || 'activo') === 'activo').length;
+  return all.filter(p => esCasaCobrable(p) && (p.estado || 'activo') === 'activo').length;
 }
 // Borra la liga privada. soloVotos=true: solo voto__* (al congelar, conservando tally y throttles).
 // soloVotos=false: TODO _privado (al cerrar). Best-effort, fuera de transacción.
@@ -3914,6 +3959,10 @@ async function votarVotacion(req, env) {
   const perfil = await getPerfil(env, user.uid);
   if (!esJefePerfil(perfil)) throw httpErr(403, 'Solo el jefe de una casa puede votar');
   if (perfil.suspendido || (perfil.estado || 'activo') !== 'activo') throw httpErr(403, 'La casa está suspendida');
+  // Una casa de prueba no cuenta en el quórum, así que tampoco vota (su voto movería el resultado).
+  const atP = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const pdoc = perfil.personaId ? await getDoc(env, atP, `personas/${perfil.personaId}`) : null;
+  if (esCasaPrueba(pdoc ? readDoc(pdoc.fields) : null)) throw httpErr(403, 'Las casas de prueba no votan');
   const { opcion } = await req.json();
   if (!opcion || typeof opcion !== 'string') throw httpErr(400, 'Falta la opción');
 

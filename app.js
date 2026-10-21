@@ -1080,7 +1080,7 @@ function renderPendientes(){
     if (!esAdm || ME.rol === 'master') acts += `<button class="row-act danger" data-act="cancelar-alta" data-id="${p.id}">Cancelar alta</button>`;
     return `<div class="row${p.duplicadoEstado==='activa'?' alerta':''}"><div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
       + `<div class="rt"><div class="a">${esc(titulo)}</div><div class="b">${esc(sub)}</div></div>`
-      + `<div class="tags"><span class="tag${p.liga.estado==='viva'?' in':''}">${p.liga.estado==='viva'?'Liga vigente':p.liga.estado==='vencida'?'Vencida':'Sin liga'}</span></div></div>`
+      + `<div class="tags">${p.casaPrueba ? '<span class="tag prueba">PRUEBA</span>' : ''}<span class="tag${p.liga.estado==='viva'?' in':''}">${p.liga.estado==='viva'?'Liga vigente':p.liga.estado==='vencida'?'Vencida':'Sin liga'}</span></div></div>`
       + (acts ? `<div class="persona-acts">${acts}</div>` : '');
   }).join('');
 }
@@ -1319,6 +1319,8 @@ function personaRow(p){
     : (p.registrado ? `<span class="tag in">Registrado</span>` : `<span class="tag">Sin cuenta</span>`);
   // FASE 7: un jefe con permiso de admin se distingue en el padrón.
   const tagAdmin = p.esAdmin ? `<span class="tag">🛡 Admin</span>` : '';
+  // Casa de prueba (la marca SOLO el master): no cuenta en cobranza, morosidad, conteos ni quórum.
+  const tagPrueba = p.casaPrueba ? `<span class="tag prueba">PRUEBA</span>` : '';
 
   // Acciones (delegadas por data-act). Al master no se le toca; tampoco a tu propia fila.
   let acts = '';
@@ -1333,6 +1335,9 @@ function personaRow(p){
     // las dos cosas). Un familiar no puede serlo; un admin puro ya es staff por su rol.
     if (ME.rol === 'master' && !esFam && !esAdmin)
       acts += `<button class="row-act" data-act="admin" data-id="${p.id}">${p.esAdmin ? 'Quitar admin' : '🛡 Hacer admin'}</button>`;
+    // Casa de prueba: SOLO master y solo sobre un jefe de familia (el Worker revalida).
+    if (ME.rol === 'master' && !esFam && !esAdmin)
+      acts += `<button class="row-act" data-act="casa-prueba" data-id="${p.id}">${p.casaPrueba ? 'Quitar PRUEBA' : '🧪 Casa de prueba'}</button>`;
     if (ME.rol === 'master')
       acts += `<button class="row-act danger" data-act="baja" data-id="${p.id}">Dar de baja</button>`
             + `<button class="row-act danger" data-act="borrar" data-id="${p.id}">Borrar</button>`;
@@ -1361,7 +1366,7 @@ function personaRow(p){
   return `<div class="row${(alFam || dup) ? ' alerta' : ''}">`
       + `<div class="ri">${esc(((p.nombre||'?').trim()[0]||'?').toUpperCase())}</div>`
       + `<div class="rt"><div class="a">${titulo}</div>${sub?`<div class="b">${sub}</div>`:''}</div>`
-      + `<div class="tags">${tagEstado}${tagAdmin}${tagCuenta}</div>`
+      + `<div class="tags">${tagPrueba}${tagEstado}${tagAdmin}${tagCuenta}</div>`
     + `</div>` + alertaLine + dupLine + motivoLine + (acts ? `<div class="persona-acts">${acts}</div>` : '');
 }
 
@@ -1417,6 +1422,7 @@ $('#personasList')?.addEventListener('click', e => {
     case 'suspender': abrirPersonaSuspenderSheet(p); break;
     case 'reactivar': cambiarEstadoPersona(p, 'reactivar', b); break;
     case 'admin':     cambiarAdminPersona(p, b); break;
+    case 'casa-prueba': cambiarCasaPrueba(p, b); break;
     case 'borrar':    abrirPersonaDelSheet(p); break;
     case 'baja':      abrirPersonaBajaSheet(p); break;
     case 'revisar-alerta': revisarAlertaFamiliar(p, b); break;
@@ -1436,6 +1442,24 @@ async function cambiarAdminPersona(p, btn){
   } catch(e){
     toast(e.message || 'No se pudo cambiar el permiso', 'bad');
     btn.disabled = false; btn.textContent = orig;
+  }
+}
+async function cambiarCasaPrueba(p, btn){
+  const marcar = !p.casaPrueba;
+  if (btn.dataset.armado !== '1'){   // dos toques: es una marca que saca a la casa de cobranza
+    btn.dataset.armado = '1'; const orig = btn.textContent; btn.textContent = '¿Seguro? Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = orig; } }, 4000);
+    return;
+  }
+  btn.dataset.armado = '';
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    await authedFetch('/personas/casa-prueba', { id: p.id, casaPrueba: marcar });
+    toast(marcar ? `${p.domicilio || p.nombre} es casa de PRUEBA: no cuenta en cobranza ni conteos` : `${p.domicilio || p.nombre} ya no es casa de prueba`, 'ok');
+    await refrescarPersonas();
+  } catch(e){
+    toast(e.message || 'No se pudo cambiar la marca', 'bad');
+    btn.disabled = false; btn.textContent = marcar ? '🧪 Casa de prueba' : 'Quitar PRUEBA';
   }
 }
 
@@ -2262,7 +2286,8 @@ $('#sinPagoToggle')?.addEventListener('click', () => {
    (activas y suspendidas); las suspendidas se marcan en la opción. -------- */
 function poblarConsultaCasa(){
   const sel = $('#consultaCasaSel');
-  const casas = jefes().slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
+  // Sin casas de prueba: no son parte de la cobranza.
+  const casas = jefes().filter(v => !v.casaPrueba).sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
   const prev = sel.value;
   sel.innerHTML = '';
   if (!casas.length){ sel.appendChild(new Option('—','')); renderConsultaCasa(); return; }
@@ -2817,7 +2842,7 @@ function casaRequerida(){ return movType==='ingreso'; }
    si la suspensión fue por mora; una manual no se quita sola). */
 function poblarCasaSelect(){
   const sel = $('#movCasa');
-  const fuente = jefes();
+  const fuente = jefes().filter(v => !v.casaPrueba);   // una casa de prueba no registra pagos (el Worker lo rechaza)
   const activos = fuente.slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
   const prev = sel.value;
   sel.innerHTML = '';
@@ -3623,7 +3648,7 @@ async function cargarVozAdmin(){
     lista.innerHTML = '';
     r.casas.forEach(c => {
       const t = document.createElement('div'); t.className = 'vnote'; t.style.margin = '10px 4px 4px';
-      t.innerHTML = `<b>${esc(c.casa)}</b>`; lista.appendChild(t);
+      t.innerHTML = `<b>${esc(c.casa)}</b>${c.casaPrueba ? ' <span class="tag prueba" style="font-size:11px;padding:2px 7px;border-radius:8px;background:#7c3aed;color:#fff;font-weight:700">PRUEBA</span>' : ''}`; lista.appendChild(t);
       c.llaves.forEach(k => {
         const row = document.createElement('div'); row.className = 'row';
         row.innerHTML = `<div class="ri">🎙️</div><div class="rt"><div class="a">${esc(k.nombre || '—')}</div>`
@@ -3955,7 +3980,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v33';
+const APP_VERSION = 'v34';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
