@@ -3497,10 +3497,15 @@ async function registerPush(){
    borra del DOM y de la memoria al cerrarla: nunca se guarda en localStorage ni se vuelve a pedir. */
 const esIPhone = () => /iPhone|iPad|iPod/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);   // iPad con iPadOS se anuncia como Mac
-const puedeVoz = () => !!ME && ME.rol === 'residente' && ME.suspendido !== true && (ME.estado || 'activo') === 'activo';
+const esResidenteVoz = () => !!ME && ME.rol === 'residente';
+const puedeVoz = () => esResidenteVoz() && ME.suspendido !== true && (ME.estado || 'activo') === 'activo';
+// Generar llave: solo residente activo y en iPhone. Ver/revocar sus llaves: cualquier residente
+// (también suspendido) desde cualquier equipo, para poder revocar si pierde el iPhone.
+const puedeGenerarVoz = () => puedeVoz() && esIPhone();
 let vozAtajoUrl = '';
 function setupVoz(){
-  $('#vozSection').classList.toggle('hidden', !(puedeVoz() && esIPhone()));
+  $('#vozSection').classList.toggle('hidden', !esResidenteVoz());
+  $('#vozAbrirBtn').textContent = puedeGenerarVoz() ? '🎙️ Configurar Abrir con Siri' : '🎙️ Mis llaves de voz (Siri)';
 }
 function armarConfirmacion(btn, texto, fn){
   if (btn.dataset.armado !== '1'){
@@ -3515,10 +3520,15 @@ const fechaCorta = iso => iso ? new Date(iso).toLocaleDateString('es-MX', { day:
 function limpiarLlaveMostrada(){
   $('#vozLlave').textContent = '';
   $('#vozResultado').classList.add('hidden');
-  $('#vozForm').classList.remove('hidden');
+  const generar = puedeGenerarVoz();
+  $('#vozForm').classList.toggle('hidden', !generar);
+  $('#vozNoGenerar').classList.toggle('hidden', generar);
+  $('#vozNoGenerar').textContent = generar ? '' : !puedeVoz()
+    ? 'Tu acceso está suspendido: no puedes generar llaves, pero sí revocar las que tengas.'
+    : 'Para generar una llave entra desde tu iPhone. Aquí puedes revocar tus llaves si perdiste o cambiaste de teléfono.';
 }
 async function abrirVozSheet(){
-  if (!puedeVoz()) return;
+  if (!esResidenteVoz()) return;
   limpiarLlaveMostrada();
   $('#vozDispositivo').value = '';
   $('#vozErr').textContent = '';

@@ -45,12 +45,21 @@ const docOut = (path, fields) => ({ name: `projects/${PROJ}/databases/(default)/
 const pathDeNombre = n => n.split('/documents/')[1];
 const authUsers = new Map();   // uid -> { disabled }
 const shellyPulsos = [];
+const pushes = [];                    // avisos FCM que mandó el Worker: { token, title, body }
+const fcm = { falla: false };         // true = FCM responde 500
+let llamadasFirestore = 0;
 globalThis.fetch = async (url, opts = {}) => {
   const u = new URL(String(url)); const m = opts.method || 'GET';
   const R = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers });
   if (u.hostname === 'oauth2.googleapis.com') return R({ access_token: 'tok' });
   if (u.hostname === 'www.googleapis.com') return R({ k1: CERT }, 200, { 'cache-control': 'max-age=3600' });
-  if (u.hostname === 'fcm.googleapis.com') return R({});
+  if (u.hostname === 'fcm.googleapis.com') {
+    if (fcm.falla) return R({ error: { status: 'INTERNAL' } }, 500);
+    const msg = JSON.parse(opts.body).message;
+    pushes.push({ token: msg.token, ...msg.notification });
+    return R({});
+  }
+  if (u.hostname === 'firestore.googleapis.com') llamadasFirestore++;
   if (u.hostname === 'identitytoolkit.googleapis.com') {
     const b = JSON.parse(opts.body || '{}');
     if (u.pathname.endsWith('accounts:lookup')) { const a = authUsers.get(b.localId[0]); return R(a ? { users: [{ localId: b.localId[0], disabled: !!a.disabled }] } : {}); }
@@ -113,14 +122,17 @@ const env = {
 const call = async (ruta, uid, body = {}) => {
   const headers = { 'Content-Type': 'application/json' }; if (uid) headers.Authorization = 'Bearer ' + idToken(uid);
   const r = await worker.fetch(new Request('https://w' + ruta, { method: 'POST', headers, body: JSON.stringify(body) }), env);
-  return { status: r.status, body: await r.json().catch(() => ({})) };
+  return { status: r.status, body: await r.json().catch(() => ({})), headers: r.headers };
 };
 // Como lo llama el atajo de Siri: POST con "Authorization: Bearer <llave>", sin pasar por la app.
-const voz = async (llave, { ip = '198.51.100.10', body, metodo = 'POST', query = '' } = {}) => {
+// pais = lo que Cloudflare pone en req.cf.country (null = petición sin req.cf).
+const voz = async (llave, { ip = '198.51.100.10', pais = 'MX', body, metodo = 'POST', query = '' } = {}) => {
   const headers = { 'CF-Connecting-IP': ip };
   if (llave !== undefined) headers.Authorization = 'Bearer ' + llave;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  const r = await worker.fetch(new Request('https://w/abrir-voz' + query, { method: metodo, headers, body: body === undefined || metodo === 'GET' ? undefined : JSON.stringify(body) }), env);
+  const req = new Request('https://w/abrir-voz' + query, { method: metodo, headers, body: body === undefined || metodo === 'GET' ? undefined : JSON.stringify(body) });
+  if (pais !== null) Object.defineProperty(req, 'cf', { value: { country: pais } });
+  const r = await worker.fetch(req, env);
   return { status: r.status, texto: await r.text(), tipo: r.headers.get('content-type') };
 };
 const hashDe = k => createHash('sha256').update(k).digest('base64url');
@@ -134,7 +146,7 @@ const atrasarUltimaApertura = (llave, segundos) => {
 const persona = (id, o) => put(`personas/${id}`, { rol: 'residente', estado: 'activo', ...o });
 const usuario = (uid, o) => { put(`usuarios/${uid}`, { rol: 'residente', estado: 'activo', suspendido: false, jefeId: '', ...o }); authUsers.set(uid, { disabled: false }); };
 persona('p-ana-000001', { nombre: 'Ana Prueba', domicilio: 'Calle 1 #10', uid: 'u-ana' });
-usuario('u-ana', { nombre: 'Ana Prueba', casa: 'Calle 1 #10', personaId: 'p-ana-000001' });
+usuario('u-ana', { nombre: 'Ana Prueba', casa: 'Calle 1 #10', personaId: 'p-ana-000001', fcmToken: 'fcm-token-ana' });
 persona('p-caro-00001', { nombre: 'Caro Prueba', jefeId: 'p-ana-000001', uid: 'u-caro' });
 usuario('u-caro', { nombre: 'Caro Prueba', casa: 'Calle 1 #10', personaId: 'p-caro-00001', jefeId: 'p-ana-000001' });
 persona('p-beto-00001', { nombre: 'Beto Prueba', domicilio: 'Calle 2 #5', uid: 'u-beto', estado: 'suspendido', motivoSuspension: 'mora' });
@@ -274,31 +286,171 @@ await prueba('Persona borrada o desactivada: su llave queda inválida (y se revo
   assert.equal(leer(`tokensVoz/${hashDe(r2.body.llave)}`).revocada, true);
   usuario('u-caro', { nombre: 'Caro Prueba', casa: 'Calle 1 #10', personaId: 'p-caro-00001', jefeId: 'p-ana-000001' });
 });
-await prueba('Candado por IP: 5 llaves falsas = 15 min bloqueada (aun con una llave buena); otra IP sigue', async () => {
+const llaveFalsa = () => 'mqvoz_' + Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
+await prueba('Candado por IP: 5 llaves inexistentes = 15 min bloqueada para llaves inventadas', async () => {
   const ip = '203.0.113.99';
   for (let i = 0; i < 5; i++) {
-    const falsa = 'mqvoz_' + Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString('base64url');
-    const r = await voz(i % 2 ? falsa : 'basura-' + i, { ip });
+    const r = await voz(llaveFalsa(), { ip });
     assert.equal(r.status, 401); assert.equal(r.texto, 'Llave no válida');
   }
-  atrasarUltimaApertura(llaves.ana1, 60);
-  const antes = shellyPulsos.length;
-  const bloqueada = await voz(llaves.ana1, { ip });
+  const bloqueada = await voz(llaveFalsa(), { ip });
   assert.equal(bloqueada.status, 429); assert.equal(bloqueada.texto, 'Espera un momento');
-  assert.equal(shellyPulsos.length, antes);
-  const otra = await voz(llaves.ana1, { ip: '203.0.113.100' });
-  assert.equal(otra.status, 200);
   const c = [...store].find(([k]) => k.startsWith('vozCandado/'));
   assert.ok(c && !JSON.stringify(c).includes(ip), 'la IP no se guarda en claro');
   const intentos = [...store].filter(([k]) => k.startsWith('registro_intentos/')).map(([k]) => k).join(' ');
   assert.match(intentos, /voz_llave_invalida/);
   assert.match(intentos, /voz_ip_bloqueada/);
 });
+await prueba('Corrección 1: una llave VÁLIDA abre aunque su IP esté bloqueada', async () => {
+  atrasarUltimaApertura(llaves.ana1, 60);
+  const antes = shellyPulsos.length;
+  const r = await voz(llaves.ana1, { ip: '203.0.113.99' });   // la IP que quedó bloqueada arriba
+  assert.equal(r.status, 200, r.texto); assert.equal(r.texto, 'Puerta de residentes abierta');
+  assert.deepEqual(shellyPulsos.slice(antes), ['dev-residentes']);
+});
+await prueba('Corrección 1: llaves revocadas o de suspendidos NO suman fallos a la IP', async () => {
+  const ip = '203.0.113.150';
+  const candado = async () => leer(`vozCandado/${createHash('sha256').update('voz-ip|' + ip).digest('base64url')}`);
+  for (let i = 0; i < 6; i++) assert.equal((await voz(llaves.ana2, { ip })).status, 401);   // revocada
+  for (let i = 0; i < 6; i++) assert.equal((await voz(llaves.dani, { ip })).status, 403);   // suspendido
+  assert.equal(await candado(), null, 'no hay candado para esa IP');
+  const r = await voz(llaveFalsa(), { ip });
+  assert.equal(r.status, 401, 'una llave inventada todavía no está bloqueada en esa IP (sin fallos previos)');
+  assert.equal((await candado()).fallidos, 1, 'solo la llave inexistente contó');
+});
 await prueba('Sin llave, llave mal formada o método GET: "Llave no válida"', async () => {
   assert.equal((await voz(undefined, { ip: '192.0.2.1' })).status, 401);
   assert.equal((await voz('mqvoz_corta', { ip: '192.0.2.2' })).status, 401);
   const g = await voz(llaves.ana1, { metodo: 'GET', ip: '192.0.2.3' });
   assert.equal(g.status, 405);
+});
+await prueba('Corrección 7: formato inválido se rechaza SIN consultar Firestore', async () => {
+  const antes = llamadasFirestore;
+  for (const k of [undefined, '', 'basura', 'mqvoz_corta', 'mqvoz_' + 'a'.repeat(44), 'MQVOZ_' + 'a'.repeat(43), llaves.ana1 + ' extra']) {
+    const r = await voz(k, { ip: '192.0.2.50' });
+    assert.equal(r.status, 401); assert.equal(r.texto, 'Llave no válida');
+  }
+  assert.equal(llamadasFirestore, antes, 'ninguna llamada a Firestore');
+});
+await prueba('Corrección 7: la respuesta que entrega la llave lleva Cache-Control: no-store', async () => {
+  const r = await call('/voz/llaves/crear', 'u-ana', { dispositivo: 'iPhone nuevo de Ana' });
+  assert.equal(r.status, 200, JSON.stringify(r.body));
+  assert.equal(r.headers.get('cache-control'), 'no-store');
+  assert.match(r.body.llave, /^mqvoz_/);
+  llaves.ana3 = r.body.llave;
+  assert.equal((await call('/voz/llaves/revocar', 'u-ana', { id: hashDe(llaves.ana3) })).status, 200);   // deja a Ana con 1 activa
+});
+
+// ======================= correcciones de la auditoría =======================
+await prueba('Corrección 4: la bitácora guarda IP y país (MX) de cada apertura por voz', async () => {
+  atrasarUltimaApertura(llaves.ana1, 60);
+  const r = await voz(llaves.ana1, { ip: '198.51.100.77', pais: 'MX' });
+  assert.equal(r.status, 200);
+  const a = aperturasVoz().at(-1);
+  assert.ok(a.resultado === 'ok' && a.ip === '198.51.100.77' && a.pais === 'MX', JSON.stringify(a));
+});
+await prueba('Corrección 4: fuera de México (o sin país) se rechaza, no abre y queda como rechazada', async () => {
+  for (const [pais, ip] of [['US', '198.51.100.81'], ['XX', '198.51.100.82'], ['T1', '198.51.100.83'], [null, '198.51.100.84']]) {
+    atrasarUltimaApertura(llaves.ana1, 60);
+    const antes = shellyPulsos.length, pushAntes = pushes.length;
+    const r = await voz(llaves.ana1, { ip, pais });
+    assert.equal(r.status, 403, `país ${pais}`); assert.equal(r.texto, 'Solo se puede abrir desde México');
+    assert.equal(shellyPulsos.length, antes, 'no abre');
+    assert.equal(pushes.length, pushAntes, 'no hubo apertura, no hay aviso');
+    const a = aperturasVoz().at(-1);
+    assert.ok(a.resultado === 'error' && a.motivo === 'pais_no_permitido' && a.ip === ip && (a.pais || '') === (pais || ''), JSON.stringify(a));
+  }
+  // un país rechazado no gasta el límite de la llave: desde MX abre de inmediato
+  atrasarUltimaApertura(llaves.ana1, 60);
+  assert.equal((await voz(llaves.ana1)).status, 200);
+});
+await prueba('Corrección 3: aviso push al dueño en cada apertura por voz; queda "enviado" en la bitácora', async () => {
+  atrasarUltimaApertura(llaves.ana1, 60);
+  const antes = pushes.length;
+  assert.equal((await voz(llaves.ana1)).status, 200);
+  const p = pushes.slice(antes);
+  assert.equal(p.length, 1);
+  assert.equal(p[0].token, 'fcm-token-ana');
+  assert.match(p[0].body, /iPhone de bAna\/b/);
+  assert.ok(!JSON.stringify(p).includes('mqvoz_'), 'el aviso no lleva la llave');
+  assert.equal(aperturasVoz().at(-1).avisoPush, 'enviado');
+});
+await prueba('Corrección 3: si el aviso push falla, la puerta abre igual y el fallo queda registrado', async () => {
+  atrasarUltimaApertura(llaves.ana1, 60);
+  fcm.falla = true;
+  const antes = shellyPulsos.length;
+  try {
+    const r = await voz(llaves.ana1);
+    assert.equal(r.status, 200); assert.equal(r.texto, 'Puerta de residentes abierta');
+  } finally { fcm.falla = false; }
+  assert.deepEqual(shellyPulsos.slice(antes), ['dev-residentes']);
+  const a = aperturasVoz().at(-1);
+  assert.ok(a.resultado === 'ok' && a.avisoPush === 'error_http_500', JSON.stringify(a));
+  // sin notificaciones activadas (sin fcmToken): abre y queda "sin_token"
+  const c = await call('/voz/llaves/crear', 'u-caro', { dispositivo: 'iPhone 2 de Caro' });
+  llaves.caro2 = c.body.llave;
+  assert.equal((await voz(llaves.caro2)).status, 200);
+  assert.equal(aperturasVoz().at(-1).avisoPush, 'sin_token');
+});
+await prueba('Corrección 6: familiar con jefe suspendido o de baja NO abre; con jefe activo sí', async () => {
+  const ana = leer('personas/p-ana-000001');
+  try {
+    for (const estado of ['suspendido', 'baja']) {
+      put('personas/p-ana-000001', { ...ana, estado });
+      atrasarUltimaApertura(llaves.caro2, 60);
+      const antes = shellyPulsos.length;
+      const r = await voz(llaves.caro2);
+      assert.equal(r.status, 403, estado); assert.equal(r.texto, 'Acceso suspendido');
+      assert.equal(shellyPulsos.length, antes, 'no abre');
+      const a = aperturasVoz().at(-1);
+      assert.ok(a.resultado === 'error' && a.motivo === 'jefe_inactivo' && a.uid === 'u-caro', JSON.stringify(a));
+    }
+    store.delete('personas/p-ana-000001');   // jefe borrado del padrón
+    atrasarUltimaApertura(llaves.caro2, 60);
+    assert.equal((await voz(llaves.caro2)).status, 403);
+  } finally { put('personas/p-ana-000001', ana); }
+  atrasarUltimaApertura(llaves.caro2, 60);
+  assert.equal((await voz(llaves.caro2)).status, 200, 'jefe activo otra vez: abre');
+  assert.equal(leer(`tokensVoz/${hashDe(llaves.caro2)}`).revocada, false, 'suspender al jefe no revoca la llave');
+});
+await prueba('Corrección 5: wrangler.toml apaga los invocation logs (no se registra la petición con Authorization)', async () => {
+  const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8').replace(/#.*$/gm, '');
+  assert.match(toml, /\[observability\]\s*\n\s*enabled\s*=\s*true/);
+  assert.match(toml, /\[observability\.logs\]\s*\n\s*invocation_logs\s*=\s*false/);
+});
+await prueba('Corrección 2 (app): «Mis llaves» en cualquier equipo y para suspendidos; generar solo iPhone activo', async () => {
+  const src = readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+  const ini = src.indexOf('const esIPhone = ');
+  const fin = src.indexOf('async function abrirVozSheet');
+  assert.ok(ini > 0 && fin > ini, 'bloque de voz en app.js');
+  const bloque = src.slice(ini, fin);
+  const UA_IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)', UA_ANDROID = 'Mozilla/5.0 (Linux; Android 14)', UA_PC = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
+  const casos = [
+    // [rol, suspendido, UA, se ve la sección, se puede generar]
+    ['residente', false, UA_IPHONE, true, true],
+    ['residente', false, UA_ANDROID, true, false],
+    ['residente', false, UA_PC, true, false],
+    ['residente', true, UA_IPHONE, true, false],
+    ['residente', true, UA_ANDROID, true, false],
+    ['master', false, UA_IPHONE, false, false],
+    ['esclavo', false, UA_IPHONE, false, false],
+  ];
+  for (const [rol, susp, ua, seVe, genera] of casos) {
+    const el = {}; const $ = sel => (el[sel] ||= { textContent: '', clases: new Set(), classList: { toggle(c, on) { on ? el[sel].clases.add(c) : el[sel].clases.delete(c); }, add(c) { el[sel].clases.add(c); }, remove(c) { el[sel].clases.delete(c); } } });
+    const ME = { rol, suspendido: susp, estado: susp ? 'suspendido' : 'activo' };
+    const navigator = { userAgent: ua, platform: ua === UA_PC ? 'Win32' : '', maxTouchPoints: 0 };
+    const correr = new Function('$', 'ME', 'navigator', `${bloque}\nsetupVoz(); limpiarLlaveMostrada();\nreturn { generar: puedeGenerarVoz() };`);
+    const r = correr($, ME, navigator);
+    const caso = `${rol}/${susp ? 'suspendido' : 'activo'}/${ua.slice(13, 30)}`;
+    assert.equal(!$('#vozSection').clases.has('hidden'), seVe, 'sección ' + caso);
+    assert.equal(r.generar, genera, 'generar ' + caso);
+    if (seVe) {
+      assert.equal(!$('#vozForm').clases.has('hidden'), genera, 'formulario ' + caso);
+      assert.equal(!$('#vozNoGenerar').clases.has('hidden'), !genera, 'nota ' + caso);
+      if (susp) assert.match($('#vozNoGenerar').textContent, /suspendido.*revocar/);
+    }
+  }
+  assert.match(src, /async function abrirVozSheet\(\)\{\s*if \(!esResidenteVoz\(\)\) return;/, 'la hoja abre para cualquier residente');
 });
 
 // ======================= staff y config =======================

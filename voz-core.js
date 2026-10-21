@@ -28,7 +28,16 @@ export const VOZ_MENSAJES = {
   otraPuerta: 'Esta llave solo abre la puerta de residentes',
   falloPuerta: 'No se pudo abrir la puerta. Intenta de nuevo',
   noDisponible: 'No se pudo abrir la puerta. Intenta de nuevo',
+  fueraDePais: 'Solo se puede abrir desde México',
 };
+
+// Solo se abre por voz si Cloudflare ubica la petición en México. País desconocido (XX), Tor (T1)
+// o ausente = no es MX = se rechaza.
+export const VOZ_PAISES_PERMITIDOS = ['MX'];
+export function paisPermitido(pais) { return VOZ_PAISES_PERMITIDOS.includes(String(pais || '').toUpperCase()); }
+
+/* Jefe de familia de un familiar: tiene que existir y estar activo (ni suspendido ni de baja). */
+export function jefeActivo(jefe) { return !!jefe && (jefe.estado || 'activo') === 'activo'; }
 
 const RE_LLAVE = /^mqvoz_[A-Za-z0-9_-]{43}$/;
 const RE_ID = /^[A-Za-z0-9_-]{43}$/;   // id del doc = SHA-256 en base64url (43 caracteres)

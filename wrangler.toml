@@ -41,3 +41,8 @@ crons = ["0 16 * * *"]
 # contar llamadas a /abrir y errores de bitácora. Los logs NO llevan secrets (ver avisarSiFalla).
 [observability]
 enabled = true
+# Sin "invocation logs": son el registro automático de cada petición (Request/Response) y Cloudflare
+# no documenta qué encabezados guarda. /abrir-voz recibe la llave de voz en "Authorization", así que
+# la petición no se registra. Los console.* del Worker (que nunca llevan la llave) se siguen viendo.
+[observability.logs]
+invocation_logs = false
