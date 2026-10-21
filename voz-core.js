@@ -10,7 +10,7 @@
 
 export const VOZ_PREFIJO = 'mqvoz_';
 export const VOZ_PUERTA = 'residentes';
-export const VOZ_MAX_ACTIVAS = 2;              // llaves activas por residente
+export const VOZ_MAX_ACTIVAS = 1;              // una llave por residente: activar de nuevo reemplaza la anterior
 export const VOZ_ESPERA_MS = 10 * 1000;        // 1 apertura cada 10 s por llave
 export const VOZ_VENTANA_MS = 60 * 60 * 1000;  // ventana de 1 hora…
 export const VOZ_MAX_POR_VENTANA = 30;         // …con máximo 30 aperturas por llave

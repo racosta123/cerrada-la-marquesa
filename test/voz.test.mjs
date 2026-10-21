@@ -120,7 +120,7 @@ globalThis.fetch = async (url, opts = {}) => {
 const env = {
   FIREBASE_PROJECT: PROJ, SA_EMAIL: 'sa@test', SA_PRIVATE_KEY: KEY8, ALLOWED_ORIGIN: 'https://x',
   SHELLY_GATE_ENABLED: '0', SHELLY_HOST: 'https://shelly.test', SHELLY_AUTH_KEY: 'clave-shelly-prueba',
-  SHELLY_DEVICES: JSON.stringify({ residentes: 'dev-residentes', visitantes: 'dev-visitantes', salida: 'dev-salida' }),
+  SHELLY_DEVICES: JSON.stringify({ residentes: 'dev-residentes', visitantes: 'dev-visitantes', salida: 'dev-salida', peatones: 'dev-peatones' }),
 };
 const call = async (ruta, uid, body = {}) => {
   const headers = { 'Content-Type': 'application/json' }; if (uid) headers.Authorization = 'Bearer ' + idToken(uid);
@@ -185,29 +185,43 @@ await prueba('Generar llave: 32 bytes, se muestra una vez, en Firestore solo el 
   assert.equal(mias.body.llaves.length, 1);
   assert.ok(!JSON.stringify(mias.body).includes(llaves.ana1), '/mias nunca devuelve la llave');
 });
-await prueba('Máximo 2 llaves activas por residente (la 3a se rechaza)', async () => {
+await prueba('Activar Siri de nuevo: la llave anterior queda INVÁLIDA al instante (una sola llave por residente)', async () => {
+  const vieja = llaves.ana1;
   const r2 = await call('/voz/llaves/crear', 'u-ana', { dispositivo: 'iPad de Ana' });
-  assert.equal(r2.status, 200); llaves.ana2 = r2.body.llave;
-  const r3 = await call('/voz/llaves/crear', 'u-ana', { dispositivo: 'Otro' });
-  assert.equal(r3.status, 409);
-  assert.match(r3.body.error, /2 llaves activas/);
+  assert.equal(r2.status, 200, JSON.stringify(r2.body));
+  const t1 = leer(`tokensVoz/${hashDe(vieja)}`);
+  assert.ok(t1.revocada === true && t1.motivoRevocacion === 'reemplazada', JSON.stringify(t1));
+  const antes = shellyPulsos.length;
+  const v = await voz(vieja, { ip: '198.51.100.11' });
+  assert.equal(v.status, 401); assert.equal(v.texto, 'Llave no válida');
+  assert.equal(shellyPulsos.length, antes, 'la llave regenerada (vieja) no abre');
+  // sin nombre de dispositivo también activa ("iPhone") y deja inválida la del iPad
+  const r3 = await call('/voz/llaves/crear', 'u-ana', {});
+  assert.equal(r3.status, 200); assert.equal(r3.body.dispositivo, 'iPhone');
+  assert.equal(leer(`tokensVoz/${hashDe(r2.body.llave)}`).revocada, true);
+  // la llave vigente de Ana para el resto de las pruebas
+  const r4 = await call('/voz/llaves/crear', 'u-ana', { dispositivo: '  iPhone de <b>Ana</b>  ' });
+  llaves.ana2 = r2.body.llave;   // la del iPad, reemplazada: sirve de llave revocada
+  llaves.ana1 = r4.body.llave;
+  const mias = (await call('/voz/llaves/mias', 'u-ana')).body.llaves;
+  assert.equal(mias.length, 1, 'solo una activa'); assert.equal(mias[0].id, hashDe(llaves.ana1));
+  assert.ok(![...store].some(([, f]) => [vieja, r2.body.llave, r3.body.llave, r4.body.llave].some(k => JSON.stringify(f).includes(k))), 'ninguna llave en claro en Firestore');
 });
-await prueba('Solo residentes activos generan llave (suspendido, esclavo y master: no)', async () => {
+await prueba('Solo residentes activos activan Siri (suspendido, esclavo y master: no)', async () => {
   assert.equal((await call('/voz/llaves/crear', 'u-beto', { dispositivo: 'iPhone de Beto' })).status, 403);
   assert.equal((await call('/voz/llaves/crear', 'u-esclavo', { dispositivo: 'iPhone' })).status, 403);
   assert.equal((await call('/voz/llaves/crear', 'u-master', { dispositivo: 'iPhone' })).status, 403);
-  assert.equal((await call('/voz/llaves/crear', 'u-ana')).status, 400);   // sin nombre de dispositivo
 });
 
 // ======================= /abrir-voz =======================
-await prueba('Llave válida abre Residentes (texto para Siri) y queda en bitácora "por voz (Siri)"', async () => {
+await prueba('Llave válida abre Residentes (texto para Siri) y queda en bitácora "vía Siri"', async () => {
   const antes = shellyPulsos.length;
   const r = await voz(llaves.ana1);
   assert.equal(r.status, 200); assert.equal(r.texto, 'Puerta de residentes abierta');
   assert.match(r.tipo, /^text\/plain/);
   assert.deepEqual(shellyPulsos.slice(antes), ['dev-residentes']);
   const a = aperturasVoz().at(-1);
-  assert.ok(a && a.resultado === 'ok' && a.puerta === 'residentes' && a.viaEtiqueta === 'por voz (Siri)' && a.dispositivo === 'iPhone de bAna/b' && a.casa === 'Calle 1 #10' && a.nombre === 'Ana Prueba' && a.hogar === 'u-ana');
+  assert.ok(a && a.resultado === 'ok' && a.puerta === 'residentes' && a.viaEtiqueta === 'vía Siri' && a.dispositivo === 'iPhone de bAna/b' && a.casa === 'Calle 1 #10' && a.nombre === 'Ana Prueba' && a.hogar === 'u-ana');
   assert.ok(leer(`tokensVoz/${hashDe(llaves.ana1)}`).ultimoUso, 'guarda el último uso');
 });
 await prueba('Límite: una segunda apertura antes de 10 s responde "Espera un momento" y no abre', async () => {
@@ -266,7 +280,7 @@ await prueba('Residente suspendido (por mora o manual) se rechaza ("Acceso suspe
   assert.equal(shellyPulsos.length, antes);
   assert.ok(aperturasVoz().some(a => a.resultado === 'error' && a.motivo === 'suspendido' && a.nombre.startsWith('Dani')));
 });
-await prueba('Familiar: abre con su llave y la bitácora lleva "Familiar de" + "por voz (Siri)"', async () => {
+await prueba('Familiar: abre con su llave y la bitácora lleva "Familiar de" + "vía Siri"', async () => {
   const r = await call('/voz/llaves/crear', 'u-caro', { dispositivo: 'iPhone de Caro' });
   llaves.caro = r.body.llave;
   const v = await voz(llaves.caro);
@@ -338,12 +352,11 @@ await prueba('Corrección 7: formato inválido se rechaza SIN consultar Firestor
   assert.equal(llamadasFirestore, antes, 'ninguna llamada a Firestore');
 });
 await prueba('Corrección 7: la respuesta que entrega la llave lleva Cache-Control: no-store', async () => {
-  const r = await call('/voz/llaves/crear', 'u-ana', { dispositivo: 'iPhone nuevo de Ana' });
+  const r = await call('/voz/llaves/crear', 'u-ana', { dispositivo: '  iPhone de <b>Ana</b>  ' });
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.equal(r.headers.get('cache-control'), 'no-store');
   assert.match(r.body.llave, /^mqvoz_/);
-  llaves.ana3 = r.body.llave;
-  assert.equal((await call('/voz/llaves/revocar', 'u-ana', { id: hashDe(llaves.ana3) })).status, 200);   // deja a Ana con 1 activa
+  llaves.ana1 = r.body.llave;   // activar de nuevo reemplaza la anterior: esta es la vigente de Ana
 });
 
 // ======================= correcciones de la auditoría =======================
@@ -497,15 +510,15 @@ await prueba('Corrección 5: wrangler.toml apaga los invocation logs (no se regi
   assert.match(toml, /\[observability\]\s*\n\s*enabled\s*=\s*true/);
   assert.match(toml, /\[observability\.logs\]\s*\n\s*invocation_logs\s*=\s*false/);
 });
-await prueba('Corrección 2 (app): «Mis llaves» en cualquier equipo y para suspendidos; generar solo iPhone activo', async () => {
+await prueba('App: Siri en «Mi cuenta» (⚙️) para residentes; Activar solo iPhone activo; Desactivar en cualquier equipo', async () => {
   const src = readFileSync(new URL('../app.js', import.meta.url), 'utf8');
   const ini = src.indexOf('const esIPhone = ');
-  const fin = src.indexOf('async function abrirVozSheet');
+  const fin = src.indexOf('async function cargarEstadoVoz');
   assert.ok(ini > 0 && fin > ini, 'bloque de voz en app.js');
   const bloque = src.slice(ini, fin);
   const UA_IPHONE = 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)', UA_ANDROID = 'Mozilla/5.0 (Linux; Android 14)', UA_PC = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)';
   const casos = [
-    // [rol, suspendido, UA, se ve la sección, se puede generar]
+    // [rol, suspendido, UA, ve el botón ⚙️, puede activar]
     ['residente', false, UA_IPHONE, true, true],
     ['residente', false, UA_ANDROID, true, false],
     ['residente', false, UA_PC, true, false],
@@ -514,22 +527,79 @@ await prueba('Corrección 2 (app): «Mis llaves» en cualquier equipo y para sus
     ['master', false, UA_IPHONE, false, false],
     ['esclavo', false, UA_IPHONE, false, false],
   ];
-  for (const [rol, susp, ua, seVe, genera] of casos) {
-    const el = {}; const $ = sel => (el[sel] ||= { textContent: '', clases: new Set(), classList: { toggle(c, on) { on ? el[sel].clases.add(c) : el[sel].clases.delete(c); }, add(c) { el[sel].clases.add(c); }, remove(c) { el[sel].clases.delete(c); } } });
+  for (const [rol, susp, ua, seVe, activa] of casos) for (const conLlave of [false, true]) {
+    const el = {}; const $ = sel => (el[sel] ||= { textContent: '', dataset: {}, disabled: false, clases: new Set(), classList: { toggle(c, on) { on ? el[sel].clases.add(c) : el[sel].clases.delete(c); }, add(c) { el[sel].clases.add(c); }, remove(c) { el[sel].clases.delete(c); } } });
     const ME = { rol, suspendido: susp, estado: susp ? 'suspendido' : 'activo' };
     const navigator = { userAgent: ua, platform: ua === UA_PC ? 'Win32' : '', maxTouchPoints: 0 };
-    const correr = new Function('$', 'ME', 'navigator', `${bloque}\nsetupVoz(); limpiarLlaveMostrada();\nreturn { generar: puedeGenerarVoz() };`);
-    const r = correr($, ME, navigator);
-    const caso = `${rol}/${susp ? 'suspendido' : 'activo'}/${ua.slice(13, 30)}`;
-    assert.equal(!$('#vozSection').clases.has('hidden'), seVe, 'sección ' + caso);
-    assert.equal(r.generar, genera, 'generar ' + caso);
+    const correr = new Function('$', 'ME', 'navigator', 'fmtTime', `${bloque}\nvozActiva = ${conLlave ? "{ dispositivo: 'iPhone', creadoEn: '2026-10-20T00:00:00Z' }" : 'null'};\nsetupVoz(); limpiarLlaveMostrada();\nreturn { activar: puedeGenerarVoz() };`);
+    const r = correr($, ME, navigator, x => x);
+    const caso = `${rol}/${susp ? 'suspendido' : 'activo'}/${ua.slice(13, 30)}/${conLlave ? 'con' : 'sin'} llave`;
+    assert.equal(!$('#cuentaBtn').clases.has('hidden'), seVe, 'botón Mi cuenta ' + caso);
+    assert.equal(r.activar, activa, 'puede activar ' + caso);
     if (seVe) {
-      assert.equal(!$('#vozForm').clases.has('hidden'), genera, 'formulario ' + caso);
-      assert.equal(!$('#vozNoGenerar').clases.has('hidden'), !genera, 'nota ' + caso);
-      if (susp) assert.match($('#vozNoGenerar').textContent, /suspendido.*revocar/);
+      assert.equal(!$('#vozActivarBtn').clases.has('hidden'), activa, 'botón Activar ' + caso);
+      assert.equal(!$('#vozDesactivarBtn').clases.has('hidden'), conLlave, 'botón Desactivar ' + caso);
+      assert.equal(!$('#vozNoGenerar').clases.has('hidden'), !activa, 'nota ' + caso);
+      if (susp) assert.match($('#vozNoGenerar').textContent, /suspendido.*desactivarlo/);
+      if (activa) assert.equal($('#vozActivarBtn').textContent, conLlave ? '🎙️ Activar Siri de nuevo' : '🎙️ Activar Siri');
     }
   }
   assert.match(src, /async function abrirVozSheet\(\)\{\s*if \(!esResidenteVoz\(\)\) return;/, 'la hoja abre para cualquier residente');
+  // Activar: pide la llave al Worker, la copia (ClipboardItem dentro del toque) y abre el atajo.
+  const act = src.slice(src.indexOf("$('#vozActivarBtn').addEventListener"), src.indexOf("$('#vozDesactivarBtn').addEventListener"));
+  assert.match(act, /authedFetch\('\/voz\/llaves\/crear'/); assert.match(act, /ClipboardItem/); assert.match(act, /window\.open\(/);
+  assert.ok(!/localStorage|sessionStorage/.test(act), 'la llave nunca se guarda en el navegador');
+  assert.match(src.slice(src.indexOf("$('#vozDesactivarBtn').addEventListener")), /authedFetch\('\/voz\/desactivar'/);
+  // index.html: nada de Siri en el panel principal; lo de staff al final de Gestión.
+  const html = readFileSync(new URL('../index.html', import.meta.url), 'utf8');
+  const inicio = html.slice(html.indexOf('<div id="tab-doors"'), html.indexOf('<!-- TAB:', html.indexOf('<div id="tab-doors"') + 10));
+  assert.ok(inicio.length > 50 && !/Siri|voz/i.test(inicio), 'el panel principal no menciona Siri');
+  const iShare = html.indexOf('id="shareAppWaBtn"'), iVozAdmin = html.indexOf('id="vozAdminSection"'), iVersion = html.indexOf('id="appVersion"');
+  assert.ok(iShare > 0 && iVozAdmin > iShare && iVersion > iVozAdmin, 'Siri de staff al final de Gestión (después de Compartir app)');
+  assert.match(html, /id="cuentaBtn"/);
+});
+
+// ======================= Activar / Desactivar Siri y reglas de suspensión =======================
+await prueba('Desactivar Siri: el residente (también suspendido) invalida su llave; repetirlo no falla; nadie más lo usa', async () => {
+  // Dani está suspendido (manual) desde la prueba de suspensión y tiene su llave activa
+  assert.equal(leer(`tokensVoz/${hashDe(llaves.dani)}`).revocada, false);
+  const r = await call('/voz/desactivar', 'u-dani');
+  assert.equal(r.status, 200, JSON.stringify(r.body)); assert.equal(r.body.desactivadas, 1);
+  const t = leer(`tokensVoz/${hashDe(llaves.dani)}`);
+  assert.ok(t.revocada === true && t.motivoRevocacion === 'desactivada');
+  reiniciarRechazos(llaves.dani);
+  assert.equal((await voz(llaves.dani, { ip: '198.51.100.60' })).texto, 'Llave no válida');
+  assert.equal((await call('/voz/desactivar', 'u-dani')).body.desactivadas, 0, 'sin llaves activas: no falla');
+  assert.equal((await call('/voz/desactivar', 'u-master')).status, 403);
+  assert.equal((await call('/voz/desactivar', 'u-esclavo')).status, 403);
+  assert.equal((await call('/voz/desactivar', null)).status, 401);
+  assert.equal(leer(`tokensVoz/${hashDe(llaves.ana1)}`).revocada, false, 'no toca las llaves de otros');
+});
+await prueba('Suspendido: mismas reglas que la app (solo Peatonal y Salida); Siri solo abre Residentes, así que lo rechaza', async () => {
+  persona('p-fer-000001', { nombre: 'Fer Prueba', domicilio: 'Calle 5 #1', uid: 'u-fer' });
+  usuario('u-fer', { nombre: 'Fer Prueba', casa: 'Calle 5 #1', personaId: 'p-fer-000001' });
+  const k = (await call('/voz/llaves/crear', 'u-fer', { dispositivo: 'iPhone de Fer' })).body.llave;
+  assert.equal((await voz(k, { ip: '198.51.100.70' })).status, 200, 'activo: Siri abre Residentes');
+  // se suspende por mora (perfil y padrón, como lo deja el cron)
+  put('usuarios/u-fer', { ...leer('usuarios/u-fer'), suspendido: true, estado: 'suspendido' });
+  put('personas/p-fer-000001', { ...leer('personas/p-fer-000001'), estado: 'suspendido', motivoSuspension: 'mora' });
+  const antes = shellyPulsos.length;
+  // app (/abrir): Peatonal y Salida sí; Residentes y Visitantes no
+  for (const [puerta, esperado] of [['peatones', 200], ['salida', 200], ['residentes', 403], ['visitantes', 403]]) {
+    assert.equal((await call('/abrir', 'u-fer', { puerta })).status, esperado, `app ${puerta}`);
+  }
+  assert.deepEqual(shellyPulsos.slice(antes), ['dev-peatones', 'dev-salida'], 'la app solo abrió Peatonal y Salida');
+  // Siri (llamada directa al Worker, sin la app): Residentes → suspendido; pedir otra puerta → rechazada
+  atrasarUltimaApertura(k, 60);
+  const v = await voz(k, { ip: '198.51.100.70' });
+  assert.equal(v.status, 403); assert.equal(v.texto, 'Acceso suspendido');
+  for (const opc of [{ body: { puerta: 'peatones' } }, { body: { puerta: 'salida' } }, { query: '?puerta=salida' }]) {
+    const r = await voz(k, { ip: '198.51.100.70', ...opc });
+    assert.equal(r.status, 403); assert.equal(r.texto, 'Esta llave solo abre la puerta de residentes');
+  }
+  assert.deepEqual(shellyPulsos.slice(antes), ['dev-peatones', 'dev-salida'], 'Siri no abrió nada');
+  // la app le deja desactivar Siri aunque esté suspendido
+  assert.equal((await call('/voz/desactivar', 'u-fer')).body.desactivadas, 1);
 });
 
 // ======================= staff y config =======================
@@ -537,7 +607,7 @@ await prueba('Gestión: staff ve las llaves activas por casa; un residente no', 
   const r = await call('/voz/llaves/listar', 'u-master');
   assert.equal(r.status, 200);
   const casa1 = r.body.casas.find(c => c.casa === 'Calle 1 #10');
-  assert.ok(casa1 && casa1.llaves.some(k => k.dispositivo === 'iPhone de bAna/b') && casa1.llaves.some(k => k.dispositivo === 'iPhone de Caro'));
+  assert.ok(casa1 && casa1.llaves.some(k => k.dispositivo === 'iPhone de bAna/b') && casa1.llaves.some(k => k.dispositivo === 'iPhone 2 de Caro'));
   assert.ok(!r.body.casas.some(c => c.llaves.some(k => k.id === hashDe(llaves.ana2))), 'las revocadas no salen');
   assert.ok(!JSON.stringify(r.body).includes('mqvoz_'), 'nunca devuelve llaves');
   assert.equal((await call('/voz/llaves/listar', 'u-ana')).status, 403);

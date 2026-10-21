@@ -90,6 +90,7 @@ export default {
         case '/voz/llaves/crear':    out = await crearLlaveVoz(req, env); break;
         case '/voz/llaves/mias':     out = await misLlavesVoz(req, env); break;
         case '/voz/llaves/revocar':  out = await revocarLlaveVoz(req, env); break;
+        case '/voz/desactivar':      out = await desactivarSiri(req, env); break;
         case '/voz/llaves/listar':   out = await listarLlavesVoz(req, env); break;
         case '/config/voz':          out = await obtenerConfigVoz(req, env); break;
         case '/config/voz-actualizar': out = await actualizarConfigVoz(req, env); break;
@@ -233,11 +234,11 @@ async function abrir(req, env) {
    =========================================================== */
 const SCOPE_DS = 'https://www.googleapis.com/auth/datastore';
 
-/* Campos extra de la bitácora para una apertura por voz (los pinta la app como "por voz (Siri)"). */
+/* Campos extra de la bitácora para una apertura por voz (los pinta la app como "vía Siri"). */
 function camposVia(o) {
   if (o.via !== 'voz') return {};
   return {
-    via: { stringValue: 'voz' }, viaEtiqueta: { stringValue: 'por voz (Siri)' },
+    via: { stringValue: 'voz' }, viaEtiqueta: { stringValue: 'vía Siri' },
     dispositivo: { stringValue: String(o.dispositivo || '').slice(0, 40) },
     ...(o.casa ? { casa: { stringValue: o.casa } } : {}),
     // Origen de la petición según Cloudflare (IP truncada y país) y resultado del aviso push al dueño.
@@ -474,34 +475,47 @@ async function llavesVozDe(env, at, uid, tx) {
 }
 const vistaLlave = t => ({ id: t.id, dispositivo: t.dispositivo || '', creadoEn: t.creadoEn || null, ultimoUso: t.ultimoUso || null });
 
-/* ============ /voz/llaves/crear — el residente genera SU llave (se devuelve UNA sola vez) ============ */
+/* Escrituras que revocan (en el mismo commit) todas las llaves activas de una lista. */
+function writesRevocarVoz(env, activas, ahoraIso, porUid, motivo) {
+  return activas.map(x => ({
+    update: { name: docName(env, `tokensVoz/${x.id}`), fields: {
+      revocada: { booleanValue: true }, revocadaEn: { timestampValue: ahoraIso },
+      revocadaPor: { stringValue: porUid }, motivoRevocacion: { stringValue: motivo },
+    } },
+    updateMask: { fieldPaths: ['revocada', 'revocadaEn', 'revocadaPor', 'motivoRevocacion'] },
+    currentDocument: { exists: true },
+  }));
+}
+
+/* ============ /voz/llaves/crear — «Activar Siri»: el residente genera SU llave (se devuelve UNA sola vez) ============
+   Una sola llave por residente: activar de nuevo REVOCA la anterior en el mismo commit (la vieja deja
+   de abrir en ese instante). El nombre del dispositivo es opcional ("iPhone" si no viene). */
 async function crearLlaveVoz(req, env) {
   const user = await requireAuth(req, env);
   const perfil = await getPerfil(env, user.uid);
   if (!perfil || perfil.rol !== 'residente') throw httpErr(403, 'Solo los residentes pueden abrir con Siri');
   if (perfil.suspendido === true || (perfil.estado || 'activo') !== 'activo') throw httpErr(403, 'Tu acceso está suspendido');
   const { dispositivo } = await req.json().catch(() => ({}));
-  const disp = limpiarDispositivo(dispositivo);
-  if (disp.length < 2) throw httpErr(400, 'Escribe el nombre del dispositivo (ej. iPhone de Ana)');
+  const disp = limpiarDispositivo(dispositivo).length >= 2 ? limpiarDispositivo(dispositivo) : 'iPhone';
 
   const llave = generarLlaveVoz();
   const hash = await hashLlave(llave);
   const creadoEn = new Date().toISOString();
-  await conTx(env, async (at, tx) => {
+  const reemplazadas = await conTx(env, async (at, tx) => {
     const activas = (await llavesVozDe(env, at, user.uid, tx)).filter(x => !x.revocada);
-    if (activas.length >= VOZ_MAX_ACTIVAS) throw httpErr(409, `Ya tienes ${VOZ_MAX_ACTIVAS} llaves activas. Revoca una para crear otra.`);
-    return { writes: [{
-      update: { name: docName(env, `tokensVoz/${hash}`), fields: {
-        uid: { stringValue: user.uid }, personaId: { stringValue: perfil.personaId || '' },
-        casa: { stringValue: perfil.casa || '' }, nombre: { stringValue: perfil.nombre || '' },
-        dispositivo: { stringValue: disp }, creadoEn: { timestampValue: creadoEn }, ultimoUso: { nullValue: null },
-        revocada: { booleanValue: false }, aperturasVentana: { integerValue: '0' },
-      } },
-      currentDocument: { exists: false },
-    }] };
+    return { value: activas.length, writes: [
+      ...writesRevocarVoz(env, activas, creadoEn, user.uid, 'reemplazada'),
+      { update: { name: docName(env, `tokensVoz/${hash}`), fields: {
+          uid: { stringValue: user.uid }, personaId: { stringValue: perfil.personaId || '' },
+          casa: { stringValue: perfil.casa || '' }, nombre: { stringValue: perfil.nombre || '' },
+          dispositivo: { stringValue: disp }, creadoEn: { timestampValue: creadoEn }, ultimoUso: { nullValue: null },
+          revocada: { booleanValue: false }, aperturasVentana: { integerValue: '0' },
+        } },
+        currentDocument: { exists: false } },
+    ] };
   });
   const at = await saToken(env, SCOPE_DS);
-  await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Residente'} creó una llave de voz (Siri) para «${disp}»` });
+  await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Residente'} activó Siri («${disp}»)${reemplazadas ? '; la llave anterior quedó inválida' : ''}` });
   // La única respuesta que lleva la llave en claro: que nada en el camino la guarde en caché.
   return new Response(JSON.stringify({ ok: true, llave, id: hash, dispositivo: disp }),
     { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' } });
@@ -514,6 +528,24 @@ async function misLlavesVoz(req, env) {
   const llaves = (await llavesVozDe(env, at, user.uid)).filter(x => !x.revocada).map(vistaLlave)
     .sort((a, b) => String(b.creadoEn).localeCompare(String(a.creadoEn)));
   return json({ ok: true, llaves, max: VOZ_MAX_ACTIVAS });
+}
+
+/* ============ /voz/desactivar — «Desactivar Siri»: el residente revoca TODAS sus llaves ============
+   Cualquier residente con sesión, también suspendido (para poder cortar un atajo perdido). */
+async function desactivarSiri(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!perfil || perfil.rol !== 'residente') throw httpErr(403, 'Solo los residentes usan Siri');
+  const ahoraIso = new Date().toISOString();
+  const n = await conTx(env, async (at, tx) => {
+    const activas = (await llavesVozDe(env, at, user.uid, tx)).filter(x => !x.revocada);
+    return { value: activas.length, writes: writesRevocarVoz(env, activas, ahoraIso, user.uid, 'desactivada') };
+  });
+  if (n) {
+    const at = await saToken(env, SCOPE_DS);
+    await logBitacora(env, at, { uid: user.uid, nombre: `${perfil.nombre || 'Residente'} desactivó Siri` });
+  }
+  return json({ ok: true, desactivadas: n });
 }
 
 /* ============ /voz/llaves/revocar — el dueño revoca la suya; staff, cualquiera ============ */

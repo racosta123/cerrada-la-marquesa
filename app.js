@@ -681,9 +681,9 @@ function filaBitacora(a, alerta){
     : (a.familiarDe
       ? `<div class="mov-liga">Familiar de ${esc(a.familiarDe)}${a.casa ? ' · ' + esc(a.casa) : ''}`
         + `${a.dadoDeAltaNombre ? ' · dado de alta por ' + esc(a.dadoDeAltaNombre) : ''}</div>` : '')
-    // Apertura con la llave de voz: "por voz (Siri) · <dispositivo> · <casa>".
+    // Apertura con la llave de voz: "vía Siri · <dispositivo> · <casa>".
     + (a.via === 'voz'
-      ? `<div class="mov-liga">🎙️ Por voz (Siri)${a.dispositivo ? ' · ' + esc(a.dispositivo) : ''}${a.casa && !a.familiarDe ? ' · ' + esc(a.casa) : ''}</div>` : '');
+      ? `<div class="mov-liga">🎙️ Vía Siri${a.dispositivo ? ' · ' + esc(a.dispositivo) : ''}${a.casa && !a.familiarDe ? ' · ' + esc(a.casa) : ''}</div>` : '');
   const alertaHtml = alerta
     ? `<div class="mov-liga bad">⚠️ ${alerta.tipoAlerta === 'posible-otra-casa' ? 'Posible residente de otra casa' : 'Posible residente suspendido'}`
       + ` · coincide con ${esc(alerta.coincideCon || '')}</div>` : '';
@@ -3524,13 +3524,14 @@ const esIPhone = () => /iPhone|iPad|iPod/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);   // iPad con iPadOS se anuncia como Mac
 const esResidenteVoz = () => !!ME && ME.rol === 'residente';
 const puedeVoz = () => esResidenteVoz() && ME.suspendido !== true && (ME.estado || 'activo') === 'activo';
-// Generar llave: solo residente activo y en iPhone. Ver/revocar sus llaves: cualquier residente
-// (también suspendido) desde cualquier equipo, para poder revocar si pierde el iPhone.
+// Activar Siri: solo residente activo y en iPhone. Desactivar: cualquier residente (también
+// suspendido) desde cualquier equipo, para poder cortar el atajo si pierde el iPhone.
 const puedeGenerarVoz = () => puedeVoz() && esIPhone();
 let vozAtajoUrl = '';
+let vozActiva = null;   // llave activa del residente (sin la llave: id, dispositivo, fechas) o null
+// Siri ya no va en el panel principal: vive en «Mi cuenta» (botón ⚙️ del encabezado), solo residentes.
 function setupVoz(){
-  $('#vozSection').classList.toggle('hidden', !esResidenteVoz());
-  $('#vozAbrirBtn').textContent = puedeGenerarVoz() ? '🎙️ Configurar Abrir con Siri' : '🎙️ Mis llaves de voz (Siri)';
+  $('#cuentaBtn').classList.toggle('hidden', !esResidenteVoz());
 }
 function armarConfirmacion(btn, texto, fn){
   if (btn.dataset.armado !== '1'){
@@ -3542,25 +3543,38 @@ function armarConfirmacion(btn, texto, fn){
   fn();
 }
 const fechaCorta = iso => iso ? new Date(iso).toLocaleDateString('es-MX', { day:'2-digit', month:'short', year:'2-digit' }) : '';
+/* Pinta la hoja «Mi cuenta» según quién es y si ya tiene Siri activo. Borra la llave mostrada. */
 function limpiarLlaveMostrada(){
   $('#vozLlave').textContent = '';
+  $('#vozCopiado').textContent = '';
   $('#vozResultado').classList.add('hidden');
   const generar = puedeGenerarVoz();
-  $('#vozForm').classList.toggle('hidden', !generar);
+  $('#vozActivarBtn').classList.toggle('hidden', !generar);
+  $('#vozActivarBtn').disabled = false; $('#vozActivarBtn').dataset.armado = '';
+  $('#vozActivarBtn').textContent = vozActiva ? '🎙️ Activar Siri de nuevo' : '🎙️ Activar Siri';
   $('#vozNoGenerar').classList.toggle('hidden', generar);
   $('#vozNoGenerar').textContent = generar ? '' : !puedeVoz()
-    ? 'Tu acceso está suspendido: no puedes generar llaves, pero sí revocar las que tengas.'
-    : 'Para generar una llave entra desde tu iPhone. Aquí puedes revocar tus llaves si perdiste o cambiaste de teléfono.';
+    ? 'Tu acceso está suspendido: no puedes activar Siri, pero sí desactivarlo.'
+    : 'Para activar Siri entra desde tu iPhone. Desde aquí puedes desactivarlo si perdiste o cambiaste de teléfono.';
+  $('#vozDesactivarBtn').classList.toggle('hidden', !vozActiva);
+  $('#vozDesactivarBtn').disabled = false; $('#vozDesactivarBtn').dataset.armado = ''; $('#vozDesactivarBtn').textContent = 'Desactivar Siri';
+  $('#vozEstado').textContent = vozActiva
+    ? `Siri está activo (${vozActiva.dispositivo || 'iPhone'}, desde ${fechaCorta(vozActiva.creadoEn)}${vozActiva.ultimoUso ? ' · último uso ' + fmtTime(vozActiva.ultimoUso) : ''}).`
+    : 'Siri no está activo.';
+}
+async function cargarEstadoVoz(){
+  try { vozActiva = ((await authedFetch('/voz/llaves/mias', {})).llaves || [])[0] || null; }
+  catch(e){ vozActiva = null; $('#vozErr').textContent = e.message || 'No se pudo consultar Siri'; }
 }
 async function abrirVozSheet(){
   if (!esResidenteVoz()) return;
-  limpiarLlaveMostrada();
-  $('#vozDispositivo').value = '';
-  $('#vozErr').textContent = '';
+  vozActiva = null; $('#vozErr').textContent = '';
+  limpiarLlaveMostrada(); $('#vozEstado').textContent = 'Cargando…';
   openSheet('#vozOverlay');
   try { vozAtajoUrl = (await authedFetch('/config/voz', {})).atajoUrl || ''; } catch(e){ vozAtajoUrl = ''; }
   pintarBotonAtajo();
-  await cargarMisLlavesVoz();
+  await cargarEstadoVoz();
+  limpiarLlaveMostrada();
 }
 function pintarBotonAtajo(){
   const a = $('#vozAtajoBtn');
@@ -3568,60 +3582,81 @@ function pintarBotonAtajo(){
   else { a.removeAttribute('href'); a.classList.add('hidden'); }
   $('#vozAtajoNota').textContent = vozAtajoUrl
     ? 'Al agregar el atajo, el iPhone te pedirá la llave: pégala. Luego di «Oye Siri, abre la puerta de residentes».'
-    : 'La administración todavía no publica el atajo. Guarda tu llave en un lugar seguro o revócala y genera otra cuando esté listo.';
-}
-async function cargarMisLlavesVoz(){
-  const lista = $('#vozLista');
-  try {
-    const r = await authedFetch('/voz/llaves/mias', {});
-    const llaves = r.llaves || [];
-    $('#vozCount').textContent = `(${llaves.length}/${r.max || 2})`;
-    $('#vozGenerarBtn').disabled = llaves.length >= (r.max || 2);
-    $('#vozGenerarBtn').textContent = llaves.length >= (r.max || 2) ? `Máximo ${r.max || 2} llaves: revoca una` : 'Generar mi llave';
-    if (!llaves.length){ lista.innerHTML = '<div class="empty">Aún no tienes llaves de voz</div>'; return; }
-    lista.innerHTML = '';
-    llaves.forEach(k => {
-      const row = document.createElement('div'); row.className = 'row';
-      row.innerHTML = `<div class="ri">🎙️</div><div class="rt"><div class="a">${esc(k.dispositivo)}</div>`
-        + `<div class="b">Creada ${esc(fechaCorta(k.creadoEn))}${k.ultimoUso ? ' · último uso ' + esc(fmtTime(k.ultimoUso)) : ' · sin usar'}</div></div>`;
-      const b = document.createElement('button'); b.className = 'row-act danger'; b.textContent = 'Revocar';
-      b.addEventListener('click', () => armarConfirmacion(b, 'Revocar', () => revocarLlaveVoz(k.id, b, cargarMisLlavesVoz)));
-      row.appendChild(b); lista.appendChild(row);
-    });
-  } catch(e){
-    lista.innerHTML = `<div class="empty">No se pudieron cargar tus llaves (${esc(e.message || 'error')})</div>`;
-  }
+    : 'La administración todavía no publica el atajo. Desactiva Siri y vuelve a activarlo cuando esté listo.';
 }
 async function revocarLlaveVoz(id, btn, despues){
   btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
     await authedFetch('/voz/llaves/revocar', { id });
-    toast('Llave revocada: ese atajo ya no abre', 'ok');
+    toast('Siri desactivado: ese atajo ya no abre', 'ok');
     await despues();
   } catch(e){
-    toast(e.message || 'No se pudo revocar', 'bad');
-    btn.disabled = false; btn.textContent = 'Revocar';
+    toast(e.message || 'No se pudo desactivar', 'bad');
+    btn.disabled = false; btn.textContent = 'Desactivar Siri';
   }
 }
-$('#vozAbrirBtn').addEventListener('click', abrirVozSheet);
+$('#cuentaBtn').addEventListener('click', abrirVozSheet);
 $('#vozCerrarBtn').addEventListener('click', () => { limpiarLlaveMostrada(); closeSheet('#vozOverlay'); });
 $('#vozOverlay').addEventListener('click', e => { if (e.target.id === 'vozOverlay'){ limpiarLlaveMostrada(); closeSheet('#vozOverlay'); } });
-$('#vozGenerarBtn').addEventListener('click', async () => {
-  const disp = $('#vozDispositivo').value.trim();
-  $('#vozErr').textContent = '';
-  if (disp.length < 2){ $('#vozErr').textContent = 'Escribe el nombre del dispositivo (ej. iPhone de Ana)'; return; }
-  const btn = $('#vozGenerarBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
-  try {
-    const r = await authedFetch('/voz/llaves/crear', { dispositivo: disp });
-    $('#vozLlave').textContent = r.llave;   // única vez que existe en claro fuera del atajo
-    $('#vozForm').classList.add('hidden');
-    $('#vozResultado').classList.remove('hidden');
-    pintarBotonAtajo();
-    await cargarMisLlavesVoz();
-  } catch(e){
-    $('#vozErr').textContent = e.message || 'No se pudo generar la llave';
-    btn.disabled = false; btn.textContent = 'Generar mi llave';
+/* «Activar Siri»: el Worker genera la llave (y deja inválida la anterior), se muestra UNA vez, se
+   copia al portapapeles y se abre el atajo de iCloud. iOS solo deja copiar y abrir ventanas DENTRO
+   del toque: por eso el portapapeles recibe una promesa (ClipboardItem) y la ventana se abre antes
+   de pedir la llave; si algo de eso no se puede, quedan los botones «Copiar llave» e «Instalar atajo». */
+$('#vozActivarBtn').addEventListener('click', () => {
+  const btn = $('#vozActivarBtn');
+  if (!puedeGenerarVoz() || btn.disabled) return;
+  if (vozActiva && btn.dataset.armado !== '1'){   // ya tiene Siri: confirmar que la llave actual dejará de servir
+    btn.dataset.armado = '1'; btn.textContent = 'Tu atajo actual dejará de abrir. Toca de nuevo';
+    setTimeout(() => { if (btn.isConnected && btn.dataset.armado === '1'){ btn.dataset.armado = ''; btn.textContent = '🎙️ Activar Siri de nuevo'; } }, 4000);
+    return;
   }
+  btn.dataset.armado = ''; $('#vozErr').textContent = '';
+  let darLlave, quitarLlave;
+  const llaveP = new Promise((ok, no) => { darLlave = ok; quitarLlave = no; });
+  let copiaP = Promise.reject(new Error('sin portapapeles'));
+  try {
+    if (window.ClipboardItem && navigator.clipboard?.write)
+      copiaP = navigator.clipboard.write([new ClipboardItem({ 'text/plain': llaveP.then(t => new Blob([t], { type: 'text/plain' })) })]);
+  } catch(_){}
+  copiaP.catch(() => {});
+  const ventana = vozAtajoUrl ? window.open('', '_blank') : null;
+  btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  (async () => {
+    try {
+      const r = await authedFetch('/voz/llaves/crear', {});
+      darLlave(r.llave);
+      $('#vozLlave').textContent = r.llave;   // única vez que existe en claro fuera del atajo
+      $('#vozResultado').classList.remove('hidden');
+      btn.classList.add('hidden');
+      pintarBotonAtajo();
+      let copiada = await copiaP.then(() => true, () => false);
+      if (!copiada) copiada = await navigator.clipboard?.writeText(r.llave).then(() => true, () => false) ?? false;
+      $('#vozCopiado').textContent = copiada ? 'Ya está copiada: solo pégala en el atajo.' : 'Cópiala con el botón y pégala en el atajo.';
+      if (ventana){ try { ventana.location.href = vozAtajoUrl; } catch(_){ ventana.close(); } }
+      vozActiva = { dispositivo: 'iPhone', creadoEn: new Date().toISOString() };
+      $('#vozEstado').textContent = 'Siri está activo. Tu llave anterior (si tenías) ya no abre.';
+      $('#vozDesactivarBtn').classList.remove('hidden');
+    } catch(e){
+      quitarLlave(e); if (ventana) ventana.close();
+      $('#vozErr').textContent = e.message || 'No se pudo activar Siri';
+      btn.disabled = false; btn.textContent = vozActiva ? '🎙️ Activar Siri de nuevo' : '🎙️ Activar Siri';
+    }
+  })();
+});
+/* «Desactivar Siri»: revoca TODAS las llaves del residente (también si está suspendido). */
+$('#vozDesactivarBtn').addEventListener('click', () => {
+  const btn = $('#vozDesactivarBtn');
+  armarConfirmacion(btn, 'Desactivar Siri', async () => {
+    btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>'; $('#vozErr').textContent = '';
+    try {
+      await authedFetch('/voz/desactivar', {});
+      toast('Siri desactivado: tu atajo ya no abre', 'ok');
+      vozActiva = null; limpiarLlaveMostrada();
+    } catch(e){
+      $('#vozErr').textContent = e.message || 'No se pudo desactivar Siri';
+      btn.disabled = false; btn.textContent = 'Desactivar Siri';
+    }
+  });
 });
 $('#vozCopiarBtn').addEventListener('click', async () => {
   const llave = $('#vozLlave').textContent;
@@ -3644,7 +3679,7 @@ async function cargarVozAdmin(){
   }
   try {
     const r = await authedFetch('/voz/llaves/listar', {});
-    if (!r.casas || !r.casas.length){ lista.innerHTML = '<div class="empty">Nadie tiene llaves de voz activas</div>'; return; }
+    if (!r.casas || !r.casas.length){ lista.innerHTML = '<div class="empty">Nadie tiene Siri activo</div>'; return; }
     lista.innerHTML = '';
     r.casas.forEach(c => {
       const t = document.createElement('div'); t.className = 'vnote'; t.style.margin = '10px 4px 4px';
@@ -3654,8 +3689,8 @@ async function cargarVozAdmin(){
         row.innerHTML = `<div class="ri">🎙️</div><div class="rt"><div class="a">${esc(k.nombre || '—')}</div>`
           + `<div class="b">${esc(k.dispositivo)} · creada ${esc(fechaCorta(k.creadoEn))}${k.ultimoUso ? ' · último uso ' + esc(fmtTime(k.ultimoUso)) : ' · sin usar'}</div>`
           + `${k.cuentaInactiva ? '<div class="mov-liga bad">Cuenta dada de baja o borrada: la llave ya no abre</div>' : ''}</div>`;
-        const b = document.createElement('button'); b.className = 'row-act danger'; b.textContent = 'Revocar';
-        b.addEventListener('click', () => armarConfirmacion(b, 'Revocar', () => revocarLlaveVoz(k.id, b, cargarVozAdmin)));
+        const b = document.createElement('button'); b.className = 'row-act danger'; b.textContent = 'Desactivar Siri';
+        b.addEventListener('click', () => armarConfirmacion(b, 'Desactivar Siri', () => revocarLlaveVoz(k.id, b, cargarVozAdmin)));
         row.appendChild(b); lista.appendChild(row);
       });
     });
@@ -3980,7 +4015,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v34';
+const APP_VERSION = 'v35';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
