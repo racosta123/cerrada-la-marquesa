@@ -29,7 +29,7 @@ import { triggerShelly, callShellyOnce, shellyCfg, shellySleep } from './shelly-
 // Módulo "Dispositivos" (cambiar un Shelly desde la app): lógica pura aparte, igual que shelly-core.
 import { PUERTAS_DISP, idShellyValido, parsearDispositivos, mapaParaTrigger, dispositivoEfectivo, consultarShelly, listarDispositivosCuenta, criterioAutoritativo, HISTORIAL_MAX } from './dispositivos-core.js';
 // Abrir con Siri (llaves personales de voz): lógica pura aparte, igual que shelly-core.
-import { VOZ_PUERTA, VOZ_MAX_ACTIVAS, VOZ_MENSAJES, generarLlaveVoz, idLlaveValido, llaveDeEncabezado, hashLlave, limpiarDispositivo, puertaPedidaPermitida, evaluarLimiteLlave, ipBloqueada, registrarFalloIp, atajoUrlValido, paisPermitido, jefeActivo } from './voz-core.js';
+import { VOZ_PUERTA, VOZ_MAX_ACTIVAS, VOZ_MENSAJES, generarLlaveVoz, idLlaveValido, llaveDeEncabezado, hashLlave, limpiarDispositivo, puertaPedidaPermitida, evaluarLimiteLlave, ipBloqueada, registrarFalloIp, atajoUrlValido, paisPermitido, jefeActivo, evaluarRechazoLlave, truncarIpVoz } from './voz-core.js';
 
 // Nombres de puerta válidos. Los IDs reales de cada Shelly YA NO viven en el código (repo
 // público): se leen en tiempo de petición del secret SHELLY_DEVICES vía resolveShellyDevice()
@@ -239,16 +239,32 @@ function camposVia(o) {
     via: { stringValue: 'voz' }, viaEtiqueta: { stringValue: 'por voz (Siri)' },
     dispositivo: { stringValue: String(o.dispositivo || '').slice(0, 40) },
     ...(o.casa ? { casa: { stringValue: o.casa } } : {}),
-    // Origen de la petición según Cloudflare (IP completa y país) y resultado del aviso push al dueño.
+    // Origen de la petición según Cloudflare (IP truncada y país) y resultado del aviso push al dueño.
     ...(o.ip ? { ip: { stringValue: String(o.ip).slice(0, 45) } } : {}),
     ...(o.pais ? { pais: { stringValue: String(o.pais).slice(0, 2) } } : {}),
     ...(o.avisoPush ? { avisoPush: { stringValue: String(o.avisoPush).slice(0, 40) } } : {}),
   };
 }
-/* IP y país de la petición. El país lo pone Cloudflare (req.cf); nunca se toma de un encabezado
-   que pueda mandar el cliente. Sin req.cf (fuera de Cloudflare) el país queda vacío = no es MX. */
+/* IP (truncada: IPv4 /24, IPv6 /48 — dato personal, la ve el hogar del dueño) y país de la
+   petición. El país lo pone Cloudflare (req.cf); nunca se toma de un encabezado que pueda mandar
+   el cliente. Sin req.cf (fuera de Cloudflare) el país queda vacío = no es MX. */
 function redVoz(req) {
-  return { ip: req.headers.get('CF-Connecting-IP') || '', pais: String((req.cf && req.cf.country) || '').toUpperCase() };
+  return { ip: truncarIpVoz(req.headers.get('CF-Connecting-IP')), pais: String((req.cf && req.cf.country) || '').toUpperCase() };
+}
+/* Rechazo de una llave que EXISTE: responde siempre igual, pero solo los primeros 5 rechazos por
+   llave cada 15 min se cuentan y van a la bitácora (evaluarRechazoLlave); el resto no escribe nada,
+   para que una llave revocada o filtrada no pueda llenar la bitácora ni generar costo. */
+async function rechazoVoz(env, perfil, t, hash, motivo, red, status, msg, ahora) {
+  const r = evaluarRechazoLlave(t, ahora);
+  if (r.registrar) {
+    try {
+      await firestoreUpdate(env, `tokensVoz/${hash}`, {
+        rechazosInicio: tsCampo(r.nuevo.rechazosInicio), rechazosVentana: { integerValue: String(r.nuevo.rechazosVentana) },
+      }, ['rechazosInicio', 'rechazosVentana']);
+    } catch (e) { console.error('[voz] no se pudo contar el rechazo:', e && e.name); }
+    await logVoz(env, perfil, t, 'error', motivo, red);
+  }
+  return textoVoz(status, msg);
 }
 function textoVoz(status, msg) {
   return new Response(msg, { status, headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' } });
@@ -374,25 +390,20 @@ async function abrirVoz(req, env) {
       return textoVoz(401, VOZ_MENSAJES.invalida);
     }
     // Revocada: se rechaza y queda en bitácora, pero NO suma fallo a la IP (un atajo viejo de un
-    // exfamiliar no debe bloquear a toda la casa).
-    if (t.revocada) {
-      await logVoz(env, null, t, 'error', 'llave_revocada', red);
-      return textoVoz(401, VOZ_MENSAJES.invalida);
-    }
+    // exfamiliar no debe bloquear a toda la casa). Desde aquí, todo rechazo pasa por el freno por llave.
+    if (t.revocada) return rechazoVoz(env, null, t, hash, 'llave_revocada', red, 401, VOZ_MENSAJES.invalida, ahora);
 
     // 2) Solo Residentes. El cuerpo es opcional; si pide otra puerta (cuerpo o ?puerta=), se rechaza.
     let body = null;
     try { const txt = await req.text(); body = txt.trim() ? JSON.parse(txt) : null; } catch (e) { body = null; }
     const qp = new URL(req.url).searchParams.get('puerta');
     if (!puertaPedidaPermitida(body) || (qp !== null && qp !== VOZ_PUERTA)) {
-      await logVoz(env, null, t, 'error', 'puerta_no_permitida', red);
-      return textoVoz(403, VOZ_MENSAJES.otraPuerta);
+      return rechazoVoz(env, null, t, hash, 'puerta_no_permitida', red, 403, VOZ_MENSAJES.otraPuerta, ahora);
     }
 
     // 3) Solo desde México (país que reporta Cloudflare). Fuera de MX se rechaza y queda en bitácora.
     if (!paisPermitido(red.pais)) {
-      await logVoz(env, null, t, 'error', 'pais_no_permitido', red);
-      return textoVoz(403, VOZ_MENSAJES.fueraDePais);
+      return rechazoVoz(env, null, t, hash, 'pais_no_permitido', red, 403, VOZ_MENSAJES.fueraDePais, ahora);
     }
 
     // 4) La persona sigue existiendo y activa (perfil, padrón y cuenta de Auth). Si no: la llave
@@ -409,14 +420,12 @@ async function abrirVoz(req, env) {
         revocada: { booleanValue: true }, revocadaEn: { timestampValue: new Date(ahora).toISOString() },
         revocadaPor: { stringValue: 'sistema' }, motivoRevocacion: { stringValue: 'cuenta_inactiva' },
       }, ['revocada', 'revocadaEn', 'revocadaPor', 'motivoRevocacion']);
-      await logVoz(env, null, t, 'error', 'cuenta_inactiva', red);
-      return textoVoz(401, VOZ_MENSAJES.invalida);
+      return rechazoVoz(env, null, t, hash, 'cuenta_inactiva', red, 401, VOZ_MENSAJES.invalida, ahora);
     }
 
     // 5) Suspensión (por mora o manual: las dos dejan suspendido/estado en el perfil y el padrón).
     if (perfil.suspendido === true || (persona && persona.estado === 'suspendido')) {
-      await logVoz(env, perfil, t, 'error', 'suspendido', red);
-      return textoVoz(403, VOZ_MENSAJES.suspendido);
+      return rechazoVoz(env, perfil, t, hash, 'suspendido', red, 403, VOZ_MENSAJES.suspendido, ahora);
     }
 
     // 6) Familiar: su jefe de familia también tiene que existir y estar activo (ni suspendido ni de baja).
@@ -424,15 +433,14 @@ async function abrirVoz(req, env) {
     if (jefeId) {
       const jdoc = await getDoc(env, at, `personas/${jefeId}`);
       if (!jefeActivo(jdoc ? readDoc(jdoc.fields) : null)) {
-        await logVoz(env, perfil, t, 'error', 'jefe_inactivo', red);
-        return textoVoz(403, VOZ_MENSAJES.suspendido);
+        return rechazoVoz(env, perfil, t, hash, 'jefe_inactivo', red, 403, VOZ_MENSAJES.suspendido, ahora);
       }
     }
 
     // 7) Límite por llave (10 s / 30 por hora). Los excesos van al registro agregado, no a la bitácora.
     try { await reservarAperturaVoz(env, hash, ahora); }
     catch (e) {
-      if (e && e.vozMotivo === 'llave_revocada') { await logVoz(env, perfil, t, 'error', 'llave_revocada', red); return textoVoz(401, VOZ_MENSAJES.invalida); }
+      if (e && e.vozMotivo === 'llave_revocada') return rechazoVoz(env, perfil, t, hash, 'llave_revocada', red, 401, VOZ_MENSAJES.invalida, ahora);
       if (e && e.vozMotivo) { await registrarIntentoFallido(env, at, req, 'voz_' + e.vozMotivo); return textoVoz(429, VOZ_MENSAJES.espera); }
       throw e;
     }

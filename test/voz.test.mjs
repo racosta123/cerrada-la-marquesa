@@ -47,7 +47,7 @@ const authUsers = new Map();   // uid -> { disabled }
 const shellyPulsos = [];
 const pushes = [];                    // avisos FCM que mandó el Worker: { token, title, body }
 const fcm = { falla: false };         // true = FCM responde 500
-let llamadasFirestore = 0;
+let llamadasFirestore = 0, escriturasFirestore = 0;
 globalThis.fetch = async (url, opts = {}) => {
   const u = new URL(String(url)); const m = opts.method || 'GET';
   const R = (body, status = 200, headers = {}) => new Response(JSON.stringify(body), { status, headers });
@@ -59,7 +59,10 @@ globalThis.fetch = async (url, opts = {}) => {
     pushes.push({ token: msg.token, ...msg.notification });
     return R({});
   }
-  if (u.hostname === 'firestore.googleapis.com') llamadasFirestore++;
+  if (u.hostname === 'firestore.googleapis.com') {
+    llamadasFirestore++;
+    if (m === 'PATCH' || m === 'DELETE' || (m === 'POST' && !/:(runQuery|beginTransaction|rollback)$/.test(u.pathname))) escriturasFirestore++;
+  }
   if (u.hostname === 'identitytoolkit.googleapis.com') {
     const b = JSON.parse(opts.body || '{}');
     if (u.pathname.endsWith('accounts:lookup')) { const a = authUsers.get(b.localId[0]); return R(a ? { users: [{ localId: b.localId[0], disabled: !!a.disabled }] } : {}); }
@@ -141,6 +144,8 @@ const atrasarUltimaApertura = (llave, segundos) => {
   const f = store.get(`tokensVoz/${hashDe(llave)}`);
   f.ultimaApertura = { timestampValue: new Date(Date.now() - segundos * 1000).toISOString() };
 };
+// Las pruebas corren en segundos: sin esto, los rechazos de pruebas anteriores agotan el freno por llave.
+const reiniciarRechazos = llave => { const f = store.get(`tokensVoz/${hashDe(llave)}`); delete f.rechazosInicio; delete f.rechazosVentana; };
 
 // ---------- padrón de prueba ----------
 const persona = (id, o) => put(`personas/${id}`, { rol: 'residente', estado: 'activo', ...o });
@@ -342,14 +347,15 @@ await prueba('Corrección 7: la respuesta que entrega la llave lleva Cache-Contr
 });
 
 // ======================= correcciones de la auditoría =======================
-await prueba('Corrección 4: la bitácora guarda IP y país (MX) de cada apertura por voz', async () => {
+await prueba('Corrección 4: la bitácora guarda IP (truncada) y país (MX) de cada apertura por voz', async () => {
   atrasarUltimaApertura(llaves.ana1, 60);
   const r = await voz(llaves.ana1, { ip: '198.51.100.77', pais: 'MX' });
   assert.equal(r.status, 200);
   const a = aperturasVoz().at(-1);
-  assert.ok(a.resultado === 'ok' && a.ip === '198.51.100.77' && a.pais === 'MX', JSON.stringify(a));
+  assert.ok(a.resultado === 'ok' && a.ip === '198.51.100.0/24' && a.pais === 'MX', JSON.stringify(a));
 });
 await prueba('Corrección 4: fuera de México (o sin país) se rechaza, no abre y queda como rechazada', async () => {
+  reiniciarRechazos(llaves.ana1);
   for (const [pais, ip] of [['US', '198.51.100.81'], ['XX', '198.51.100.82'], ['T1', '198.51.100.83'], [null, '198.51.100.84']]) {
     atrasarUltimaApertura(llaves.ana1, 60);
     const antes = shellyPulsos.length, pushAntes = pushes.length;
@@ -358,7 +364,7 @@ await prueba('Corrección 4: fuera de México (o sin país) se rechaza, no abre 
     assert.equal(shellyPulsos.length, antes, 'no abre');
     assert.equal(pushes.length, pushAntes, 'no hubo apertura, no hay aviso');
     const a = aperturasVoz().at(-1);
-    assert.ok(a.resultado === 'error' && a.motivo === 'pais_no_permitido' && a.ip === ip && (a.pais || '') === (pais || ''), JSON.stringify(a));
+    assert.ok(a.resultado === 'error' && a.motivo === 'pais_no_permitido' && a.ip === '198.51.100.0/24' && (a.pais || '') === (pais || ''), JSON.stringify(a));
   }
   // un país rechazado no gasta el límite de la llave: desde MX abre de inmediato
   atrasarUltimaApertura(llaves.ana1, 60);
@@ -412,6 +418,79 @@ await prueba('Corrección 6: familiar con jefe suspendido o de baja NO abre; con
   atrasarUltimaApertura(llaves.caro2, 60);
   assert.equal((await voz(llaves.caro2)).status, 200, 'jefe activo otra vez: abre');
   assert.equal(leer(`tokensVoz/${hashDe(llaves.caro2)}`).revocada, false, 'suspender al jefe no revoca la llave');
+});
+await prueba('Freno de rechazos: una llave revocada solo deja 5 registros cada 15 min; después no escribe nada', async () => {
+  reiniciarRechazos(llaves.ana2);
+  const deAna2 = () => aperturasVoz().filter(a => a.dispositivo === 'iPad de Ana' && a.motivo === 'llave_revocada').length;
+  const antes = deAna2();
+  for (let i = 0; i < 5; i++) assert.equal((await voz(llaves.ana2, { ip: '198.51.100.90' })).status, 401);
+  assert.equal(deAna2() - antes, 5, 'los primeros 5 sí quedan en bitácora');
+  const esc = escriturasFirestore, n = deAna2();
+  for (let i = 0; i < 20; i++) {
+    const r = await voz(llaves.ana2, { ip: '198.51.100.90' });
+    assert.equal(r.status, 401); assert.equal(r.texto, 'Llave no válida', 'misma respuesta');
+  }
+  assert.equal(deAna2(), n, 'ningún registro más en bitácora');
+  assert.equal(escriturasFirestore, esc, 'ninguna escritura en Firestore (ni bitácora, ni contador, ni registro_intentos)');
+  // pasada la ventana de 15 min vuelve a registrar
+  store.get(`tokensVoz/${hashDe(llaves.ana2)}`).rechazosInicio = { timestampValue: new Date(Date.now() - 16 * 60e3).toISOString() };
+  await voz(llaves.ana2, { ip: '198.51.100.90' });
+  assert.equal(deAna2(), n + 1, 'nueva ventana: vuelve a registrar');
+});
+await prueba('Freno de rechazos: aplica a otro país, otra puerta, suspendido y jefe inactivo', async () => {
+  // país (llave válida usada desde fuera)
+  reiniciarRechazos(llaves.ana1);
+  const esc0 = escriturasFirestore;
+  for (let i = 0; i < 5; i++) assert.equal((await voz(llaves.ana1, { pais: 'US' })).status, 403);
+  const escTras5 = escriturasFirestore;
+  assert.ok(escTras5 > esc0, 'los primeros 5 sí escriben');
+  for (let i = 0; i < 10; i++) assert.equal((await voz(llaves.ana1, { pais: 'US' })).status, 403);
+  for (let i = 0; i < 10; i++) assert.equal((await voz(llaves.ana1, { body: { puerta: 'visitantes' } })).status, 403);
+  assert.equal(escriturasFirestore, escTras5, 'país y otra puerta: sin escrituras pasado el freno');
+  // suspendido (Dani)
+  reiniciarRechazos(llaves.dani);
+  for (let i = 0; i < 5; i++) assert.equal((await voz(llaves.dani)).status, 403);
+  const escD = escriturasFirestore;
+  for (let i = 0; i < 10; i++) assert.equal((await voz(llaves.dani)).texto, 'Acceso suspendido');
+  assert.equal(escriturasFirestore, escD, 'suspendido: sin escrituras pasado el freno');
+  // jefe inactivo (Caro con Ana suspendida)
+  const ana = leer('personas/p-ana-000001');
+  reiniciarRechazos(llaves.caro2);
+  try {
+    put('personas/p-ana-000001', { ...ana, estado: 'suspendido' });
+    for (let i = 0; i < 5; i++) assert.equal((await voz(llaves.caro2)).status, 403);
+    const escC = escriturasFirestore;
+    for (let i = 0; i < 10; i++) assert.equal((await voz(llaves.caro2)).status, 403);
+    assert.equal(escriturasFirestore, escC, 'jefe inactivo: sin escrituras pasado el freno');
+  } finally { put('personas/p-ana-000001', ana); }
+});
+await prueba('Freno de rechazos: NO afecta a llaves válidas (con el freno agotado abre desde MX)', async () => {
+  const t = leer(`tokensVoz/${hashDe(llaves.ana1)}`);
+  assert.equal(t.rechazosVentana, 5, 'la llave de Ana agotó sus rechazos en la prueba anterior');
+  atrasarUltimaApertura(llaves.ana1, 60);
+  const antes = shellyPulsos.length;
+  const r = await voz(llaves.ana1);
+  assert.equal(r.status, 200); assert.equal(r.texto, 'Puerta de residentes abierta');
+  assert.deepEqual(shellyPulsos.slice(antes), ['dev-residentes']);
+  assert.equal(aperturasVoz().at(-1).resultado, 'ok', 'la apertura sí queda en bitácora');
+  atrasarUltimaApertura(llaves.caro2, 60);
+  assert.equal((await voz(llaves.caro2)).status, 200, 'Caro (jefe activo otra vez) también abre');
+});
+await prueba('IP truncada: IPv4 sin el último número, IPv6 solo el /48; inválidas no se guardan', async () => {
+  const { truncarIpVoz } = await import('../voz-core.js');
+  const casos = [
+    ['198.51.100.77', '198.51.100.0/24'], ['8.8.8.8', '8.8.8.0/24'], ['010.001.002.003', '10.1.2.0/24'],
+    ['2001:db8:abcd:12:34::1', '2001:db8:abcd::/48'], ['2001:0db8:0000:0042:0000:8a2e:0370:7334', '2001:db8:0::/48'],
+    ['2001:db8::1', '2001:db8:0::/48'], ['::1', '0:0:0::/48'], ['::ffff:203.0.113.9', '203.0.113.0/24'],
+    ['', ''], ['desconocida', ''], ['1.2.3', ''], ['256.1.1.1', ''], ['1::2::3', ''], ['2001:db8:zz::1', ''], ['1:2:3:4:5:6:7:8:9', ''],
+  ];
+  for (const [ip, esperado] of casos) assert.equal(truncarIpVoz(ip), esperado, ip);
+  // en la bitácora (IPv6)
+  atrasarUltimaApertura(llaves.ana1, 60);
+  assert.equal((await voz(llaves.ana1, { ip: '2001:db8:abcd:12:34::1' })).status, 200);
+  const a = aperturasVoz().at(-1);
+  assert.equal(a.ip, '2001:db8:abcd::/48');
+  assert.ok(!JSON.stringify([...store].filter(([k]) => k.startsWith('aperturas/'))).match(/198\.51\.100\.(77|8[1-4]|90)|2001:db8:abcd:12/), 'ninguna IP completa en la bitácora');
 });
 await prueba('Corrección 5: wrangler.toml apaga los invocation logs (no se registra la petición con Authorization)', async () => {
   const toml = readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8').replace(/#.*$/gm, '');

@@ -39,6 +39,42 @@ export function paisPermitido(pais) { return VOZ_PAISES_PERMITIDOS.includes(Stri
 /* Jefe de familia de un familiar: tiene que existir y estar activo (ni suspendido ni de baja). */
 export function jefeActivo(jefe) { return !!jefe && (jefe.estado || 'activo') === 'activo'; }
 
+/* Freno para llaves que EXISTEN pero se rechazan (revocada, otra puerta, otro país, suspendido,
+   jefe inactivo, cuenta inactiva): como máximo 5 rechazos por llave cada 15 min van a la bitácora;
+   los demás se contestan igual pero sin escribir nada. No toca el límite de aperturas: una llave
+   válida abre aunque haya agotado sus rechazos. estado = { rechazosInicio, rechazosVentana }. */
+export const VOZ_RECHAZOS_MAX = 5;
+export const VOZ_RECHAZOS_VENTANA_MS = 15 * 60 * 1000;
+export function evaluarRechazoLlave(estado, ahora) {
+  let inicio = ms(estado?.rechazosInicio);
+  let n = Number(estado?.rechazosVentana) || 0;
+  if (!Number.isFinite(inicio) || ahora - inicio >= VOZ_RECHAZOS_VENTANA_MS || ahora < inicio) { inicio = ahora; n = 0; }
+  if (n >= VOZ_RECHAZOS_MAX) return { registrar: false };
+  return { registrar: true, nuevo: { rechazosInicio: new Date(inicio).toISOString(), rechazosVentana: n + 1 } };
+}
+
+/* IP para la bitácora, truncada: IPv4 sin el último número (/24), IPv6 solo el prefijo /48.
+   '' si no es una IP válida. */
+function ipv4Truncada(s) {
+  const p = s.split('.');
+  return p.length === 4 && p.every(x => /^\d{1,3}$/.test(x) && +x <= 255) ? `${+p[0]}.${+p[1]}.${+p[2]}.0/24` : '';
+}
+export function truncarIpVoz(ip) {
+  const v = String(ip || '').trim();
+  if (!v.includes(':')) return ipv4Truncada(v);
+  const mapeada = v.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);   // IPv4 escrita como IPv6
+  if (mapeada) return ipv4Truncada(mapeada[1]);
+  const partes = v.split('::');
+  if (partes.length > 2) return '';
+  const izq = partes[0] ? partes[0].split(':') : [];
+  const der = partes.length === 2 && partes[1] ? partes[1].split(':') : [];
+  const relleno = partes.length === 2 ? 8 - izq.length - der.length : 0;
+  if (partes.length === 2 && relleno < 1) return '';
+  const grupos = [...izq, ...Array(relleno).fill('0'), ...der];
+  if (grupos.length !== 8 || !grupos.every(g => /^[0-9a-f]{1,4}$/i.test(g))) return '';
+  return grupos.slice(0, 3).map(g => parseInt(g, 16).toString(16)).join(':') + '::/48';
+}
+
 const RE_LLAVE = /^mqvoz_[A-Za-z0-9_-]{43}$/;
 const RE_ID = /^[A-Za-z0-9_-]{43}$/;   // id del doc = SHA-256 en base64url (43 caracteres)
 
