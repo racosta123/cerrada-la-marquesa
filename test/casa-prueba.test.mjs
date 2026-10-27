@@ -269,6 +269,18 @@ await t('sigue sujeta a suspensión MANUAL (no abre) y a revocación de su llave
   assert.equal(pulsos.length, 1, 'solo abrió la vez que estaba activa');
 });
 
+console.log('\n[3b] /abrir exige estado activo (mismo criterio que Siri)');
+await t('estado "inactivo" => 403 sin pulso; sin campo estado => abre', async () => {
+  usuario('u1', { nombre: 'Vecino 1', rol: 'residente', casa: 'Casa 1', personaId: 'pers-000001', estado: 'inactivo' });
+  const r = await call('/abrir', 'u1', { puerta: 'residentes' });
+  assert.equal(r.status, 403, JSON.stringify(r.body));
+  assert.equal(pulsos.length, 0, 'no se llamó a Shelly');
+  put('usuarios/u2', { nombre: 'Vecino 2', rol: 'residente', casa: 'Casa 2', personaId: 'pers-000002', suspendido: false, jefeId: '' });
+  const a = await call('/abrir', 'u2', { puerta: 'residentes' });
+  assert.equal(a.status, 200, JSON.stringify(a.body));
+  assert.deepEqual(pulsos, ['dev-residentes']);
+});
+
 console.log('\n[4] reglas y app');
 await t('firestore.rules: personas cerrada al cliente; usuarios solo deja tocar fcmToken', async () => {
   const r = readFileSync(new URL('../firestore.rules', import.meta.url), 'utf8');

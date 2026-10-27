@@ -75,7 +75,7 @@ globalThis.fetch = async (url, opts = {}) => {
       if (shellyV2 === 'falla') throw new Error('red');
       return R(body.ids.filter(id => shellyDevices.has(id) && !shellyDevices.get(id).sinV2).map(id => { const d = shellyDevices.get(id); const g3 = (d.modelo || '').startsWith('S3'); const it = { id, type: 'relay', code: d.modelo || 'SHSW-1', gen: g3 ? 'G2' : d.gen, online: d.online ? 1 : 0 }; if (body.select && body.select.includes('settings') && !d.sinSettings) it.settings = g3 ? { sys: { device: { name: d.nombre || '', mac: 'X' } }, wifi: {} } : (d.nombre ? { name: d.nombre, device: { type: 'SHSW-1' } } : { device: { type: 'SHSW-1' } }); return it; }));
     }
-    if (u.pathname === '/device/relay/control') { const p = new URLSearchParams(String(opts.body)); shellyCalls.push({ tipo: 'pulso', gen: 1, id: p.get('id') }); return new Response('ok'); }
+    if (u.pathname === '/device/relay/control') { const p = new URLSearchParams(String(opts.body)); shellyCalls.push({ tipo: 'pulso', gen: 1, id: p.get('id') }); return new Response(JSON.stringify({ isok: true })); }
     if (u.pathname === '/v2/devices/api/set/switch') { shellyCalls.push({ tipo: 'pulso', gen: 3, id: JSON.parse(opts.body).id }); return new Response('ok'); }
     throw new Error('shelly ruta ' + u.pathname);
   }

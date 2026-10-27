@@ -183,6 +183,11 @@ async function abrir(req, env) {
   // o mal. Un fallo del propio log NUNCA impide abrir ni cambia la respuesta de la puerta.
   let fallo = null;
   try {
+    // Mismo criterio que Siri (/abrir-voz): solo abre un usuario con estado 'activo' (sin campo = activo).
+    // 'suspendido' (mora) NO se corta aquí: sigue la regla de abajo (solo peatonal y salida).
+    const estado = perfil.estado || 'activo';
+    if (estado !== 'activo' && estado !== 'suspendido') throw Object.assign(httpErr(403, 'Tu acceso no está activo'), { motivo: 'inactivo' });
+    if (estado === 'suspendido' && puerta !== 'peatones' && puerta !== 'salida') throw Object.assign(httpErr(403, 'Residente suspendido por mora'), { motivo: 'suspendido' });
     // Un residente suspendido (por mora) no puede abrir, salvo peatonal y salida (nadie debe
     // quedar atrapado sin poder salir, ni en coche ni a pie); tampoco sus esclavos.
     if (perfil.suspendido && puerta !== 'peatones' && puerta !== 'salida') throw Object.assign(httpErr(403, 'Residente suspendido por mora'), { motivo: 'suspendido' });

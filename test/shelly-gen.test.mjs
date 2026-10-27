@@ -7,7 +7,7 @@ import { resolveShellyDevice, triggerShelly, callShellyOnce } from '../shelly-co
 import { ShellyGate } from '../worker.js';
 
 let calls = [];
-let respond = () => ({ ok: true, status: 200, text: 'ok' });
+let respond = () => ({ ok: true, status: 200, text: '{"isok":true}' });
 globalThis.fetch = async (url, opts = {}) => {
   calls.push({ url: String(url), opts });
   const r = respond();
@@ -27,7 +27,7 @@ const base = { SHELLY_HOST: 'https://host.test', SHELLY_AUTH_KEY: 'LLAVE_TEST' }
 const envDirecto = { ...base, SHELLY_GATE_ENABLED: '0', SHELLY_DEVICES: JSON.stringify(DEVICES) };
 
 let pass = 0;
-const t = async (name, fn) => { calls = []; respond = () => ({ ok: true, status: 200, text: 'ok' }); await fn(); pass++; console.log('  ok -', name); };
+const t = async (name, fn) => { calls = []; respond = () => ({ ok: true, status: 200, text: '{"isok":true}' }); await fn(); pass++; console.log('  ok -', name); };
 const rejects = async (p, status, msg) => { try { await p; } catch (e) { assert.equal(e.status, status); if (msg) assert.equal(e.message, msg); return e; } assert.fail('debía rechazar'); };
 
 console.log('\n[1] resolveShellyDevice');
@@ -69,6 +69,21 @@ await t('peatones: igual que hoy (Gen1 clásico)', async () => {
   const p = new URLSearchParams(calls[0].opts.body);
   assert.deepEqual([...p.keys()].sort(), ['auth_key', 'channel', 'id', 'turn']);
   assert.equal(p.get('id'), 'PEATONES_TEST_ID'); assert.equal(p.get('turn'), 'on');
+});
+await t('Gen1: 200 con isok:false (p.ej. sin conexión) => 502, no "abrió"', async () => {
+  respond = () => ({ ok: true, status: 200, text: JSON.stringify({ isok: false, errors: { device_offline: 'x' } }) });
+  const e = await rejects(quiet(triggerShelly)(envDirecto, 'residentes'), 502, 'La cerradura no respondió');
+  assert.equal(e.motivo, 'shelly_isok_false');
+  assert.equal(calls.length, 1, 'sin reintento');
+});
+await t('Gen1: 200 con cuerpo que no es JSON => 502', async () => {
+  respond = () => ({ ok: true, status: 200, text: 'ok' });
+  await rejects(quiet(triggerShelly)(envDirecto, 'peatones'), 502, 'La cerradura no respondió');
+});
+await t('Gen3 (API v2): 200 sin isok => abre', async () => {
+  respond = () => ({ ok: true, status: 200, text: '' });
+  await quiet(triggerShelly)(envDirecto, 'visitantes');
+  assert.equal(calls.length, 1);
 });
 await t('salida (sin dispositivo): 503 inmediato, SIN llamar a Shelly', async () => {
   const t0 = Date.now();

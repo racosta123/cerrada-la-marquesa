@@ -166,7 +166,15 @@ export async function callShellyOnce(env, device, label) {
     }
     const limitado = r.status === 429 || /max_req/i.test(txt);
     if (limitado) sawLimitado = true;
-    if (r.ok && !limitado) return { ok:true, limitado: sawLimitado };
+    if (r.ok && !limitado) {
+      // Gen1 (API v1): Shelly Cloud contesta 200 aunque el equipo esté sin conexión; el resultado
+      // real viene en el cuerpo ({isok:true|false}). Solo isok:true cuenta como apertura.
+      // Gen2+ (API v2): no trae isok; el éxito es el 200 y "sin conexión" llega como 400.
+      if (gen >= 2 || shellyIsOk(txt)) return { ok:true, limitado: sawLimitado };
+      motivo = 'shelly_isok_false';
+      console.warn(`[shelly] Shelly no confirmó (isok != true) puerta=${label} intento=${attempt}`);
+      return fail();
+    }
     if (limitado && attempt === 1) {
       console.warn(`[shelly] max_req/429 puerta=${label} status=${r.status}; reintento en ${shellyCfg(env, 'SHELLY_RETRY_DELAY_MS')}ms`);
       continue;
@@ -178,6 +186,11 @@ export async function callShellyOnce(env, device, label) {
   return fail();
 }
 
+
+// true solo si el cuerpo es JSON con isok === true (texto ilegible o sin isok => false).
+function shellyIsOk(txt) {
+  try { return JSON.parse(txt).isok === true; } catch (e) { return false; }
+}
 
 // Mismo contrato que httpErr de worker.js (Error con .status).
 function httpErr(status, msg){ const e=new Error(msg); e.status=status; return e; }
