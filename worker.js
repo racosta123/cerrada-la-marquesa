@@ -99,6 +99,7 @@ export default {
         case '/validar-pin':       out = await validarPin(req, env); break; // idem, código de respaldo
         case '/finanzas/registrar': out = await registrarFinanza(req, env); break;
         case '/finanzas/resumen':  out = await resumenFinanzas(req, env); break;
+        case '/aperturas/reporte': out = await reporteAperturas(req, env); break;
         case '/finanzas/cobranza': out = await cobranzaFinanzas(req, env); break;
         case '/finanzas/marcar-recibo': out = await marcarRecibo(req, env); break;
         case '/finanzas/cancelar': out = await cancelarFinanza(req, env); break;
@@ -1371,6 +1372,7 @@ async function cancelarFinanza(req, env) {
         wLimite,
         writeLogFinanzas(env, req, { movId:id, accion:'cancelar', uid:user.uid, perfil, motivo:mot,
           resumen: 'Canceló ' + resumenMov(id, d), antes: doc.fields, despues: campos }),
+        ...writesInvalidarSaldos(env, d.ts),   // si es de un mes cerrado, su saldo guardado se recalcula
       ] };
     });
   } catch (e) {
@@ -1445,6 +1447,7 @@ async function corregirFinanza(req, env) {
         writeLogFinanzas(env, req, { movId:id, accion:'corregir', uid:user.uid, perfil, motivo:mot, relacionadoId:nuevoId,
           resumen: `Corrigió ${resumenMov(id, d)} → ${resumenMov(nuevoId, readDoc(fieldsNuevo))}`,
           antes: doc.fields, despues: fieldsNuevo }),
+        ...writesInvalidarSaldos(env, d.ts),   // el corregido conserva la fecha del original
       );
       return { writes, value: folio };
     });
@@ -1499,6 +1502,7 @@ async function reactivarFinanza(req, env) {
         updateMask:{ fieldPaths: mascara }, currentDocument:{ exists:true } },
       writeLogFinanzas(env, req, { movId:id, accion:'reactivar', uid:user.uid, perfil, motivo:mot,
         resumen: 'Reactivó ' + resumenMov(id, d), antes: doc.fields, despues: campos }),
+      ...writesInvalidarSaldos(env, d.ts),
     ], value: d };
   });
 
@@ -3060,11 +3064,14 @@ async function resumenFinanzas(req, env) {
   const perfil = await getPerfil(env, user.uid);
   if (!perfil) throw httpErr(403, 'Sin perfil');
 
-  const now = ahoraHermosillo();
-  const inicioMes = inicioDiaHermosilloUTC(now.getUTCFullYear(), now.getUTCMonth(), 1);
-  const finMes = inicioDiaHermosilloUTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
+  const ym = claveMesHermosillo(Date.now());
+  const { inicio: inicioMes, fin: finMes } = rangoMesUTC(ym);
 
-  const docs = await firestoreList(env, 'finanzas');
+  // Saldo ACUMULADO: saldo inicial (cierre del mes anterior, guardado en saldos/{YYYY-MM} y escrito
+  // SOLO por el Worker) + lo del mes. Así no se relee toda la historia en cada carga: solo el mes.
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const saldoInicial = await saldoInicialDelMes(env, at, ym);
+  const docs = await finanzasEnRango(env, at, inicioMes, finMes);
   let ingreso = 0, egreso = 0;
   const pagaron = new Set();
   for (const doc of docs) {
@@ -3083,10 +3090,169 @@ async function resumenFinanzas(req, env) {
   const totalCasas = (await personasList(env)).filter(p => esCasaCobrable(p)).length;   // sin casas de prueba
 
   return json({
-    ingreso, egreso, balance: ingreso - egreso,
+    ingreso, egreso, balance: ingreso - egreso,          // balance = neto del MES (como antes)
+    mes: ym, saldoInicial: redondear2(saldoInicial), saldoActual: redondear2(saldoInicial + ingreso - egreso),
     pagaron: pagaron.size,
     totalCasas,
   });
+}
+
+/* ============ /aperturas/reporte — SOLO staff (master, admin, jefe-admin activo) ============
+   Aperturas de puerta de UNA persona del padrón en un rango de fechas (días completos, Hermosillo).
+   El rol se decide aquí con el token de Firebase + el perfil releído (esStaff): un residente normal
+   recibe 403 aunque llame directo. Topes contra abuso y lecturas: rango de REPORTE_MAX_DIAS días y
+   REPORTE_MAX_REG registros por consulta (si hay más, truncado:true). Una sola consulta indexada
+   (uid + tipo 'app' + ts; ver firestore.indexes.json): no recorre la bitácora de nadie más. */
+const REPORTE_MAX_DIAS = 92;
+const REPORTE_MAX_REG = 500;
+function fechaHermosilloUTC(s, sumarDias = 0) {
+  if (typeof s !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(s)) return null;
+  const [y, m, d] = s.split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  if (t.getUTCFullYear() !== y || t.getUTCMonth() !== m - 1 || t.getUTCDate() !== d) return null;   // 2026-02-31
+  return inicioDiaHermosilloUTC(y, m - 1, d + sumarDias);
+}
+async function reporteAperturas(req, env) {
+  const user = await requireAuth(req, env);
+  const perfil = await getPerfil(env, user.uid);
+  if (!esStaff(perfil)) throw httpErr(403, 'Solo staff consulta el reporte de aperturas');
+
+  const body = await req.json().catch(() => ({})) || {};
+  const { personaId, desde, hasta } = body;
+  if (typeof personaId !== 'string' || !/^[A-Za-z0-9_-]{1,64}$/.test(personaId)) throw httpErr(400, 'Residente no válido');
+  const inicio = fechaHermosilloUTC(desde), fin = fechaHermosilloUTC(hasta, 1);   // hasta INCLUIDO
+  if (!inicio || !fin) throw httpErr(400, 'Fechas no válidas (AAAA-MM-DD)');
+  if (fin <= inicio) throw httpErr(400, 'La fecha final es anterior a la inicial');
+  if ((fin - inicio) / 86400000 > REPORTE_MAX_DIAS) throw httpErr(400, `El rango máximo es de ${REPORTE_MAX_DIAS} días`);
+
+  const at = await saToken(env, 'https://www.googleapis.com/auth/datastore');
+  const pdoc = await getDoc(env, at, `personas/${personaId}`);
+  if (!pdoc) throw httpErr(404, 'Esa persona no está en el padrón');
+  const p = readDoc(pdoc.fields);
+  let domicilio = p.domicilio || '';
+  if (p.jefeId) { const j = await getDoc(env, at, `personas/${p.jefeId}`); domicilio = (j && readDoc(j.fields).domicilio) || ''; }
+  const persona = { nombre: p.nombre || '', domicilio, registrado: !!p.uid };
+  const vacio = { ok: true, persona, desde, hasta, total: 0, exitosas: 0, fallidas: 0, truncado: false, maxRegistros: REPORTE_MAX_REG, registros: [] };
+  if (!p.uid) return json(vacio);   // sin cuenta todavía: no puede haber abierto
+
+  const r = await fetch(`${fsBase(env)}:runQuery`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ structuredQuery: {
+      from: [{ collectionId: 'aperturas' }],
+      where: { compositeFilter: { op: 'AND', filters: [
+        { fieldFilter: { field: { fieldPath: 'uid' }, op: 'EQUAL', value: { stringValue: p.uid } } },
+        { fieldFilter: { field: { fieldPath: 'tipo' }, op: 'EQUAL', value: { stringValue: 'app' } } },
+        { fieldFilter: { field: { fieldPath: 'ts' }, op: 'GREATER_THAN_OR_EQUAL', value: { timestampValue: inicio.toISOString() } } },
+        { fieldFilter: { field: { fieldPath: 'ts' }, op: 'LESS_THAN', value: { timestampValue: fin.toISOString() } } },
+      ] } },
+      orderBy: [{ field: { fieldPath: 'ts' }, direction: 'DESCENDING' }],
+      limit: REPORTE_MAX_REG + 1,
+    } }),
+  });
+  if (!r.ok) {
+    console.error('[reporte-aperturas] runQuery HTTP', r.status);
+    throw httpErr(500, r.status === 400 ? 'Falta publicar el índice de aperturas (uid + tipo + ts)' : 'Firestore query falló');
+  }
+  const filas = ((await r.json()) || []).filter(x => x.document).map(x => readDoc(x.document.fields));
+  const registros = filas.slice(0, REPORTE_MAX_REG).map(d => ({
+    ts: d.ts, puerta: d.puerta || '', resultado: d.resultado === 'error' ? 'error' : 'ok',
+    motivo: d.resultado === 'error' ? (d.motivo || '') : '', via: d.via === 'voz' ? 'Siri' : 'App',
+  }));
+  const exitosas = registros.filter(x => x.resultado === 'ok').length;
+  return json({ ...vacio, total: registros.length, exitosas, fallidas: registros.length - exitosas,
+    truncado: filas.length > REPORTE_MAX_REG, registros });
+}
+
+/* ============ Saldo acumulado (caja que NO regresa a cero al cambiar de mes) ============
+   saldoActual = (todos los ingresos − todos los gastos) desde el primer movimiento, sin cancelados.
+   saldos/{YYYY-MM} = { cierre, ingresos, egresos, calculadoEn } de un mes YA TERMINADO (Hermosillo):
+   cierre = saldo acumulado al final de ese mes. Lo escribe SOLO el Worker (firestore.rules no tiene
+   match para "saldos" → el cliente no lo lee ni lo escribe). Si falta, se recalcula una sola vez
+   leyendo toda la historia y se guardan todos los meses terminados.
+   Invalidación: cancelar / corregir / reactivar un movimiento de un mes ya cerrado borra, en la MISMA
+   transacción, los saldos de ese mes en adelante (writesInvalidarSaldos). Registrar siempre cae en el
+   mes en curso, que nunca está guardado. */
+const redondear2 = n => Math.round(n * 100) / 100;
+function claveMesHermosillo(instante) {
+  const d = aHermosillo(instante);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+function moverMes(ym, delta) {
+  const [y, m] = ym.split('-').map(Number);
+  const t = new Date(Date.UTC(y, m - 1 + delta, 1));
+  return `${t.getUTCFullYear()}-${String(t.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+function rangoMesUTC(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return { inicio: inicioDiaHermosilloUTC(y, m - 1, 1), fin: inicioDiaHermosilloUTC(y, m, 1) };
+}
+/* Movimientos con ts en [inicio, fin): un solo rango sobre "ts" (índice automático de un campo). */
+async function finanzasEnRango(env, at, inicio, fin) {
+  const r = await fetch(`${fsBase(env)}:runQuery`, {
+    method: 'POST', headers: { Authorization: 'Bearer ' + at, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ structuredQuery: {
+      from: [{ collectionId: 'finanzas' }],
+      where: { compositeFilter: { op: 'AND', filters: [
+        { fieldFilter: { field: { fieldPath: 'ts' }, op: 'GREATER_THAN_OR_EQUAL', value: { timestampValue: inicio.toISOString() } } },
+        { fieldFilter: { field: { fieldPath: 'ts' }, op: 'LESS_THAN', value: { timestampValue: fin.toISOString() } } },
+      ] } },
+    } }),
+  });
+  if (!r.ok) throw httpErr(500, 'Firestore query falló');
+  return ((await r.json()) || []).filter(x => x.document).map(x => x.document);
+}
+/* Saldo con el que ABRE el mes ym = cierre del mes anterior. */
+async function saldoInicialDelMes(env, at, ym) {
+  const prev = moverMes(ym, -1);
+  const doc = await getDoc(env, at, `saldos/${prev}`);
+  const c = doc && readDoc(doc.fields);
+  if (c && typeof c.cierre === 'number' && Number.isFinite(c.cierre)) return c.cierre;
+  return (await recalcularSaldos(env, at)).get(prev) ?? 0;
+}
+/* Recorre TODA la historia una vez, guarda el cierre de cada mes terminado y devuelve Map(ym → cierre).
+   Meses sin movimientos (huecos) también se guardan, con el cierre del anterior. */
+async function recalcularSaldos(env, at) {
+  const porMes = new Map();   // ym -> { ingresos, egresos }
+  for (const doc of await firestoreList(env, 'finanzas')) {
+    const d = readDoc(doc.fields);
+    if (!d || esCancelado(d) || !d.ts) continue;
+    const ym = claveMesHermosillo(d.ts);
+    const t = porMes.get(ym) || { ingresos: 0, egresos: 0 };
+    if (d.tipo === 'ingreso') t.ingresos += d.monto || 0;
+    else if (d.tipo === 'egreso') t.egresos += d.monto || 0;
+    porMes.set(ym, t);
+  }
+  const actual = claveMesHermosillo(Date.now());
+  const cierres = new Map();
+  const meses = [...porMes.keys()].filter(k => k < actual).sort();
+  if (!meses.length) return cierres;
+  let saldo = 0;
+  const writes = [];
+  const ahora = new Date().toISOString();
+  for (let ym = meses[0]; ym < actual; ym = moverMes(ym, 1)) {
+    const t = porMes.get(ym) || { ingresos: 0, egresos: 0 };
+    saldo = redondear2(saldo + t.ingresos - t.egresos);
+    cierres.set(ym, saldo);
+    writes.push({ update: { name: docName(env, `saldos/${ym}`), fields: {
+      cierre: { doubleValue: saldo }, ingresos: { doubleValue: redondear2(t.ingresos) },
+      egresos: { doubleValue: redondear2(t.egresos) }, calculadoEn: { timestampValue: ahora },
+    } } });
+  }
+  // Guardar es best-effort: si falla, el saldo devuelto sigue siendo correcto (solo se recalcula otra vez).
+  try { for (let i = 0; i < writes.length; i += 400) await fsCommit(env, at, writes.slice(i, i + 400)); }
+  catch (e) { console.error('[saldos] no se pudo guardar el cierre:', e && e.message); }
+  return cierres;
+}
+/* Borra los saldos guardados desde el mes del movimiento hasta el mes pasado (un movimiento del mes en
+   curso no toca nada). Van DENTRO del commit que cambia el movimiento: o se aplican juntos o ninguno. */
+function writesInvalidarSaldos(env, tsMov) {
+  if (!tsMov) return [];
+  const actual = claveMesHermosillo(Date.now());
+  const out = [];
+  for (let ym = claveMesHermosillo(tsMov); ym < actual && out.length < 480; ym = moverMes(ym, 1)) {
+    out.push({ delete: docName(env, `saldos/${ym}`) });
+  }
+  return out;
 }
 
 /* ============ /finanzas/cobranza — SOLO staff ============

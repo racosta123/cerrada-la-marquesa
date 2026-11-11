@@ -17,6 +17,15 @@
       ]
     },
     {
+      "collectionGroup": "aperturas",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "uid", "order": "ASCENDING" },
+        { "fieldPath": "tipo", "order": "ASCENDING" },
+        { "fieldPath": "ts", "order": "DESCENDING" }
+      ]
+    },
+    {
       "collectionGroup": "invitaciones",
       "queryScope": "COLLECTION",
       "fields": [

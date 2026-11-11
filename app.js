@@ -609,6 +609,7 @@ function watchLog(){
   $('#logTitle').textContent = isStaff ? 'Bitácora general' : 'Historial';
   $('#logAlertasBtn').classList.toggle('hidden', !isStaff);
   $('#logAlertasBtn').classList.toggle('sel', logSoloAlertas);
+  $('#aperRepBtn').classList.toggle('hidden', !isStaff);
   // Une los resultados por id (una visita propia sale en las dos consultas) y ordena por hora.
   const partes = qs.map(() => null);
   const unir = () => {
@@ -2131,9 +2132,11 @@ function activarFinanzasStaff(){
 async function loadResumenResidente(){
   try {
     const r = await authedFetch('/finanzas/resumen', {});
+    $('#finSaldoIni').textContent = money(r.saldoInicial);
     $('#finCobrado').textContent = money(r.ingreso);
     $('#finGastos').textContent = money(r.egreso);
-    $('#finCaja').textContent = money(r.balance);
+    $('#finCaja').textContent = money(r.saldoActual);   // acumulado: no regresa a cero al cambiar de mes
+    pintarNetoMes(r.balance);
     renderTermometro(r.pagaron, r.totalCasas);
   } catch(e){
     console.error(e);
@@ -2342,21 +2345,57 @@ function renderFinanzas(){
   const cur = byMonth[curKey], prev = byMonth[prevKey];
 
   const cobrado = cur.ingreso, gastos = cur.gasto, caja = cur.ingreso - cur.gasto;
-  const prevCaja = prev.ingreso - prev.gasto;
 
   $('#finCobrado').textContent = money(cobrado);
   $('#finGastos').textContent = money(gastos);
-  $('#finCaja').textContent = money(caja);
+  pintarSaldoStaff(caja);
 
   renderCmp($('#cmpCobrado'), cobrado, prev.ingreso, true);
   renderCmp($('#cmpGastos'), gastos, prev.gasto, false);
-  renderCmp($('#cmpCaja'), caja, prevCaja, true);
+  pintarNetoMes(caja);
+  cargarSaldoInicial();
 
   renderFinCharts(byMonth, curKey);
   populateFiltros();
   filterAndRenderMovs();
   // Un movimiento nuevo puede cambiar quién pagó → recalcula la cobranza en el Worker.
   cargarCobranza();
+}
+
+/* -------- saldo acumulado: Saldo inicial del mes + cobrado − gastos = Saldo actual --------
+   El saldo inicial (cierre del mes anterior) lo calcula SOLO el Worker (/finanzas/resumen). Staff:
+   el neto del mes sale de finCache (los mismos movimientos del mes que suma el Worker), así la
+   tarjeta se actualiza con cada snapshot; y cada snapshot vuelve a pedir el saldo inicial porque
+   cancelar/corregir un movimiento de un mes cerrado lo cambia. */
+let saldoInicialMes = null;
+let saldoIniEnVuelo = null;
+function netoMesStaff(){
+  const b = groupByMonth()[finMonths[finMonths.length-1].key];
+  return b ? b.ingreso - b.gasto : 0;
+}
+function pintarSaldoStaff(netoMes){
+  $('#finSaldoIni').textContent = saldoInicialMes == null ? '—' : money(saldoInicialMes);
+  $('#finCaja').textContent = saldoInicialMes == null ? '—' : money(saldoInicialMes + netoMes);
+}
+function pintarNetoMes(neto){
+  $('#cmpCaja').innerHTML = `<span class="muted">Este mes: ${neto < 0 ? '-' : '+'}${money(Math.abs(neto))}</span>`;
+}
+let saldoIniRepetir = false;
+function cargarSaldoInicial(){
+  // Una sola petición en vuelo; si llega otro snapshot mientras tanto, se repite UNA vez al terminar
+  // (la respuesta en curso pudo salir antes del cambio).
+  if (saldoIniEnVuelo){ saldoIniRepetir = true; return saldoIniEnVuelo; }
+  saldoIniEnVuelo = (async () => {
+    try {
+      const r = await authedFetch('/finanzas/resumen', {});
+      if (typeof r.saldoInicial === 'number') saldoInicialMes = r.saldoInicial;
+    } catch(e){ console.error('saldo inicial', e); }
+    if (finStaffActivo) pintarSaldoStaff(netoMesStaff());
+    saldoIniEnVuelo = null;
+    if (saldoIniRepetir){ saldoIniRepetir = false; return cargarSaldoInicial(); }
+    return saldoInicialMes;
+  })();
+  return saldoIniEnVuelo;
 }
 
 /* -------- gastos por categoría del mes (compartido: dashboard + PDF) -------- */
@@ -2949,7 +2988,10 @@ $('#pdfBtn').addEventListener('click', generarPDF);
 async function construirReportePDF(){
     // bajo demanda (las gráficas del PDF usan Chart.js); el logo casi siempre ya está (se adelanta al
     // abrir Finanzas) y cargarLogoMarquesa nunca falla: si no llega, devuelve null y el PDF sale sin logo.
-    await Promise.all([cargarLib('pdf'), cargarLib('chart'), cargarLogoMarquesa()]);
+    // El saldo inicial del mes se pide fresco al Worker: sin él no se arma el reporte (un saldo
+    // final inventado sería peor que un error).
+    const [, , , saldoIni] = await Promise.all([cargarLib('pdf'), cargarLib('chart'), cargarLogoMarquesa(), cargarSaldoInicial()]);
+    if (typeof saldoIni !== 'number') throw new Error('No se pudo obtener el saldo inicial del mes');
     const { jsPDF } = window.jspdf;
     const doc = new jsPDF({ unit:'pt', format:'letter' });
     const W = doc.internal.pageSize.getWidth();
@@ -2964,15 +3006,15 @@ async function construirReportePDF(){
 
     let cobrado = 0, gastos = 0;
     monthMovs.forEach(m => m.tipo==='ingreso' ? cobrado += m.monto : gastos += m.monto);
-    const saldo = cobrado - gastos;
+    const saldo = cobrado - gastos;            // neto del periodo
+    const saldoFinal = saldoIni + saldo;       // acumulado al cierre (o al día de hoy, si el mes sigue)
+    const sgn = n => (n < 0 ? '-' : '+') + money(Math.abs(n));   // "-" ASCII: el "−" corrompe WinAnsi
 
     const byMonth = groupByMonth();
     const prevMonth = prevKey ? byMonth[prevKey] : null;
     const cmpPct = (cur, prevVal) => (prevVal > 0) ? Math.round(((cur - prevVal) / prevVal) * 100) : null;
     const cmpCobrado = prevMonth ? cmpPct(cobrado, prevMonth.ingreso) : null;
     const cmpGastos = prevMonth ? cmpPct(gastos, prevMonth.gasto) : null;
-    const prevSaldo = prevMonth ? (prevMonth.ingreso - prevMonth.gasto) : null;
-    const cmpSaldo = (prevMonth && prevSaldo !== 0) ? Math.round(((saldo - prevSaldo) / Math.abs(prevSaldo)) * 100) : null;
 
     const folio = folioDelMes(curKey, cobrado, gastos);
     const generadoEl = new Date().toLocaleString('es-MX', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
@@ -3013,7 +3055,8 @@ async function construirReportePDF(){
     const boxes = [
       { label:'TOTAL COBRADO', value: cobrado, color: PDF.green, cmp: cmpCobrado, higherIsBetter:true },
       { label:'GASTOS', value: gastos, color: PDF.red, cmp: cmpGastos, higherIsBetter:false },
-      { label:'SALDO EN CAJA', value: saldo, color: PDF.navy, cmp: cmpSaldo, higherIsBetter:true },
+      { label:'SALDO FINAL', value: saldoFinal, color: PDF.navy, cmp: null,
+        nota: `Inicial ${money(saldoIni)}  ${sgn(saldo)} del mes` },
     ];
     boxes.forEach((b, i) => {
       const x = M + i*(boxW + boxGap);
@@ -3033,7 +3076,7 @@ async function construirReportePDF(){
         doc.text(`${up?'+':'-'}${Math.abs(b.cmp)}% vs mes anterior`, x + 14, y + 58);
       } else {
         doc.setFont('helvetica','normal'); doc.setFontSize(8); doc.setTextColor(...PDF.notes);
-        doc.text('Sin datos del mes anterior', x + 14, y + 58);
+        doc.text(b.nota || 'Sin datos del mes anterior', x + 14, y + 58);
       }
     });
     y += boxH + 22;
@@ -3095,7 +3138,11 @@ async function construirReportePDF(){
         // de jsPDF y corrompe toda la celda (mismo bug que las flechas ▲▼ de las cajas).
         ? rows.map(r => [r.fecha, r.categoria, r.concepto, (r.tipo==='ingreso'?'+':'-') + money(r.monto)])
         : [['—','—','Sin movimientos','—']],
-      foot: rows.length ? [['', '', 'Saldo del periodo', (saldo>=0?'+':'-') + money(Math.abs(saldo))]] : [],
+      foot: [
+        ['', '', 'Saldo inicial del mes', money(saldoIni)],
+        ['', '', 'Saldo del periodo', sgn(saldo)],
+        ['', '', 'Saldo final', money(saldoFinal)],
+      ],
       theme:'plain',
       styles:{ font:'helvetica', fontSize:9, textColor: PDF.text, cellPadding:6, lineColor: PDF.grid, lineWidth:0.5 },
       headStyles:{ fillColor:[255,255,255], textColor: PDF.secondary, fontStyle:'bold', fontSize:8.5, lineColor: PDF.text },
@@ -3396,6 +3443,154 @@ $('#casaRepGo').addEventListener('click', async () => {
     $('#casaRepErr').textContent = 'No se pudo generar el reporte';
   } finally { btn.disabled = false; btn.textContent = 'Generar PDF'; }
 });
+
+/* ====================== REPORTE DE APERTURAS POR RESIDENTE (solo staff) ======================
+   Todo lo decide el Worker (/aperturas/reporte): rol staff, rango máximo y tope de registros. Aquí
+   solo se elige persona + fechas, se muestra el detalle y se arma el PDF con lo que respondió. */
+let aperRepUltimo = null;
+const HMO_TZ = 'America/Hermosillo';   // mismo huso que usa el Worker para cortar los días
+const fechaHmo = ts => new Date(ts).toLocaleDateString('es-MX', { timeZone: HMO_TZ, day:'2-digit', month:'2-digit', year:'numeric' });
+const horaHmo = ts => new Date(ts).toLocaleTimeString('es-MX', { timeZone: HMO_TZ, hour:'2-digit', minute:'2-digit' });
+const isoDiaHmo = d => new Date(d).toLocaleDateString('en-CA', { timeZone: HMO_TZ });   // AAAA-MM-DD
+$('#aperRepBtn').addEventListener('click', async () => {
+  $('#aperRepErr').textContent = '';
+  $('#aperRepRes').classList.add('hidden');
+  aperRepUltimo = null;
+  if (!$('#aperRepHasta').value) $('#aperRepHasta').value = isoDiaHmo(Date.now());
+  if (!$('#aperRepDesde').value) $('#aperRepDesde').value = isoDiaHmo(Date.now() - 29 * 86400000);
+  const sel = $('#aperRepSel');
+  sel.innerHTML = '<option value="">Cargando padrón…</option>';
+  openSheet('#aperRepOverlay');
+  if (!personasCache.length) await cargarPersonas();
+  const etiqueta = p => `${p.nombre || 'Sin nombre'}${p.domicilio ? ' · ' + p.domicilio : ''}${p.estado === 'baja' ? ' (baja)' : ''}`;
+  const lista = personasCache.filter(p => p.registrado)   // sin cuenta no puede haber abierto
+    .sort((a, b) => (a.estado === 'baja') - (b.estado === 'baja')
+      || (a.domicilio || '').localeCompare(b.domicilio || '', 'es', { numeric:true })
+      || (a.nombre || '').localeCompare(b.nombre || '', 'es'));
+  sel.innerHTML = '';
+  sel.appendChild(new Option(lista.length ? 'Elige un residente…' : 'Sin residentes con cuenta', ''));
+  lista.forEach(p => sel.appendChild(new Option(etiqueta(p), p.id)));
+});
+$('#aperRepOverlay').addEventListener('click', e => { if (e.target.id==='aperRepOverlay') closeSheet('#aperRepOverlay'); });
+
+$('#aperRepGo').addEventListener('click', async () => {
+  const personaId = $('#aperRepSel').value, desde = $('#aperRepDesde').value, hasta = $('#aperRepHasta').value;
+  $('#aperRepErr').textContent = '';
+  if (!personaId){ $('#aperRepErr').textContent = 'Elige un residente'; return; }
+  if (!desde || !hasta){ $('#aperRepErr').textContent = 'Elige las dos fechas'; return; }
+  const btn = $('#aperRepGo'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+  try {
+    const r = await authedFetch('/aperturas/reporte', { personaId, desde, hasta });
+    aperRepUltimo = r;
+    $('#aperRepResumen').innerHTML = `<b style="color:var(--text)">${r.total}</b> apertura(s) de ${esc(r.persona.nombre)}`
+      + ` del ${esc(fechaHmo(r.desde + 'T12:00:00Z'))} al ${esc(fechaHmo(r.hasta + 'T12:00:00Z'))}`
+      + ` · ${r.exitosas} exitosa(s) · ${r.fallidas} fallida(s)`
+      + (r.truncado ? `<br>⚠️ Hay más de ${r.maxRegistros} registros: acorta el rango para ver todos.` : '');
+    const list = $('#aperRepList'); list.innerHTML = '';
+    if (!r.registros.length) list.innerHTML = '<div class="empty">Sin aperturas en ese rango</div>';
+    r.registros.forEach(x => {
+      const row = document.createElement('div');
+      row.className = 'row';
+      const ok = x.resultado === 'ok';
+      row.innerHTML = `<div class="rt"><div class="a">${esc(puertaName(x.puerta))}${x.via === 'Siri' ? ' · 🎙️ Siri' : ''}</div>`
+        + `<div class="b">${esc(fechaHmo(x.ts))} · ${esc(horaHmo(x.ts))}${ok ? '' : ' · ' + esc(x.motivo || 'error')}</div></div>`
+        + `<span class="tag ${ok ? 'in' : 'out'}">${ok ? 'Abrió' : 'Fallido'}</span>`;
+      list.appendChild(row);
+    });
+    $('#aperRepPdf').disabled = !r.registros.length;
+    $('#aperRepRes').classList.remove('hidden');
+  } catch(e){ $('#aperRepErr').textContent = e.message || 'No se pudo consultar'; }
+  finally { btn.disabled = false; btn.textContent = 'Consultar'; }
+});
+
+$('#aperRepPdf').addEventListener('click', async () => {
+  if (!aperRepUltimo) return;
+  const btn = $('#aperRepPdf'); btn.disabled = true; btn.textContent = 'Generando…';
+  try {
+    await Promise.all([cargarLib('pdf'), cargarLogoMarquesa()]);
+    const { doc, filename } = construirReporteAperturasPDF(aperRepUltimo);
+    doc.save(filename);
+    toast('Reporte descargado', 'ok');
+  } catch(e){
+    console.error('reporteAperturas', e);
+    $('#aperRepErr').textContent = 'No se pudo generar el PDF';
+  } finally { btn.disabled = false; btn.textContent = 'Descargar PDF'; }
+});
+
+/* PDF del reporte de aperturas: identidad FASE 0 + banner del logo real (assets/logo-marquesa.jpg). */
+function construirReporteAperturasPDF(r){
+  const { jsPDF } = window.jspdf;
+  const doc = new jsPDF({ unit:'pt', format:'letter' });
+  const W = doc.internal.pageSize.getWidth();
+  const H = doc.internal.pageSize.getHeight();
+  const M = PDF.MARGIN;
+  const generadoEl = new Date().toLocaleString('es-MX', { timeZone: HMO_TZ, day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
+  const periodo = `${fechaHmo(r.desde + 'T12:00:00Z')} al ${fechaHmo(r.hasta + 'T12:00:00Z')}`;
+
+  doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
+  const LOGO_W = 220, LOGO_H = LOGO_W * (300 / 662);
+  let y;
+  if (logoMarquesaDataUrl) {
+    const logoY = 4 + 16;
+    doc.addImage(logoMarquesaDataUrl, 'JPEG', (W - LOGO_W) / 2, logoY, LOGO_W, LOGO_H);
+    y = logoY + LOGO_H + 16;
+  } else {
+    y = M - 10;
+  }
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+  doc.text('R E P O R T E   D E   A P E R T U R A S', M, y + 14);
+  doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
+  doc.text('Cerrada La Marquesa', M, y + 42);
+  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
+  doc.text(`Periodo: ${periodo}`, W - M, y + 10, { align:'right' });
+  doc.setTextColor(...PDF.notes);
+  doc.text(`Generado: ${generadoEl}`, W - M, y + 22, { align:'right' });
+  y += 58; doc.setDrawColor(...PDF.grid); doc.line(M, y, W - M, y); y += 22;
+
+  doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(...PDF.text);
+  doc.text(r.persona.nombre || 'Residente', M, y);
+  doc.setFont('helvetica','normal'); doc.setFontSize(9.5); doc.setTextColor(...PDF.secondary);
+  if (r.persona.domicilio) doc.text(`Domicilio: ${r.persona.domicilio}`, M, y + 15);
+  doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...PDF.text);
+  doc.text(`${r.total} apertura(s) · ${r.exitosas} exitosa(s) · ${r.fallidas} fallida(s)`, W - M, y, { align:'right' });
+  y += 26;
+  if (r.truncado){
+    doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(...PDF.red);
+    doc.text(`Se muestran los ${r.maxRegistros} registros más recientes del periodo: hay más. Acorta el rango para verlos todos.`, M, y);
+    y += 14;
+  }
+
+  doc.autoTable({
+    startY: y,
+    head: [['Fecha','Hora','Puerta','Vía','Resultado']],
+    body: r.registros.map(x => [
+      fechaHmo(x.ts), horaHmo(x.ts), puertaName(x.puerta), x.via,
+      x.resultado === 'ok' ? 'Abrió' : `Fallido${x.motivo ? ' (' + x.motivo + ')' : ''}`,
+    ]),
+    theme:'plain',
+    styles:{ font:'helvetica', fontSize:9, textColor: PDF.text, cellPadding:6, lineColor: PDF.grid, lineWidth:0.5 },
+    headStyles:{ fillColor:[255,255,255], textColor: PDF.secondary, fontStyle:'bold', fontSize:8.5, lineColor: PDF.text },
+    alternateRowStyles:{ fillColor: PDF.zebra },
+    columnStyles:{ 1:{ font:'courier' } },
+    margin:{ left:M, right:M, bottom: 50 },
+    didParseCell(data){
+      if (data.section === 'body' && data.column.index === 4){
+        data.cell.styles.fontStyle = 'bold';
+        data.cell.styles.textColor = r.registros[data.row.index]?.resultado === 'ok' ? PDF.green : PDF.red;
+      }
+    },
+  });
+
+  const totalPages = doc.internal.getNumberOfPages();
+  for (let p = 1; p <= totalPages; p++){
+    doc.setPage(p);
+    doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
+    doc.text('Reporte de aperturas · Cerrada La Marquesa · Uso interno de administración', M, H - 24);
+    doc.text(`Página ${p} de ${totalPages}`, W - M, H - 24, { align:'right' });
+  }
+  const limpio = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  return { doc, filename: `Aperturas-${limpio(r.persona.nombre) || 'residente'}-${r.desde}-a-${r.hasta}.pdf` };
+}
 
 /* Historial de pagos de una casa, identidad FASE 0. Cada pago referencia su folio
    de recibo y la fecha de envío/descarga — el soporte para aclaraciones. */
@@ -4015,7 +4210,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v35';
+const APP_VERSION = 'v36';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

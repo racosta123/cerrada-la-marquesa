@@ -203,7 +203,7 @@
   .empty{text-align:center;color:var(--muted-2);font-size:14px;padding:36px 10px}
 
   /* ---------- FINANZAS ---------- */
-  .fin-cards{display:grid;grid-template-columns:1fr 1fr 1fr;gap:11px;margin-bottom:14px}
+  .fin-cards{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:14px}
   .fin-card{position:relative;background:var(--surface);border:1px solid var(--line);border-radius:var(--r-sm);padding:15px 12px 14px;overflow:hidden}
   .fin-bar{position:absolute;left:0;top:0;bottom:0;width:4px}
   .fin-label{font-size:11px;color:var(--muted);letter-spacing:.3px;margin-bottom:7px}
@@ -490,6 +490,8 @@
       <div class="section-title" id="logTitle">Mi historial</div>
       <!-- Solo staff: filtra la bitácora a los registros con "⚠️ Posible residente suspendido" -->
       <button type="button" class="row-act hidden" id="logAlertasBtn">⚠️ Solo alertas</button>
+      <!-- Solo staff: aperturas de un residente en un rango de fechas (lo valida el Worker) -->
+      <button type="button" class="row-act hidden" id="aperRepBtn">📄 Reporte por residente</button>
     </div>
     <div class="list" id="logList"><div class="empty">Sin movimientos</div></div>
   </div>
@@ -498,6 +500,13 @@
   <div id="tab-finanzas" class="tabpane hidden">
     <div class="section-title" id="finMonth">Finanzas</div>
     <div class="fin-cards">
+      <!-- Saldo inicial del mes (cierre del mes anterior) + Cobrado − Gastos = Saldo actual (acumulado, lo calcula el Worker) -->
+      <div class="fin-card">
+        <div class="fin-bar" style="background:var(--muted)"></div>
+        <div class="fin-label">Saldo inicial del mes</div>
+        <div class="fin-val" id="finSaldoIni">—</div>
+        <div class="fin-cmp"><span class="muted">Cierre del mes anterior</span></div>
+      </div>
       <div class="fin-card">
         <div class="fin-bar" style="background:var(--ok)"></div>
         <div class="fin-label">Cobrado</div>
@@ -512,8 +521,8 @@
       </div>
       <div class="fin-card">
         <div class="fin-bar" style="background:var(--gold)"></div>
-        <div class="fin-label">En caja</div>
-        <div class="fin-val" id="finCaja">$0</div>
+        <div class="fin-label">Saldo actual</div>
+        <div class="fin-val" id="finCaja">—</div>
         <div class="fin-cmp" id="cmpCaja"></div>
       </div>
     </div>
@@ -950,6 +959,27 @@
     <div class="field hidden" id="casaRepCustomField"><label>Casa exacta</label><input id="casaRepCustom" placeholder="Ej. 57"></div>
     <button class="btn-primary" id="casaRepGo">Generar PDF</button>
     <div id="casaRepErr" class="err"></div>
+  </div>
+</div>
+
+<!-- ============ REPORTE DE APERTURAS POR RESIDENTE (solo staff) ============ -->
+<div class="overlay" id="aperRepOverlay">
+  <div class="sheet">
+    <div class="grab"></div>
+    <h3>Aperturas por residente</h3>
+    <div class="field"><label>Residente</label>
+      <select id="aperRepSel"></select>
+    </div>
+    <div class="field"><label>Desde</label><input type="date" id="aperRepDesde"></div>
+    <div class="field"><label>Hasta</label><input type="date" id="aperRepHasta"></div>
+    <p class="vnote" style="margin:0 0 10px">Rango máximo de 92 días · hasta 500 registros por consulta.</p>
+    <button class="btn-primary" id="aperRepGo">Consultar</button>
+    <div id="aperRepErr" class="err"></div>
+    <div id="aperRepRes" class="hidden" style="margin-top:12px">
+      <div id="aperRepResumen" class="vnote" style="margin:0 0 8px"></div>
+      <div class="list" id="aperRepList" style="max-height:38vh;overflow:auto"></div>
+      <button class="btn-primary" id="aperRepPdf" style="margin-top:10px">Descargar PDF</button>
+    </div>
   </div>
 </div>
 
