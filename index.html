@@ -968,7 +968,9 @@
     <div class="grab"></div>
     <h3>Aperturas por residente</h3>
     <div class="field"><label>Residente</label>
-      <select id="aperRepSel"></select>
+      <input id="aperRepBuscar" type="search" placeholder="Escribe nombre o casa…" autocomplete="off">
+      <div class="list" id="aperRepSug" style="max-height:30vh;overflow:auto;margin-top:6px"></div>
+      <div class="vnote hidden" id="aperRepElegido" style="margin:6px 0 0"></div>
     </div>
     <div class="field"><label>Desde</label><input type="date" id="aperRepDesde"></div>
     <div class="field"><label>Hasta</label><input type="date" id="aperRepHasta"></div>

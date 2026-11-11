@@ -3458,23 +3458,53 @@ $('#aperRepBtn').addEventListener('click', async () => {
   aperRepUltimo = null;
   if (!$('#aperRepHasta').value) $('#aperRepHasta').value = isoDiaHmo(Date.now());
   if (!$('#aperRepDesde').value) $('#aperRepDesde').value = isoDiaHmo(Date.now() - 29 * 86400000);
-  const sel = $('#aperRepSel');
-  sel.innerHTML = '<option value="">Cargando padrón…</option>';
+  aperRepElegir(null);
+  $('#aperRepBuscar').value = '';
+  $('#aperRepSug').innerHTML = '<div class="empty">Cargando padrón…</div>';
   openSheet('#aperRepOverlay');
+  // Solo si el padrón aún no está en el teléfono; si ya está, el buscador filtra lo cargado.
   if (!personasCache.length) await cargarPersonas();
-  const etiqueta = p => `${p.nombre || 'Sin nombre'}${p.domicilio ? ' · ' + p.domicilio : ''}${p.estado === 'baja' ? ' (baja)' : ''}`;
-  const lista = personasCache.filter(p => p.registrado)   // sin cuenta no puede haber abierto
-    .sort((a, b) => (a.estado === 'baja') - (b.estado === 'baja')
-      || (a.domicilio || '').localeCompare(b.domicilio || '', 'es', { numeric:true })
-      || (a.nombre || '').localeCompare(b.nombre || '', 'es'));
-  sel.innerHTML = '';
-  sel.appendChild(new Option(lista.length ? 'Elige un residente…' : 'Sin residentes con cuenta', ''));
-  lista.forEach(p => sel.appendChild(new Option(etiqueta(p), p.id)));
+  aperRepFiltrar();
 });
 $('#aperRepOverlay').addEventListener('click', e => { if (e.target.id==='aperRepOverlay') closeSheet('#aperRepOverlay'); });
 
+/* Buscador de residente: filtra en vivo personasCache (ya cargado, sin lecturas nuevas) por nombre o
+   casa, sin distinguir mayúsculas ni acentos ("ruben" encuentra "Rubén"). Máximo 20 resultados. */
+let aperRepPersonaId = '';
+const sinAcentos = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+const aperRepEtiqueta = p => `${p.nombre || 'Sin nombre'} · ${p.domicilio || 'sin casa'}${p.estado === 'baja' ? ' (baja)' : ''}`;
+function aperRepElegir(p){
+  aperRepPersonaId = p ? p.id : '';
+  const el = $('#aperRepElegido');
+  el.classList.toggle('hidden', !p);
+  el.innerHTML = p ? `Seleccionado: <b style="color:var(--text)">${esc(aperRepEtiqueta(p))}</b>` : '';
+}
+function aperRepFiltrar(){
+  const q = sinAcentos($('#aperRepBuscar').value.trim());
+  const cont = $('#aperRepSug'); cont.innerHTML = '';
+  const todos = personasCache.filter(p => p.registrado);   // sin cuenta no puede haber abierto
+  if (!todos.length){ cont.innerHTML = '<div class="empty">Sin residentes con cuenta</div>'; return; }
+  const hits = todos
+    .filter(p => !q || sinAcentos(p.nombre).includes(q) || sinAcentos(p.domicilio).includes(q))
+    .sort((a, b) => (a.estado === 'baja') - (b.estado === 'baja')
+      || (a.nombre || '').localeCompare(b.nombre || '', 'es')
+      || (a.domicilio || '').localeCompare(b.domicilio || '', 'es', { numeric:true }))
+    .slice(0, 20);
+  if (!hits.length){ cont.innerHTML = '<div class="empty">Sin coincidencias</div>'; return; }
+  hits.forEach(p => {
+    const row = document.createElement('div');
+    row.className = 'row'; row.style.cursor = 'pointer';
+    row.innerHTML = `<div class="rt"><div class="a">${esc(p.nombre || 'Sin nombre')}</div>`
+      + `<div class="b">${esc(p.domicilio || 'sin casa')}${p.estado === 'baja' ? ' · baja' : ''}</div></div>`
+      + (p.id === aperRepPersonaId ? '<span class="tag in">Elegido</span>' : '');
+    row.addEventListener('click', () => { aperRepElegir(p); aperRepFiltrar(); });
+    cont.appendChild(row);
+  });
+}
+$('#aperRepBuscar').addEventListener('input', () => { aperRepElegir(null); aperRepFiltrar(); });
+
 $('#aperRepGo').addEventListener('click', async () => {
-  const personaId = $('#aperRepSel').value, desde = $('#aperRepDesde').value, hasta = $('#aperRepHasta').value;
+  const personaId = aperRepPersonaId, desde = $('#aperRepDesde').value, hasta = $('#aperRepHasta').value;
   $('#aperRepErr').textContent = '';
   if (!personaId){ $('#aperRepErr').textContent = 'Elige un residente'; return; }
   if (!desde || !hasta){ $('#aperRepErr').textContent = 'Elige las dos fechas'; return; }
@@ -4210,7 +4240,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v36';
+const APP_VERSION = 'v37';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
