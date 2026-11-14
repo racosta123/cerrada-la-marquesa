@@ -1,15 +1,16 @@
-const CACHE = 'marquesa-v38';
+const CACHE = 'marquesa-v39';
 
 // SHELL: cambia en cada publicación → se baja SIEMPRE del servidor al instalar una versión nueva.
 // cache:'reload' — GitHub Pages manda Cache-Control max-age=600: con addAll a secas el precache
 // de una versión NUEVA podía llenarse con el app.js/index.html VIEJO de la caché HTTP (hasta 10 min).
-const SHELL = ['./','./index.html','./app.js','./config.js','./manifest.json'];
+const SHELL = ['./','./index.html','./app.js','./config.js','./manifest.json','./pdf-marquesa.js'];
 
 // ESTÁTICOS: no cambian de contenido sin cambiar de nombre (así se hizo con los iconos icon-m-*).
 // Si ya están en la caché de la versión anterior se COPIAN de ahí (0 bytes de datos móviles por
 // versión); si no, se piden a la red. REGLA: si reemplazas uno de estos archivos, cámbiale el nombre.
 // vendor/ va aquí aunque app.js lo cargue bajo demanda: así el QR, los PDF y las gráficas
-// funcionan sin red. El resto de imágenes/iconos se guarda la primera vez que se piden.
+// funcionan sin red. El resto de imágenes/iconos se guarda la primera vez que se piden (también el logo y la
+// Poppins de los PDF, vendor/Poppins-*.ttf: ~470 KB que solo baja quien genera un PDF; sin ellas sale en Helvetica).
 const ESTATICOS = [
   './vendor/qrcode.min.js','./vendor/jspdf.umd.min.js','./vendor/jspdf.plugin.autotable.min.js','./vendor/chart.umd.min.js',
   './assets/marquesa-mobile.webp',

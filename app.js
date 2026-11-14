@@ -17,7 +17,7 @@ const db   = firebase.firestore();
 const FIREBASE_SDK = 'https://www.gstatic.com/firebasejs/10.12.2/';
 const LIBS = {
   qr:    ['vendor/qrcode.min.js'],
-  pdf:   ['vendor/jspdf.umd.min.js', 'vendor/jspdf.plugin.autotable.min.js'],   // autotable necesita jsPDF antes
+  pdf:   ['vendor/jspdf.umd.min.js', 'vendor/jspdf.plugin.autotable.min.js', 'pdf-marquesa.js'],   // en orden: autotable necesita jsPDF; pdf-marquesa (estilo único de los PDF) usa ambos
   chart: ['vendor/chart.umd.min.js'],
 };
 const scriptsCargando = new Map();   // src → Promise
@@ -359,23 +359,13 @@ function enterApp(){
   refrescarAvisoPago(true);
 }
 
-/* Logo de la cerrada (assets/logo-marquesa.jpg, 662x300) para el banner del recibo PDF y del
-   reporte financiero del mes (staff): se pide al abrir la hoja del recibo o la pestaña Finanzas,
-   y los botones lo esperan antes de armar el PDF. construirReciboPDF() es síncrona a propósito
-   (ver su comentario): si aun así el logo no llegó (p.ej. sin red), el PDF sale sin el banner. */
-let logoMarquesaDataUrl = null;
-async function cargarLogoMarquesa(){
-  if (logoMarquesaDataUrl) return logoMarquesaDataUrl;
-  try {
-    const blob = await fetch('assets/logo-marquesa.jpg').then(r => r.blob());
-    logoMarquesaDataUrl = await new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.onload = () => resolve(reader.result);
-      reader.onerror = reject;
-      reader.readAsDataURL(blob);
-    });
-  } catch(e){ console.error('cargarLogoMarquesa', e); }
-  return logoMarquesaDataUrl;
+/* Todos los PDF salen de pdf-marquesa.js (módulo único de estilo: encabezado con el logo, tarjetas,
+   tablas y pie). prepararPDF() carga jsPDF + ese módulo y luego el logo (assets/logo-marquesa.jpg) y la
+   Poppins local de vendor/. Se adelanta al abrir Finanzas o la hoja del recibo, y los botones la esperan
+   antes de armar el PDF. Si el logo o las fuentes no llegan (p.ej. sin red), el PDF sale igual sin ellos. */
+async function prepararPDF(){
+  await cargarLib('pdf');
+  await MarquesaPDF.preparar();
 }
 
 function roleLabel(r){
@@ -2017,28 +2007,6 @@ let finCache = [];      // solo los VIGENTES — base de TODOS los cálculos: ca
                         // Un cancelado sigue visible (tachado) en la lista, pero nunca suma.
 let finMonths = [];     // [{key,start,end,label}] los últimos 6 meses, más viejo primero
 let finCharts = { barras:null, pastel:null, linea:null };
-// Paleta compartida: colores de las categorías en la dona del PDF y su leyenda nativa (mismo orden,
-// gama sobria para papel: dorado, ocre, terracota, verde seco + tonos tierra de respaldo).
-const DOUGHNUT_PALETTE = ['#d4a017', '#d97706', '#b7472a', '#6b8e63', '#8a6d3b', '#94a3b8'];
-function hexToRgb(hex){
-  const n = parseInt(hex.replace('#',''), 16);
-  return [(n>>16)&255, (n>>8)&255, n&255];
-}
-// Identidad visual del PDF "despacho contable" (FASE 0 del plan maestro).
-const PDF = {
-  text: [17,24,39],        // #111827 — nunca negro puro
-  secondary: [100,116,139],// #64748b
-  notes: [156,163,175],    // #9ca3af
-  gold: [212,160,23],      // #d4a017 — solo filetes/acentos
-  green: [15,118,110],     // #0f766e — ingresos
-  red: [153,27,27],        // #991b1b — gastos
-  navy: [30,58,138],       // #1e3a8a — saldo
-  grid: [226,232,240],     // #e2e8f0
-  zebra: [248,250,252],    // #f8fafc
-  badgeGreenBg: [204,251,241], badgeGreenFg: [15,118,110],
-  badgeRedBg: [254,226,226], badgeRedFg: [153,27,27],
-  MARGIN: 25 * 72 / 25.4,  // 25mm en pt
-};
 /* folio determinista FIN-YYYYMM-### — no hay contador persistente en Firestore (fuera de alcance
    escribir uno sin autorización), así que se deriva de mes+totales: estable mientras no cambien
    los movimientos del mes, único por combinación mes/monto. */
@@ -2112,7 +2080,7 @@ let finStaffActivo = false;   // el listener de finanzas (staff) ya está corrie
 function activarFinanzasStaff(){
   if (finStaffActivo || !ME || !enModoStaff()) return;
   finStaffActivo = true;
-  cargarLogoMarquesa();   // se adelanta el logo del reporte PDF; no bloquea nada
+  prepararPDF().catch(() => {});   // se adelantan jsPDF, logo y fuentes del reporte PDF; no bloquea nada
   // FASE 6.5: el padrón alimenta los dropdowns; la cobranza (termómetro + listas pagaron/
   // sin pago) la calcula el Worker y se pide en renderFinanzas(). El padrón normalmente ya
   // lo cargó buildTabs(); solo si no hay se pide (cargarPersonas reutiliza una en curso).
@@ -2486,186 +2454,6 @@ function resizeFinCharts(){
   requestAnimationFrame(()=> Object.values(finCharts).forEach(c => c && c.resize()));
 }
 
-/* -------- barras (Ingresos vs Gastos) en alta resolución, solo para el PDF --------
-   Colores de la identidad "despacho contable" (verde/rojo oscuros, legibles en papel blanco).
-   Sin leyenda horneada — esa va como texto nativo (ver dibujarLeyendaSeries). Valores encima
-   de cada barra vía plugin propio (afterDatasetsDraw), grid casi invisible. */
-async function renderBarrasHiRes(labels, ingresos, gastos){
-  const off = document.createElement('canvas');
-  off.width = 1400; off.height = 700;
-
-  const valueLabelsPlugin = {
-    id: 'valueLabels',
-    afterDatasetsDraw(chart){
-      const { ctx } = chart;
-      chart.data.datasets.forEach((dataset, di) => {
-        const meta = chart.getDatasetMeta(di);
-        meta.data.forEach((bar, i) => {
-          const value = dataset.data[i];
-          if (!value) return;
-          ctx.save();
-          ctx.fillStyle = '#111827';
-          ctx.font = 'bold 20px Helvetica, Arial, sans-serif';
-          ctx.textAlign = 'center';
-          ctx.fillText(money(value), bar.x, bar.y - 12);
-          ctx.restore();
-        });
-      });
-    },
-  };
-
-  const chart = new Chart(off, {
-    type:'bar',
-    data:{ labels, datasets:[
-      { label:'Ingresos', data:ingresos, backgroundColor:'#0f766e', borderRadius:6, maxBarThickness:46 },
-      { label:'Gastos', data:gastos, backgroundColor:'#991b1b', borderRadius:6, maxBarThickness:46 },
-    ]},
-    options:{
-      responsive:false, animation:false,
-      layout:{ padding:{ top:36 } },
-      plugins:{ legend:{ display:false }, tooltip:{ enabled:false } },
-      scales:{
-        x:{ ticks:{ color:'#64748b', font:{ size:22 } }, grid:{ display:false } },
-        y:{ ticks:{ color:'#64748b', font:{ size:20 } }, grid:{ color:'#e2e8f0' }, beginAtZero:true },
-      },
-    },
-    plugins: [valueLabelsPlugin],
-  });
-  await new Promise(r => setTimeout(r, 0));
-  const dataUrl = off.toDataURL('image/png');
-  chart.destroy();
-  return dataUrl;
-}
-/* leyenda nativa simple (swatch + texto) para series de una gráfica, ej. Ingresos/Gastos */
-function dibujarLeyendaSeries(doc, W, gy, items){
-  const itemW = 110;
-  let x = (W - items.length*itemW) / 2;
-  items.forEach(({label, color}) => {
-    doc.setFillColor(...hexToRgb(color));
-    doc.roundedRect(x, gy, 12, 12, 3, 3, 'F');
-    doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...PDF.text);
-    doc.text(label, x + 18, gy + 10);
-    x += itemW;
-  });
-  return gy + 12 + 14;
-}
-
-/* -------- doughnut de gastos en alta resolución, solo para el PDF --------
-   Solo el círculo (+ total al centro): sin leyenda ni etiquetas de categoría horneadas en la
-   imagen — esas van como texto nativo del PDF (ver dibujarLeyendaCategorias), para que queden
-   nítidas a cualquier zoom en vez de pixeleadas dentro de un PNG. */
-async function renderPastelDoughnutHiRes(catLabels, catData, hasData, totalTexto){
-  // sin gastos: anillo gris de relleno solo dentro de esta imagen (el dato falso no sale de aquí)
-  if (!hasData){ catLabels = ['Sin gastos']; catData = [1]; }
-  const SIZE = 900; // px reales del canvas (cuadrado, > 800 mínimo pedido)
-  const off = document.createElement('canvas');
-  off.width = SIZE; off.height = SIZE;
-
-  const shadowPlugin = {
-    id: 'donutShadow',
-    beforeDatasetDraw(chart){
-      const ctx = chart.ctx;
-      ctx.save();
-      ctx.shadowColor = 'rgba(0,0,0,.30)';
-      ctx.shadowBlur = 22;
-      ctx.shadowOffsetX = 0;
-      ctx.shadowOffsetY = 8;
-    },
-    afterDatasetDraw(chart){ chart.ctx.restore(); },
-  };
-  const centerTextPlugin = {
-    id: 'centerText',
-    afterDraw(chart){
-      const { ctx, chartArea } = chart;
-      if (!chartArea) return;
-      const cx = (chartArea.left + chartArea.right) / 2;
-      const cy = (chartArea.top + chartArea.bottom) / 2;
-      ctx.save();
-      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-      ctx.fillStyle = '#111827';
-      ctx.font = 'bold 46px Helvetica, Arial, sans-serif';
-      ctx.fillText(totalTexto, cx, cy - 16);
-      ctx.fillStyle = '#64748b';
-      ctx.font = '24px Helvetica, Arial, sans-serif';
-      ctx.fillText('Total gastos', cx, cy + 28);
-      ctx.restore();
-    },
-  };
-
-  const chart = new Chart(off, {
-    type:'doughnut',
-    data:{
-      labels: catLabels,
-      datasets:[{
-        data: catData,
-        backgroundColor: hasData ? catLabels.map((_,i)=>DOUGHNUT_PALETTE[i%DOUGHNUT_PALETTE.length]) : ['#d8d8d8'],
-        borderColor:'#ffffff',
-        borderWidth:4,
-      }],
-    },
-    options:{
-      responsive:false,
-      animation:false,
-      devicePixelRatio:1,
-      cutout:'55%',
-      layout:{ padding:24 },
-      plugins:{ legend:{ display:false }, tooltip:{ enabled:false } },
-    },
-    plugins: [shadowPlugin, centerTextPlugin],
-  });
-
-  // Con animation:false, Chart.js ya pintó de forma síncrona. Se usa setTimeout (no rAF)
-  // porque rAF nunca se dispara si la pestaña está en segundo plano al generar el PDF.
-  await new Promise(r => setTimeout(r, 0));
-  const dataUrl = off.toDataURL('image/png');
-  chart.destroy();
-  return dataUrl;
-}
-
-/* leyenda nativa del PDF: cuadrito de color + nombre + porcentaje + monto, texto real (no imagen).
-   `x0` permite dibujarla a la derecha de la dona en vez de a todo el ancho. */
-function dibujarLeyendaCategorias(doc, W, gy, catLabels, catData, hasData, x0, x1){
-  x0 = x0 ?? 40; x1 = x1 ?? (W - 40);
-  if (!hasData){
-    doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(...PDF.notes);
-    doc.text('Sin gastos registrados este mes.', x0, gy + 14);
-    return gy + 26;
-  }
-  const total = catData.reduce((a,b)=>a+b, 0) || 1;
-  const rowH = 24;
-  catLabels.forEach((catLabel, i) => {
-    const y = gy + i*rowH;
-    doc.setFillColor(...hexToRgb(DOUGHNUT_PALETTE[i % DOUGHNUT_PALETTE.length]));
-    doc.roundedRect(x0, y, 12, 12, 3, 3, 'F');
-    doc.setFont('helvetica','bold'); doc.setFontSize(10.5); doc.setTextColor(...PDF.text);
-    doc.text(catLabel, x0 + 18, y + 10);
-    const pct = Math.round(catData[i] / total * 100);
-    doc.setFont('courier','bold'); doc.setFontSize(9.5); doc.setTextColor(...PDF.secondary);
-    doc.text(`${pct}% · ${money(catData[i])}`, x1, y + 10, { align:'right' });
-  });
-  return gy + catLabels.length*rowH + 12;
-}
-
-/* indicador de salud financiera: barra proporción gastos/ingresos + línea de lectura */
-function dibujarSaludFinanciera(doc, W, gy, cobrado, gastos){
-  const x0 = PDF.MARGIN, x1 = W - PDF.MARGIN, barW = x1 - x0, barH = 8;
-  if (!(cobrado > 0)){
-    doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.notes);
-    doc.text('Sin datos suficientes para el indicador de salud financiera este mes.', x0, gy + 10);
-    return gy + 24;
-  }
-  const pct = Math.min(gastos / cobrado, 1);
-  const color = pct < 0.5 ? PDF.green : pct < 0.8 ? PDF.gold : PDF.red;
-  doc.setFillColor(...PDF.grid);
-  doc.roundedRect(x0, gy, barW, barH, 4, 4, 'F');
-  doc.setFillColor(...color);
-  doc.roundedRect(x0, gy, Math.max(barW*pct, barH), barH, 4, 4, 'F');
-  doc.setFont('helvetica','normal'); doc.setFontSize(9.5); doc.setTextColor(...PDF.secondary);
-  const pctTxt = Math.round(pct*100);
-  doc.text(`Los gastos representan el ${pctTxt}% de lo recaudado este mes.`, x0, gy + barH + 14);
-  return gy + barH + 28;
-}
-
 /* -------- filtros (100% client-side sobre finCache) -------- */
 // Las 8 categorías fijas siempre visibles en el filtro (mismo orden que el <select> de registro).
 const CATEGORIAS_FIJAS = ['Cuota','Multa','Mantenimiento','Seguridad','Limpieza','Mejoras','Servicios','Otro'];
@@ -3012,17 +2800,12 @@ $('#pdfBtn').addEventListener('click', generarPDF);
 /* construye el PDF premium (FASE 0) y devuelve {doc, filename} sin descargar ni compartir —
    generarPDF() y compartirReportePDF() comparten esta misma construcción. */
 async function construirReportePDF(){
-    // bajo demanda (las gráficas del PDF usan Chart.js); el logo casi siempre ya está (se adelanta al
-    // abrir Finanzas) y cargarLogoMarquesa nunca falla: si no llega, devuelve null y el PDF sale sin logo.
+    // bajo demanda (las gráficas del PDF usan Chart.js); jsPDF, logo y fuentes casi siempre ya están (se
+    // adelantan al abrir Finanzas) y prepararPDF no deja el PDF sin salir por el logo o las fuentes.
     // El saldo inicial del mes se pide fresco al Worker: sin él no se arma el reporte (un saldo
     // final inventado sería peor que un error).
-    const [, , , saldoIni] = await Promise.all([cargarLib('pdf'), cargarLib('chart'), cargarLogoMarquesa(), cargarSaldoInicial()]);
+    const [, , saldoIni] = await Promise.all([prepararPDF(), cargarLib('chart'), cargarSaldoInicial()]);
     if (typeof saldoIni !== 'number') throw new Error('No se pudo obtener el saldo inicial del mes');
-    const { jsPDF } = window.jspdf;
-    const doc = new jsPDF({ unit:'pt', format:'letter' });
-    const W = doc.internal.pageSize.getWidth();
-    const H = doc.internal.pageSize.getHeight();
-    const M = PDF.MARGIN;
     const { label } = monthRange();
 
     // finCache trae 6 meses; el reporte PDF es mensual, así que se filtra al mes en curso.
@@ -3034,7 +2817,6 @@ async function construirReportePDF(){
     monthMovs.forEach(m => m.tipo==='ingreso' ? cobrado += m.monto : gastos += m.monto);
     const saldo = cobrado - gastos;            // neto del periodo
     const saldoFinal = saldoIni + saldo;       // acumulado al cierre (o al día de hoy, si el mes sigue)
-    const sgn = n => (n < 0 ? '-' : '+') + money(Math.abs(n));   // "-" ASCII: el "−" corrompe WinAnsi
 
     const byMonth = groupByMonth();
     const prevMonth = prevKey ? byMonth[prevKey] : null;
@@ -3045,181 +2827,14 @@ async function construirReportePDF(){
     const folio = folioDelMes(curKey, cobrado, gastos);
     const generadoEl = new Date().toLocaleString('es-MX', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
 
-    /* ===== 1. Filete dorado + encabezado ===== */
-    doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
-
-    // Banner del logo, igual que el recibo (construirReciboPDF): centrado, proporción 662x300 intacta.
-    // Sin logo, el encabezado arranca donde siempre (y = M - 10).
-    const LOGO_W = 220, LOGO_H = LOGO_W * (300 / 662);
-    let y;
-    if (logoMarquesaDataUrl) {
-      const logoY = 4 + 16;
-      doc.addImage(logoMarquesaDataUrl, 'JPEG', (W - LOGO_W) / 2, logoY, LOGO_W, LOGO_H);
-      y = logoY + LOGO_H + 16;
-    } else {
-      y = M - 10;
-    }
-    doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-    doc.text('E S T A D O   D E   C U E N T A   R E S I D E N C I A L', M, y + 14);
-
-    doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
-    doc.text('Cerrada La Marquesa', M, y + 42);
-
-    doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-    doc.text(`Periodo: ${label}`, W - M, y + 10, { align:'right' });
-    doc.setTextColor(...PDF.notes);
-    doc.text(`Generado: ${generadoEl}`, W - M, y + 22, { align:'right' });
-    doc.text(`Folio: ${folio}`, W - M, y + 34, { align:'right' });
-
-    y += 58;
-    doc.setDrawColor(...PDF.grid);
-    doc.line(M, y, W - M, y);
-    y += 24;
-
-    /* ===== 2. Tres cajas de balance ===== */
-    const boxGap = 14, boxW = (W - 2*M - 2*boxGap) / 3, boxH = 68;
-    const boxes = [
-      { label:'TOTAL COBRADO', value: cobrado, color: PDF.green, cmp: cmpCobrado, higherIsBetter:true },
-      { label:'GASTOS', value: gastos, color: PDF.red, cmp: cmpGastos, higherIsBetter:false },
-      { label:'SALDO FINAL', value: saldoFinal, color: PDF.navy, cmp: null,
-        nota: `Inicial ${money(saldoIni)}  ${sgn(saldo)} del mes` },
-    ];
-    boxes.forEach((b, i) => {
-      const x = M + i*(boxW + boxGap);
-      doc.setDrawColor(...PDF.grid); doc.setFillColor(255,255,255);
-      doc.roundedRect(x, y, boxW, boxH, 6, 6, 'FD');
-      doc.setFont('helvetica','bold'); doc.setFontSize(8.5); doc.setTextColor(...PDF.secondary);
-      doc.text(b.label, x + 14, y + 20);
-      doc.setFont('courier','bold'); doc.setFontSize(16); doc.setTextColor(...b.color);
-      doc.text(money(b.value), x + boxW - 14, y + 44, { align:'right' });
-      if (b.cmp !== null){
-        const up = b.cmp >= 0;
-        const good = b.higherIsBetter ? up : !up;
-        doc.setFont('helvetica','bold'); doc.setFontSize(8);
-        doc.setTextColor(...(good ? PDF.green : PDF.red));
-        // ▲▼ evitados a propósito: los fuentes estándar de jsPDF (Helvetica WinAnsi) no
-        // los soportan y corrompen la codificación del texto completo. +/- sí es seguro.
-        doc.text(`${up?'+':'-'}${Math.abs(b.cmp)}% vs mes anterior`, x + 14, y + 58);
-      } else {
-        doc.setFont('helvetica','normal'); doc.setFontSize(8); doc.setTextColor(...PDF.notes);
-        doc.text(b.nota || 'Sin datos del mes anterior', x + 14, y + 58);
-      }
+    // Toda la presentación (tarjetas, salud financiera, gráficas, tabla, pie) vive en pdf-marquesa.js.
+    const doc = await MarquesaPDF.reporteFinanciero({
+      periodo: label, generado: generadoEl, folio,
+      cobrado, gastos, saldo, saldoIni, saldoFinal, cmpCobrado, cmpGastos,
+      barras: mesesConMovimientos(byMonth),          // solo meses con movimientos
+      categorias: categoriasDelMes(curKey),
+      movimientos: monthMovs.map(m => ({ fecha: fmtTime(m.ts), tipo: m.tipo, categoria: m.categoria || 'Otro', concepto: m.concepto || '', monto: m.monto })),
     });
-    y += boxH + 22;
-
-    /* ===== 3. Indicador de salud financiera ===== */
-    y = dibujarSaludFinanciera(doc, W, y, cobrado, gastos);
-    y += 10;
-
-    const tituloSeccion = (txt) => {
-      doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(...PDF.text);
-      doc.text(txt, M, y + 12);
-      y += 20;
-    };
-
-    /* ===== 4. Barras Ingresos vs Gastos — solo meses con movimientos ===== */
-    tituloSeccion('Ingresos vs Gastos');
-    const { labels: barLabels, ingresos: barIngresos, gastos: barGastos } = mesesConMovimientos(byMonth);
-    const barImg = await renderBarrasHiRes(barLabels, barIngresos, barGastos);
-    const barBoxW = W - 2*M, barImgH = 140;
-    doc.setDrawColor(...PDF.grid); doc.setFillColor(255,255,255);
-    doc.roundedRect(M, y, barBoxW, barImgH + 16, 6, 6, 'FD');
-    doc.addImage(barImg, 'PNG', M + 8, y + 8, barBoxW - 16, barImgH);
-    y += barImgH + 16 + 12;
-    y = dibujarLeyendaSeries(doc, W, y, [{ label:'Ingresos', color:'#0f766e' }, { label:'Gastos', color:'#991b1b' }]);
-    y += 14;
-
-    /* ===== 5. Dona por categoría (izquierda) + desglose nativo (derecha), mayor a menor ===== */
-    tituloSeccion('Distribución de gastos por categoría');
-    const catRaw = categoriasDelMes(curKey);
-    const order = catRaw.labels.map((l,i)=>i).sort((a,b)=>catRaw.data[b]-catRaw.data[a]);
-    const pdfCatLabels = order.map(i=>catRaw.labels[i]);
-    const pdfCatData = order.map(i=>catRaw.data[i]);
-    const pdfCatHasData = catRaw.hasData;
-    const pastelImg = await renderPastelDoughnutHiRes(pdfCatLabels, pdfCatData, pdfCatHasData, money(gastos));
-    const donutSize = 150, donutX = M, donutY = y;
-    doc.addImage(pastelImg, 'PNG', donutX, donutY, donutSize, donutSize);
-    const legendX0 = donutX + donutSize + 24, legendX1 = W - M;
-    const legendEnd = dibujarLeyendaCategorias(doc, W, donutY + 6, pdfCatLabels, pdfCatData, pdfCatHasData, legendX0, legendX1);
-    y = Math.max(donutY + donutSize + 14, legendEnd) + 10;
-
-    /* ===== 6. Tabla "03 · Historial de transacciones" ===== */
-    // Con el banner del logo, el título puede quedar sobre el pie (H - 24): si no caben el título
-    // y el encabezado de la tabla antes del margen inferior (50), la sección empieza en otra página.
-    if (y + 20 + 40 > H - 50){ doc.addPage(); y = M; }
-    doc.setFillColor(...PDF.gold); doc.rect(M, y, 20, 3, 'F');
-    doc.setFont('helvetica','bold'); doc.setFontSize(12); doc.setTextColor(...PDF.text);
-    doc.text('03 · Historial de transacciones', M + 28, y + 6);
-    y += 20;
-
-    const rows = monthMovs.map(m => ({
-      fecha: fmtTime(m.ts), tipo: m.tipo, categoria: m.categoria || 'Otro', concepto: m.concepto || '', monto: m.monto,
-    }));
-
-    doc.autoTable({
-      startY: y,
-      head: [['Fecha','Categoría','Concepto','Monto']],
-      body: rows.length
-        // "-" ASCII normal, no "−" (U+2212): ese signo no existe en WinAnsi/Helvetica estándar
-        // de jsPDF y corrompe toda la celda (mismo bug que las flechas ▲▼ de las cajas).
-        ? rows.map(r => [r.fecha, r.categoria, r.concepto, (r.tipo==='ingreso'?'+':'-') + money(r.monto)])
-        : [['—','—','Sin movimientos','—']],
-      foot: [
-        ['', '', 'Saldo inicial del mes', money(saldoIni)],
-        ['', '', 'Saldo del periodo', sgn(saldo)],
-        ['', '', 'Saldo final', money(saldoFinal)],
-      ],
-      theme:'plain',
-      styles:{ font:'helvetica', fontSize:9, textColor: PDF.text, cellPadding:6, lineColor: PDF.grid, lineWidth:0.5 },
-      headStyles:{ fillColor:[255,255,255], textColor: PDF.secondary, fontStyle:'bold', fontSize:8.5, lineColor: PDF.text },
-      alternateRowStyles:{ fillColor: PDF.zebra },
-      columnStyles:{ 3:{ halign:'right', font:'courier', fontStyle:'bold' } },
-      margin:{ left:M, right:M, bottom: 50 },
-      didParseCell(data){
-        if (data.section === 'body' && data.column.index === 1 && rows[data.row.index]){
-          data.cell.text = [''];
-        }
-        if (data.section === 'body' && data.column.index === 3 && rows[data.row.index]){
-          data.cell.styles.textColor = rows[data.row.index].tipo === 'ingreso' ? PDF.green : PDF.red;
-        }
-        if (data.section === 'foot'){
-          data.cell.styles.fontStyle = 'bold';
-          data.cell.styles.textColor = PDF.text;
-          if (data.column.index === 3){ data.cell.styles.font = 'courier'; data.cell.styles.halign = 'right'; }
-        }
-      },
-      didDrawCell(data){
-        if (data.section === 'body' && data.column.index === 1 && rows[data.row.index]){
-          const r = rows[data.row.index];
-          const ing = r.tipo === 'ingreso';
-          doc.setFont('helvetica','bold'); doc.setFontSize(8);
-          const textW = doc.getTextWidth(r.categoria);
-          const padX = 6, badgeW = textW + padX*2, badgeH = 14;
-          const bx = data.cell.x + 4, by = data.cell.y + (data.cell.height - badgeH) / 2;
-          doc.setFillColor(...(ing ? PDF.badgeGreenBg : PDF.badgeRedBg));
-          doc.roundedRect(bx, by, badgeW, badgeH, 3, 3, 'F');
-          doc.setTextColor(...(ing ? PDF.badgeGreenFg : PDF.badgeRedFg));
-          doc.text(r.categoria, bx + padX, by + badgeH/2 + 3);
-        }
-        if (data.section === 'foot' && data.row.index === 0 && data.column.index === 0){
-          doc.setDrawColor(...PDF.text); doc.setLineWidth(0.6);
-          doc.line(M, data.cell.y, W - M, data.cell.y);
-          doc.line(M, data.cell.y + 2, W - M, data.cell.y + 2);
-        }
-      },
-    });
-
-    /* ===== 7. Pie en todas las páginas =====
-       Folio + página van juntos a la derecha (no centrados) para no traslaparse con el texto
-       de la izquierda — con folio+fecha+"Reporte financiero oficial..." los tres textos
-       independientes no cabían en el ancho de la página. */
-    const totalPages = doc.internal.getNumberOfPages();
-    for (let p = 1; p <= totalPages; p++){
-      doc.setPage(p);
-      doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
-      doc.text('Reporte financiero oficial · Cerrada La Marquesa · Transparencia vecinal', M, H - 24);
-      doc.text(`${folio} · Página ${p} de ${totalPages}`, W - M, H - 24, { align:'right' });
-    }
 
     return { doc, filename: `Finanzas-La-Marquesa-${label.replace(' ','-')}.pdf` };
 }
@@ -3274,99 +2889,26 @@ $('#waBtn').addEventListener('click', compartirReportePDF);
 /* ====================== FASE 4.5 · RECIBOS DE PAGO ====================== */
 function tsADate(ts){ return ts && ts.toDate ? ts.toDate() : new Date(ts); }
 
-/* Recibo individual, una página carta, misma identidad tipográfica de FASE 0
-   (filete dorado, eyebrow espaciado, folio a la derecha, montos en courier). */
+/* Recibo individual (comprobante formal, una página carta). Síncrono a propósito: el botón de
+   compartir no debe perder el gesto de usuario; prepararPDF() se espera antes. Diseño en pdf-marquesa.js. */
 function construirReciboPDF(mov){
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit:'pt', format:'letter' });
-  const W = doc.internal.pageSize.getWidth();
-  const H = doc.internal.pageSize.getHeight();
-  const M = PDF.MARGIN;
-  const fecha = tsADate(mov.ts).toLocaleString('es-MX', { day:'2-digit', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit' });
-
-  doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
-
-  // Banner del logo (assets/logo-marquesa.jpg, 662x300 original), centrado, proporción intacta
-  // (ancho fijo, alto derivado del ratio real — nunca se deforma). Si logoMarquesaDataUrl
-  // todavía no cargó, se omite y el encabezado cae al arranque de siempre (y = M - 10):
-  // el recibo nunca depende de que el logo esté listo.
-  const LOGO_W = 220, LOGO_H = LOGO_W * (300 / 662);
-  let y;
-  if (logoMarquesaDataUrl) {
-    const logoY = 4 + 16;
-    doc.addImage(logoMarquesaDataUrl, 'JPEG', (W - LOGO_W) / 2, logoY, LOGO_W, LOGO_H);
-    y = logoY + LOGO_H + 16;
-  } else {
-    y = M - 10;
-  }
-  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-  doc.text('R E C I B O   D E   P A G O', M, y + 14);
-  doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
-  doc.text('Cerrada La Marquesa', M, y + 42);
-  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-  doc.text(`Folio: ${mov.folioRecibo}`, W - M, y + 10, { align:'right' });
-  doc.setTextColor(...PDF.notes);
-  doc.text(`Emitido: ${fecha}`, W - M, y + 22, { align:'right' });
-
-  y += 58; doc.setDrawColor(...PDF.grid); doc.line(M, y, W - M, y); y += 30;
-
-  const boxH = 88;
-  doc.setDrawColor(...PDF.grid); doc.setFillColor(255,255,255);
-  doc.roundedRect(M, y, W - 2*M, boxH, 8, 8, 'FD');
-  doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-  doc.text('MONTO RECIBIDO', M + 18, y + 24);
-  doc.setFont('courier','bold'); doc.setFontSize(30); doc.setTextColor(...PDF.green);
-  doc.text(money(mov.monto), W - M - 18, y + 58, { align:'right' });
-  y += boxH + 34;
-
   const cancelado = esCanceladoMov(mov);
-  const filas = [
-    ['CASA', mov.casa || '—'],
-    ['CONCEPTO', mov.concepto || '—'],
-    ['CATEGORÍA', mov.categoria || 'Otro'],
-    ['FECHA Y HORA', fecha],
-    ['REGISTRÓ', mov.creadoNombre || '—'],
-    ...(mov.corrigeAId ? [['CORRIGE A', `Recibo ${refMovPorId(mov.corrigeAId)} (cancelado)`]] : []),
-    ...(cancelado ? [
-      ['ESTADO', 'CANCELADO — este recibo NO es válido'],
-      ['MOTIVO', mov.motivoCancelacion || '—'],
-      ...(mov.corregidoPorId ? [['SUSTITUIDO POR', `Recibo ${refMovPorId(mov.corregidoPorId)}`]] : []),
-    ] : []),
-  ];
-  filas.forEach(([k, v]) => {
-    doc.setFont('helvetica','bold'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-    doc.text(k, M, y);
-    doc.setFont('helvetica','normal'); doc.setFontSize(11); doc.setTextColor(...PDF.text);
-    doc.text(String(v).slice(0, 90), M + 140, y);
-    doc.setDrawColor(...PDF.grid); doc.setLineWidth(0.5);
-    doc.line(M, y + 8, W - M, y + 8);
-    y += 28;
+  const doc = MarquesaPDF.recibo({
+    folio: mov.folioRecibo,
+    emitido: tsADate(mov.ts).toLocaleString('es-MX', { day:'2-digit', month:'long', year:'numeric', hour:'2-digit', minute:'2-digit' }),
+    casa: mov.casa || '—', concepto: mov.concepto || '—', categoria: mov.categoria || 'Otro', monto: mov.monto,
+    registro: mov.creadoNombre || '—',
+    corrigeA: mov.corrigeAId ? refMovPorId(mov.corrigeAId) : null,
+    cancelado, motivoCancelacion: mov.motivoCancelacion || '',
+    sustituidoPor: cancelado && mov.corregidoPorId ? refMovPorId(mov.corregidoPorId) : null,
   });
-
-  doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
-  doc.text(cancelado ? 'Recibo CANCELADO · sin validez · Cerrada La Marquesa' : 'Recibo oficial · Cerrada La Marquesa · Transparencia vecinal', M, H - 24);
-  doc.text(`${mov.folioRecibo} · Página 1 de 1`, W - M, H - 24, { align:'right' });
-
-  // Marca de agua CANCELADO, encima de todo: diagonal, roja y semitransparente para que el
-  // contenido se siga leyendo (el folio y los datos originales se conservan a propósito).
-  if (cancelado){
-    doc.saveGraphicsState();
-    try { doc.setGState(new doc.GState({ opacity: 0.22 })); } catch(_){}
-    doc.setFont('helvetica','bold'); doc.setFontSize(80); doc.setTextColor(...PDF.red);
-    // Con ángulo, jsPDF ignora align:'center': se centra a mano con el ancho real del texto.
-    const ANG = 35, rad = ANG * Math.PI / 180, tw = doc.getTextWidth('CANCELADO');
-    doc.text('CANCELADO', W / 2 - (tw / 2) * Math.cos(rad), H / 2 + (tw / 2) * Math.sin(rad), { angle: ANG });
-    doc.restoreGraphicsState();
-  }
-
   return { doc, filename: `Recibo-${mov.folioRecibo}${cancelado ? '-CANCELADO' : ''}.pdf` };
 }
 
 let reciboActual = null;
 function abrirReciboSheet(mov){
   reciboActual = mov;
-  cargarLogoMarquesa();             // se adelantan logo y jsPDF mientras se lee la hoja;
-  cargarLib('pdf').catch(() => {}); // los botones los esperan antes de armar el PDF
+  prepararPDF().catch(() => {});   // se adelantan jsPDF, logo y fuentes mientras se lee la hoja; los botones los esperan
   const cancelado = esCanceladoMov(mov);
   $('#reciboTitle').textContent = `Recibo ${mov.folioRecibo}${cancelado ? ' · CANCELADO' : ''}`;
   $('#reciboErr').textContent = '';
@@ -3393,7 +2935,7 @@ $('#reciboWaBtn').addEventListener('click', async () => {
   const btn = $('#reciboWaBtn'); const original = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generando…';
   try {
-    await Promise.all([cargarLib('pdf'), cargarLogoMarquesa()]);   // casi siempre ya listos (abrirReciboSheet)
+    await prepararPDF();   // casi siempre ya listo (abrirReciboSheet)
     const { doc, filename } = construirReciboPDF(mov);
     const file = new File([doc.output('blob')], filename, { type:'application/pdf' });
     if (navigator.canShare && navigator.canShare({ files:[file] })){
@@ -3421,7 +2963,7 @@ $('#reciboDlBtn').addEventListener('click', async () => {
   const btn = $('#reciboDlBtn'); const original = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generando…';
   try {
-    await Promise.all([cargarLib('pdf'), cargarLogoMarquesa()]);
+    await prepararPDF();
     const { doc, filename } = construirReciboPDF(mov);
     doc.save(filename);
     toast('Recibo descargado', 'ok');
@@ -3459,7 +3001,7 @@ $('#casaRepGo').addEventListener('click', async () => {
       .filter(m => m.tipo === 'ingreso' && !esCanceladoMov(m))   // un pago cancelado no es un pago
       .sort((a,b) => tsADate(b.ts) - tsADate(a.ts));
     if (!movs.length){ $('#casaRepErr').textContent = `Sin pagos registrados para "${casa}"`; return; }
-    await cargarLib('pdf');
+    await prepararPDF();
     const { doc, filename } = construirReporteCasaPDF(casa, movs);
     doc.save(filename);
     toast('Reporte descargado', 'ok');
@@ -3538,9 +3080,10 @@ $('#aperRepGo').addEventListener('click', async () => {
   try {
     const r = await authedFetch('/aperturas/reporte', { personaId, desde, hasta });
     aperRepUltimo = r;
-    $('#aperRepResumen').innerHTML = `<b style="color:var(--text)">${r.total}</b> apertura(s) de ${esc(r.persona.nombre)}`
+    const pl = (n, uno, varios) => `${n} ${n === 1 ? uno : varios}`;
+    $('#aperRepResumen').innerHTML = `<b style="color:var(--text)">${pl(r.total, 'apertura', 'aperturas')}</b> de ${esc(r.persona.nombre)}`
       + ` del ${esc(fechaHmo(r.desde + 'T12:00:00Z'))} al ${esc(fechaHmo(r.hasta + 'T12:00:00Z'))}`
-      + ` · ${r.exitosas} exitosa(s) · ${r.fallidas} fallida(s)`
+      + ` · ${pl(r.exitosas, 'exitosa', 'exitosas')} · ${pl(r.fallidas, 'fallida', 'fallidas')}`
       + (r.truncado ? `<br>⚠️ Hay más de ${r.maxRegistros} registros: acorta el rango para ver todos.` : '');
     const list = $('#aperRepList'); list.innerHTML = '';
     if (!r.registros.length) list.innerHTML = '<div class="empty">Sin aperturas en ese rango</div>';
@@ -3563,7 +3106,7 @@ $('#aperRepPdf').addEventListener('click', async () => {
   if (!aperRepUltimo) return;
   const btn = $('#aperRepPdf'); btn.disabled = true; btn.textContent = 'Generando…';
   try {
-    await Promise.all([cargarLib('pdf'), cargarLogoMarquesa()]);
+    await prepararPDF();
     const { doc, filename } = construirReporteAperturasPDF(aperRepUltimo);
     doc.save(filename);
     toast('Reporte descargado', 'ok');
@@ -3573,155 +3116,35 @@ $('#aperRepPdf').addEventListener('click', async () => {
   } finally { btn.disabled = false; btn.textContent = 'Descargar PDF'; }
 });
 
-/* PDF del reporte de aperturas: identidad FASE 0 + banner del logo real (assets/logo-marquesa.jpg). */
+/* PDF del reporte de aperturas (diseño en pdf-marquesa.js): aquí solo se pasan los datos del Worker
+   ya formateados en hora de Hermosillo; el motivo técnico de cada falla se traduce en el módulo. */
 function construirReporteAperturasPDF(r){
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit:'pt', format:'letter' });
-  const W = doc.internal.pageSize.getWidth();
-  const H = doc.internal.pageSize.getHeight();
-  const M = PDF.MARGIN;
-  const generadoEl = new Date().toLocaleString('es-MX', { timeZone: HMO_TZ, day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
-  const periodo = `${fechaHmo(r.desde + 'T12:00:00Z')} al ${fechaHmo(r.hasta + 'T12:00:00Z')}`;
-
-  doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
-  const LOGO_W = 220, LOGO_H = LOGO_W * (300 / 662);
-  let y;
-  if (logoMarquesaDataUrl) {
-    const logoY = 4 + 16;
-    doc.addImage(logoMarquesaDataUrl, 'JPEG', (W - LOGO_W) / 2, logoY, LOGO_W, LOGO_H);
-    y = logoY + LOGO_H + 16;
-  } else {
-    y = M - 10;
-  }
-  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-  doc.text('R E P O R T E   D E   A P E R T U R A S', M, y + 14);
-  doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
-  doc.text('Cerrada La Marquesa', M, y + 42);
-  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-  doc.text(`Periodo: ${periodo}`, W - M, y + 10, { align:'right' });
-  doc.setTextColor(...PDF.notes);
-  doc.text(`Generado: ${generadoEl}`, W - M, y + 22, { align:'right' });
-  y += 58; doc.setDrawColor(...PDF.grid); doc.line(M, y, W - M, y); y += 22;
-
-  doc.setFont('helvetica','bold'); doc.setFontSize(13); doc.setTextColor(...PDF.text);
-  doc.text(r.persona.nombre || 'Residente', M, y);
-  doc.setFont('helvetica','normal'); doc.setFontSize(9.5); doc.setTextColor(...PDF.secondary);
-  if (r.persona.domicilio) doc.text(`Domicilio: ${r.persona.domicilio}`, M, y + 15);
-  doc.setFont('helvetica','bold'); doc.setFontSize(10); doc.setTextColor(...PDF.text);
-  doc.text(`${r.total} apertura(s) · ${r.exitosas} exitosa(s) · ${r.fallidas} fallida(s)`, W - M, y, { align:'right' });
-  y += 26;
-  if (r.truncado){
-    doc.setFont('helvetica','normal'); doc.setFontSize(8.5); doc.setTextColor(...PDF.red);
-    doc.text(`Se muestran los ${r.maxRegistros} registros más recientes del periodo: hay más. Acorta el rango para verlos todos.`, M, y);
-    y += 14;
-  }
-
-  doc.autoTable({
-    startY: y,
-    head: [['Fecha','Hora','Puerta','Vía','Resultado']],
-    body: r.registros.map(x => [
-      fechaHmo(x.ts), horaHmo(x.ts), puertaName(x.puerta), x.via,
-      x.resultado === 'ok' ? 'Abrió' : `Fallido${x.motivo ? ' (' + x.motivo + ')' : ''}`,
-    ]),
-    theme:'plain',
-    styles:{ font:'helvetica', fontSize:9, textColor: PDF.text, cellPadding:6, lineColor: PDF.grid, lineWidth:0.5 },
-    headStyles:{ fillColor:[255,255,255], textColor: PDF.secondary, fontStyle:'bold', fontSize:8.5, lineColor: PDF.text },
-    alternateRowStyles:{ fillColor: PDF.zebra },
-    columnStyles:{ 1:{ font:'courier' } },
-    margin:{ left:M, right:M, bottom: 50 },
-    didParseCell(data){
-      if (data.section === 'body' && data.column.index === 4){
-        data.cell.styles.fontStyle = 'bold';
-        data.cell.styles.textColor = r.registros[data.row.index]?.resultado === 'ok' ? PDF.green : PDF.red;
-      }
-    },
+  const doc = MarquesaPDF.reporteAperturas({
+    nombre: r.persona.nombre || 'Residente', domicilio: r.persona.domicilio || '',
+    periodo: `${fechaHmo(r.desde + 'T12:00:00Z')} al ${fechaHmo(r.hasta + 'T12:00:00Z')}`,
+    generado: new Date().toLocaleString('es-MX', { timeZone: HMO_TZ, day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }),
+    total: r.total, exitosas: r.exitosas, fallidas: r.fallidas, truncado: !!r.truncado, maxRegistros: r.maxRegistros,
+    registros: r.registros.map(x => ({ fecha: fechaHmo(x.ts), hora: horaHmo(x.ts), puerta: puertaName(x.puerta), via: x.via, ok: x.resultado === 'ok', motivo: x.motivo || '' })),
   });
-
-  const totalPages = doc.internal.getNumberOfPages();
-  for (let p = 1; p <= totalPages; p++){
-    doc.setPage(p);
-    doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
-    doc.text('Reporte de aperturas · Cerrada La Marquesa · Uso interno de administración', M, H - 24);
-    doc.text(`Página ${p} de ${totalPages}`, W - M, H - 24, { align:'right' });
-  }
   const limpio = s => String(s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^A-Za-z0-9]+/g, '-').replace(/^-|-$/g, '');
   return { doc, filename: `Aperturas-${limpio(r.persona.nombre) || 'residente'}-${r.desde}-a-${r.hasta}.pdf` };
 }
 
-/* Historial de pagos de una casa, identidad FASE 0. Cada pago referencia su folio
+/* Historial de pagos de una casa (diseño en pdf-marquesa.js). Cada pago referencia su folio
    de recibo y la fecha de envío/descarga — el soporte para aclaraciones. */
 function construirReporteCasaPDF(casa, movs){
-  const { jsPDF } = window.jspdf;
-  const doc = new jsPDF({ unit:'pt', format:'letter' });
-  const W = doc.internal.pageSize.getWidth();
-  const H = doc.internal.pageSize.getHeight();
-  const M = PDF.MARGIN;
-  const generadoEl = new Date().toLocaleString('es-MX', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' });
-  const total = movs.reduce((a,m) => a + (m.monto || 0), 0);
-
-  doc.setFillColor(...PDF.gold); doc.rect(0, 0, W, 4, 'F');
-  let y = M - 10;
-  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-  doc.text('H I S T O R I A L   D E   P A G O S', M, y + 14);
-  doc.setFont('helvetica','bold'); doc.setFontSize(26); doc.setTextColor(...PDF.text);
-  doc.text('Cerrada La Marquesa', M, y + 42);
-  doc.setFont('helvetica','normal'); doc.setFontSize(9); doc.setTextColor(...PDF.secondary);
-  doc.text(`Casa: ${casa}`, W - M, y + 10, { align:'right' });
-  doc.setTextColor(...PDF.notes);
-  doc.text(`Generado: ${generadoEl}`, W - M, y + 22, { align:'right' });
-  doc.text(`${movs.length} pago(s)`, W - M, y + 34, { align:'right' });
-
-  y += 58; doc.setDrawColor(...PDF.grid); doc.line(M, y, W - M, y); y += 24;
-
   const fmtEnvio = m => {
     const ts = m.reciboCompartidoTs || m.reciboDescargadoTs;
     if (!ts) return '—';
     const cuando = tsADate(ts).toLocaleString('es-MX', { day:'2-digit', month:'short', year:'2-digit', hour:'2-digit', minute:'2-digit' });
     return (m.reciboCompartidoTs ? 'Enviado ' : 'Descargado ') + cuando;
   };
-
-  doc.autoTable({
-    startY: y,
-    head: [['Fecha','Concepto','Categoría','Folio recibo','Recibo enviado','Monto']],
-    body: movs.map(m => [
-      fmtTime(m.ts),
-      (m.concepto || '—').slice(0, 40),
-      m.categoria || 'Otro',
-      m.folioRecibo || '—',
-      fmtEnvio(m),
-      '+' + money(m.monto),
-    ]),
-    foot: [['', '', '', '', 'Total pagado', '+' + money(total)]],
-    theme:'plain',
-    styles:{ font:'helvetica', fontSize:8.5, textColor: PDF.text, cellPadding:6, lineColor: PDF.grid, lineWidth:0.5 },
-    headStyles:{ fillColor:[255,255,255], textColor: PDF.secondary, fontStyle:'bold', fontSize:8, lineColor: PDF.text },
-    alternateRowStyles:{ fillColor: PDF.zebra },
-    columnStyles:{ 3:{ font:'courier' }, 5:{ halign:'right', font:'courier', fontStyle:'bold', textColor: PDF.green } },
-    margin:{ left:M, right:M, bottom: 50 },
-    didParseCell(data){
-      if (data.section === 'foot'){
-        data.cell.styles.fontStyle = 'bold';
-        data.cell.styles.textColor = PDF.text;
-        if (data.column.index === 5){ data.cell.styles.font = 'courier'; data.cell.styles.halign = 'right'; }
-      }
-    },
-    didDrawCell(data){
-      if (data.section === 'foot' && data.row.index === 0 && data.column.index === 0){
-        doc.setDrawColor(...PDF.text); doc.setLineWidth(0.6);
-        doc.line(M, data.cell.y, W - M, data.cell.y);
-        doc.line(M, data.cell.y + 2, W - M, data.cell.y + 2);
-      }
-    },
+  const doc = MarquesaPDF.reporteCasa({
+    casa,
+    generado: new Date().toLocaleString('es-MX', { day:'2-digit', month:'2-digit', year:'numeric', hour:'2-digit', minute:'2-digit' }),
+    total: movs.reduce((a,m) => a + (m.monto || 0), 0),
+    pagos: movs.map(m => ({ fecha: fmtTime(m.ts), concepto: m.concepto || '—', categoria: m.categoria || 'Otro', folio: m.folioRecibo || '—', envio: fmtEnvio(m), monto: m.monto })),
   });
-
-  const totalPages = doc.internal.getNumberOfPages();
-  for (let p = 1; p <= totalPages; p++){
-    doc.setPage(p);
-    doc.setFont('helvetica','normal'); doc.setFontSize(7); doc.setTextColor(...PDF.notes);
-    doc.text('Historial de pagos oficial · Cerrada La Marquesa · Transparencia vecinal', M, H - 24);
-    doc.text(`${casa} · Página ${p} de ${totalPages}`, W - M, H - 24, { align:'right' });
-  }
-
   return { doc, filename: `Pagos-${casa.replace(/\s+/g,'-')}-La-Marquesa.pdf` };
 }
 
@@ -4266,7 +3689,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v38';
+const APP_VERSION = 'v39';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

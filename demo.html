@@ -327,6 +327,7 @@
 
 <script src="vendor/jspdf.umd.min.js"></script>
 <script src="vendor/jspdf.plugin.autotable.min.js"></script>
+<script src="pdf-marquesa.js"></script>
 <script>
 /* ===== QR generator (autónomo, sin CDN) ===== */
 //---------------------------------------------------------------------
@@ -2825,28 +2826,16 @@ function renderUsers(){
 }
 
 /* ============ RECIBO DE PAGO (PDF) ============ */
-function generarRecibo(m){
-  if(!(window.jspdf&&window.jspdf.jsPDF)){ toast('Generando…vuelve a tocar en un momento','bad'); return; }
-  const { jsPDF }=window.jspdf; const doc=new jsPDF({unit:'pt',format:'a5'}); const W=doc.internal.pageSize.getWidth();
-  const gold=[184,148,31],dark=[20,20,23];
-  doc.setFillColor(...dark); doc.rect(0,0,W,72,'F');
-  doc.setFillColor(...gold); doc.roundedRect(28,22,28,28,7,7,'F');
-  doc.setTextColor(255); doc.setFont('helvetica','bold'); doc.setFontSize(15); doc.text('Cerrada La Marquesa',68,38);
-  doc.setFont('helvetica','normal'); doc.setFontSize(10); doc.setTextColor(205); doc.text('Recibo de pago',68,53);
+/* Mismo diseño que la app real: pdf-marquesa.js (módulo único de estilo de los PDF). */
+if (window.MarquesaPDF) MarquesaPDF.preparar();   // logo + fuentes, una vez
+async function generarRecibo(m){
+  if(!(window.jspdf&&window.jspdf.jsPDF&&window.MarquesaPDF)){ toast('Generando…vuelve a tocar en un momento','bad'); return; }
+  await MarquesaPDF.preparar();
   const folio = 'REC-'+(++reciboFolio);
-  doc.setTextColor(90); doc.setFontSize(10);
-  doc.text('Folio: '+folio, 28, 104);
-  doc.text('Fecha: '+(m.t==='Hoy'?new Date().toLocaleDateString('es-MX'):m.t), W-28, 104, {align:'right'});
-  doc.setDrawColor(225); doc.line(28,116,W-28,116);
-  doc.setTextColor(40); doc.setFontSize(11);
-  doc.text('Recibí de:', 28, 144); doc.setFont('helvetica','bold'); doc.text(m.concepto, 110, 144);
-  doc.setFont('helvetica','normal'); doc.text('Concepto:', 28, 166); doc.text(m.categoria, 110, 166);
-  doc.setFillColor(248,246,238); doc.roundedRect(28,186,W-56,52,8,8,'F');
-  doc.setTextColor(120); doc.setFontSize(10); doc.text('Monto recibido', 44, 208);
-  doc.setTextColor(...gold); doc.setFont('helvetica','bold'); doc.setFontSize(20); doc.text(money(m.monto)+' MXN', 44, 230);
-  doc.setFont('helvetica','normal'); doc.setTextColor(150); doc.setFontSize(9);
-  doc.text('Administración · Cerrada La Marquesa', 28, doc.internal.pageSize.getHeight()-40);
-  doc.text('Documento emitido electrónicamente.', 28, doc.internal.pageSize.getHeight()-28);
+  const doc = MarquesaPDF.recibo({
+    folio, emitido: m.t==='Hoy' ? new Date().toLocaleString('es-MX',{day:'2-digit',month:'long',year:'numeric',hour:'2-digit',minute:'2-digit'}) : m.t,
+    casa: m.concepto, concepto: m.concepto, categoria: m.categoria, monto: m.monto, registro: 'Administración (demo)',
+  });
   doc.save('Recibo-'+folio+'-La-Marquesa.pdf');
   toast('Recibo '+folio+' generado','ok');
 }
@@ -2902,25 +2891,18 @@ $('#saveMovBtn').onclick=()=>{
 };
 
 /* ============ REPORTE PDF ============ */
-$('#pdfBtn').onclick=()=>{
-  if(!(window.jspdf&&window.jspdf.jsPDF)){ toast('Generando…vuelve a tocar en un momento','bad'); return; }
-  const { jsPDF }=window.jspdf; const doc=new jsPDF({unit:'pt',format:'a4'}); const W=doc.internal.pageSize.getWidth();
-  const gold=[184,148,31],green=[34,160,110],red=[200,70,70],dark=[20,20,23];
-  doc.setFillColor(...dark); doc.rect(0,0,W,90,'F');
-  doc.setFillColor(...gold); doc.roundedRect(40,28,34,34,8,8,'F');
-  doc.setTextColor(255); doc.setFont('helvetica','bold'); doc.setFontSize(18); doc.text('Cerrada La Marquesa',88,46);
-  doc.setFont('helvetica','normal'); doc.setFontSize(11); doc.setTextColor(200); doc.text('Reporte de finanzas · junio 2026',88,64);
+$('#pdfBtn').onclick=async()=>{
+  if(!(window.jspdf&&window.jspdf.jsPDF&&window.MarquesaPDF)){ toast('Generando…vuelve a tocar en un momento','bad'); return; }
+  await MarquesaPDF.preparar();
   let c=0,g=0; finanzas.forEach(m=>m.tipo==='ingreso'?c+=m.monto:g+=m.monto);
-  const cy=120,cw=(W-80-24)/3; [['Cobrado',money(c),green],['Gastos',money(g),red],['En caja',money(c-g),gold]].forEach((card,i)=>{
-    const x=40+i*(cw+12); doc.setDrawColor(225); doc.setFillColor(250,250,250); doc.roundedRect(x,cy,cw,64,8,8,'FD');
-    doc.setFontSize(9); doc.setTextColor(120); doc.text(card[0],x+12,cy+22);
-    doc.setFont('helvetica','bold'); doc.setFontSize(15); doc.setTextColor(...card[2]); doc.text(card[1],x+12,cy+46); doc.setFont('helvetica','normal');
+  const cats={}; finanzas.filter(m=>m.tipo==='egreso').forEach(m=>cats[m.categoria]=(cats[m.categoria]||0)+m.monto);
+  const doc = await MarquesaPDF.reporteFinanciero({
+    periodo:'junio 2026', generado:new Date().toLocaleString('es-MX',{day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}), folio:'FIN-202606-DEMO',
+    cobrado:c, gastos:g, saldo:c-g, saldoIni:0, saldoFinal:c-g, cmpCobrado:null, cmpGastos:null,
+    barras:{ labels:['jun 2026'], ingresos:[c], gastos:[g] },
+    categorias:{ labels:Object.keys(cats), data:Object.values(cats), hasData:Object.keys(cats).length>0 },
+    movimientos: finanzas.map(m=>({ fecha:m.t, tipo:m.tipo, categoria:m.categoria, concepto:m.concepto, monto:m.monto })),
   });
-  doc.autoTable({ startY:208, head:[['Fecha','Tipo','Categoría','Concepto','Monto']],
-    body: finanzas.map(m=>[m.t,m.tipo==='ingreso'?'Ingreso':'Gasto',m.categoria,m.concepto,(m.tipo==='ingreso'?'+':'−')+money(m.monto)]),
-    theme:'striped', headStyles:{fillColor:dark,textColor:255,fontSize:10}, bodyStyles:{fontSize:9,textColor:40},
-    alternateRowStyles:{fillColor:[248,248,248]}, columnStyles:{4:{halign:'right',fontStyle:'bold'}}, margin:{left:40,right:40} });
-  doc.setFontSize(9); doc.setTextColor(150); doc.text('Generado el '+new Date().toLocaleString('es-MX')+' · Cerrada La Marquesa',40,doc.lastAutoTable.finalY+24);
   doc.save('Finanzas-La-Marquesa-junio-2026.pdf');
   toast('Reporte PDF generado','ok');
 };
