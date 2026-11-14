@@ -568,7 +568,12 @@
       <button type="button" class="moros-toggle" id="sinPagoToggle"><span class="caret">▸</span> <span id="sinPagoCount">❌ Sin pago</span></button>
       <div class="list hidden" id="sinPagoList"><div class="empty">Sin datos</div></div>
       <!-- Consulta puntual de una casa (detalle del pago); lista activas y suspendidas -->
-      <div class="field" style="margin-top:14px"><label>Consultar casa (detalle)</label><select id="consultaCasaSel"></select></div>
+      <div class="field" style="margin-top:14px"><label>Consultar casa (detalle)</label>
+      <input id="consultaCasaBuscar" type="search" placeholder="Escribe el domicilio…" autocomplete="off">
+      <input type="hidden" id="consultaCasa" value="">
+      <div class="list" id="consultaCasaSug" style="max-height:30vh;overflow:auto;margin-top:6px"></div>
+      <div class="vnote hidden" id="consultaCasaElegido" style="margin:6px 0 0"></div>
+    </div>
       <div id="consultaCasaResult" class="consulta-result hidden"></div>
     </div>
     <div id="finDetalle">
@@ -959,9 +964,11 @@
     <div class="grab"></div>
     <h3>Reporte por casa</h3>
     <div class="field"><label>Casa</label>
-      <select id="casaRepSel"></select>
+      <input id="casaRepBuscar" type="search" placeholder="Escribe el domicilio…" autocomplete="off">
+      <input type="hidden" id="casaRep" value="">
+      <div class="list" id="casaRepSug" style="max-height:30vh;overflow:auto;margin-top:6px"></div>
+      <div class="vnote hidden" id="casaRepElegido" style="margin:6px 0 0"></div>
     </div>
-    <div class="field hidden" id="casaRepCustomField"><label>Casa exacta</label><input id="casaRepCustom" placeholder="Ej. 57"></div>
     <button class="btn-primary" id="casaRepGo">Generar PDF</button>
     <div id="casaRepErr" class="err"></div>
   </div>

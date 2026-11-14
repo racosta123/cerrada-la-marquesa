@@ -2253,24 +2253,18 @@ $('#sinPagoToggle')?.addEventListener('click', () => {
   $('#sinPagoToggle').classList.toggle('abierto', sinPagoExpandido);
 });
 
-/* -------- consultar el detalle de un domicilio (solo staff). Lista TODAS las casas
-   (activas y suspendidas); las suspendidas se marcan en la opción. -------- */
+/* -------- consultar el detalle de un domicilio (solo staff): mismo buscador de domicilio, con TODAS
+   las casas (activas y suspendidas, marcadas); sin casas de prueba, no son parte de la cobranza. -------- */
+let buscaConsultaCasa = null;   // se crea al primer uso (la función se declara más abajo en el archivo)
 function poblarConsultaCasa(){
-  const sel = $('#consultaCasaSel');
-  // Sin casas de prueba: no son parte de la cobranza.
-  const casas = jefes().filter(v => !v.casaPrueba).sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
-  const prev = sel.value;
-  sel.innerHTML = '';
-  if (!casas.length){ sel.appendChild(new Option('—','')); renderConsultaCasa(); return; }
-  sel.appendChild(new Option('Elige un domicilio…',''));
-  casas.forEach(v => sel.appendChild(new Option(   // new Option escapa seguro
-    v.estado === 'suspendido' ? v.domicilio + ' (suspendido)' : v.domicilio, v.domicilio)));
-  if (prev) sel.value = prev;
+  if (!buscaConsultaCasa) buscaConsultaCasa = buscadorDomicilio('consultaCasa', {
+    fuente: () => jefes().filter(v => !v.casaPrueba).sort(ordenDom), alCambiar: renderConsultaCasa, soloAlEscribir: true });
+  buscaConsultaCasa.refrescar();
   renderConsultaCasa();
 }
 function renderConsultaCasa(){
   const box = $('#consultaCasaResult');
-  const casa = $('#consultaCasaSel').value;
+  const casa = $('#consultaCasa').value;
   if (!casa){ box.classList.add('hidden'); box.classList.remove('pagado'); return; }
   const pago = pagosPorCasaDelMes().get(normDom(casa));
   box.classList.remove('hidden');
@@ -2284,7 +2278,6 @@ function renderConsultaCasa(){
       + `<div class="sub">No hay Cuota registrada para este domicilio en el mes en curso.</div>`;
   }
 }
-$('#consultaCasaSel').addEventListener('change', renderConsultaCasa);
 
 function groupByMonth(){
   const map = {};
@@ -2667,48 +2660,55 @@ function casaRequerida(){ return movType==='ingreso'; }
    revalida contra el padrón. Las suspendidas van incluidas a propósito: un moroso que llega a
    pagar tiene que poder pagar, y ese pago de Cuota dispara la reactivación automática (solo
    si la suspensión fue por mora; una manual no se quita sola). */
-/* Buscador de domicilio (mismo patrón que el de aperturas): filtra en vivo las casas ya cargadas
-   en el teléfono (jefes(), sin lecturas nuevas), sin distinguir mayúsculas ni acentos, máximo 20.
-   Solo se acepta lo elegido de las sugerencias: #movCasa (oculto) guarda el domicilio exacto. */
-function movCasaFuente(){
-  return jefes().filter(v => !v.casaPrueba)   // una casa de prueba no registra pagos (el Worker lo rechaza)
-    .sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
+/* Buscador de domicilio — componente ÚNICO para todo lugar donde se elige una casa (Registrar
+   movimiento, Consultar casa, Reporte por casa). Filtra en vivo las casas ya cargadas en el
+   teléfono (jefes(), sin lecturas nuevas), sin distinguir mayúsculas ni acentos ("efes" → todos los
+   Efeso, "efeso 73" → Efeso 73), máximo 20. Solo se acepta lo elegido de las sugerencias: el input
+   oculto #<p> guarda el domicilio exacto. Marcado: #<p>Buscar, #<p>, #<p>Sug, #<p>Elegido.
+   soloAlEscribir: no lista nada mientras el campo está vacío (para no llenar una pantalla). */
+function buscadorDomicilio(p, { fuente, alCambiar, soloAlEscribir = false }){
+  const norm = t => sinAcentos(t).replace(/\s+/g, ' ');
+  const elegir = dom => {
+    const v = dom ? fuente().find(x => x.domicilio === dom) : null;
+    const antes = $('#' + p).value;
+    $('#' + p).value = v ? v.domicilio : '';
+    const el = $('#' + p + 'Elegido');
+    el.classList.toggle('hidden', !v);
+    el.innerHTML = v ? `Seleccionado: <b style="color:var(--text)">${esc(v.domicilio)}</b>${v.estado === 'suspendido' ? ' (suspendido)' : ''}` : '';
+    if (alCambiar && antes !== $('#' + p).value) alCambiar($('#' + p).value);
+  };
+  const refrescar = () => {
+    const cont = $('#' + p + 'Sug'); cont.innerHTML = '';
+    const casas = fuente();
+    $('#' + p + 'Buscar').disabled = !casas.length;
+    if (!casas.length){ cont.innerHTML = '<div class="empty">Da de alta casas primero</div>'; return; }
+    const elegido = $('#' + p).value;
+    if (elegido && !casas.some(v => v.domicilio === elegido)) elegir('');   // ya no está en el padrón
+    const q = norm($('#' + p + 'Buscar').value.trim());
+    if (soloAlEscribir && (!q || $('#' + p).value)) return;
+    const hits = casas.filter(v => !q || norm(v.domicilio).includes(q)).slice(0, 20);
+    if (!hits.length){ cont.innerHTML = '<div class="empty">Sin coincidencias</div>'; return; }
+    hits.forEach(v => {
+      const row = document.createElement('div');
+      row.className = 'row'; row.style.cursor = 'pointer';
+      row.innerHTML = `<div class="rt"><div class="a">${esc(v.domicilio)}</div>`
+        + (v.estado === 'suspendido' ? '<div class="b">suspendido</div>' : '') + '</div>'
+        + (v.domicilio === $('#' + p).value ? '<span class="tag in">Elegido</span>' : '');
+      row.addEventListener('click', () => set(v.domicilio));
+      cont.appendChild(row);
+    });
+  };
+  /* Pone (o limpia) el domicilio: al tocar una sugerencia, al abrir/limpiar el formulario. */
+  const set = dom => { elegir(dom || ''); $('#' + p + 'Buscar').value = $('#' + p).value; refrescar(); };
+  $('#' + p + 'Buscar').addEventListener('input', () => { elegir(''); refrescar(); });
+  return { set, refrescar, valor: () => $('#' + p).value, fuente };
 }
-function movCasaElegir(dom){
-  const v = dom ? movCasaFuente().find(x => x.domicilio === dom) : null;
-  $('#movCasa').value = v ? v.domicilio : '';
-  const el = $('#movCasaElegido');
-  el.classList.toggle('hidden', !v);
-  el.innerHTML = v ? `Seleccionado: <b style="color:var(--text)">${esc(v.domicilio)}</b>${v.estado === 'suspendido' ? ' (suspendido)' : ''}` : '';
-}
-function poblarCasaSelect(){
-  const cont = $('#movCasaSug'); cont.innerHTML = '';
-  const casas = movCasaFuente();
-  $('#movCasaBuscar').disabled = !casas.length;
-  if (!casas.length){ cont.innerHTML = '<div class="empty">Da de alta casas primero</div>'; return; }
-  const elegido = $('#movCasa').value;
-  if (elegido && !casas.some(v => v.domicilio === elegido)) movCasaElegir('');   // ya no está en el padrón
-  const norm = t => sinAcentos(t).replace(/s+/g, ' ');
-  const q = norm($('#movCasaBuscar').value.trim());
-  const hits = casas.filter(v => !q || norm(v.domicilio).includes(q)).slice(0, 20);
-  if (!hits.length){ cont.innerHTML = '<div class="empty">Sin coincidencias</div>'; return; }
-  hits.forEach(v => {
-    const row = document.createElement('div');
-    row.className = 'row'; row.style.cursor = 'pointer';
-    row.innerHTML = `<div class="rt"><div class="a">${esc(v.domicilio)}</div>`
-      + (v.estado === 'suspendido' ? '<div class="b">suspendido</div>' : '') + '</div>'
-      + (v.domicilio === $('#movCasa').value ? '<span class="tag in">Elegido</span>' : '');
-    row.addEventListener('click', () => movCasaSet(v.domicilio));
-    cont.appendChild(row);
-  });
-}
-$('#movCasaBuscar').addEventListener('input', () => { movCasaElegir(''); poblarCasaSelect(); });
-/* Pone (o limpia) el domicilio del formulario: al tocar una sugerencia, alta nueva, corrección, guardado. */
-function movCasaSet(dom){
-  movCasaElegir(dom || '');
-  $('#movCasaBuscar').value = $('#movCasa').value;
-  poblarCasaSelect();
-}
+const ordenDom = (a,b) => a.domicilio.localeCompare(b.domicilio,'es',{numeric:true});
+// Registrar movimiento: una casa de prueba no registra pagos (el Worker lo rechaza).
+const buscaMovCasa = buscadorDomicilio('movCasa', { fuente: () => jefes().filter(v => !v.casaPrueba).sort(ordenDom) });
+function movCasaFuente(){ return buscaMovCasa.fuente(); }
+function poblarCasaSelect(){ buscaMovCasa.refrescar(); }
+function movCasaSet(dom){ buscaMovCasa.set(dom); }
 function updateCasaField(){
   const req = casaRequerida();
   $('#movCasaField').classList.toggle('hidden', !req);
@@ -2975,23 +2975,18 @@ $('#reciboDlBtn').addEventListener('click', async () => {
 });
 
 /* ====================== FASE 4.5 · REPORTE POR CASA (FASE 6.5: desde el padrón) ====================== */
+// Mismo buscador de domicilio; todas las casas (activas y suspendidas) para poder reportar cualquiera.
+const buscaCasaRep = buscadorDomicilio('casaRep', { fuente: () => jefes().slice().sort(ordenDom) });
 $('#casaRepBtn').addEventListener('click', () => {
-  const casas = jefes().slice()   // todas las casas (activas y suspendidas) para poder reportar cualquiera
-    .sort((a,b) => a.domicilio.localeCompare(b.domicilio, 'es', { numeric:true }))
-    .map(v => v.domicilio);
-  const sel = $('#casaRepSel');
-  sel.innerHTML = '';
-  if (!casas.length){ sel.appendChild(new Option('Sin casas en el padrón','')); }
-  else { sel.appendChild(new Option('Elige un domicilio…','')); casas.forEach(c => sel.appendChild(new Option(c, c))); }
-  $('#casaRepCustomField').classList.add('hidden');   // ya no hay texto libre: el padrón es la fuente
+  buscaCasaRep.set('');
   $('#casaRepErr').textContent = '';
   openSheet('#casaRepOverlay');
 });
 $('#casaRepOverlay').addEventListener('click', e => { if (e.target.id==='casaRepOverlay') closeSheet('#casaRepOverlay'); });
 
 $('#casaRepGo').addEventListener('click', async () => {
-  const casa = $('#casaRepSel').value;
-  if (!casa){ $('#casaRepErr').textContent = 'Elige un domicilio'; return; }
+  const casa = buscaCasaRep.valor();   // solo un domicilio elegido de las sugerencias
+  if (!casa){ $('#casaRepErr').textContent = 'Escribe y elige el domicilio de las sugerencias'; return; }
   const btn = $('#casaRepGo'); btn.disabled = true; btn.textContent = 'Generando…';
   try {
     // Historial completo de la casa (no solo los 6 meses del cache). Sin orderBy
@@ -3689,7 +3684,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v39';
+const APP_VERSION = 'v40';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);
