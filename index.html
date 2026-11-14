@@ -897,7 +897,12 @@
         <option value="Otro">Otro</option>
       </select>
     </div>
-    <div class="field hidden" id="movCasaField"><label>Domicilio (obligatorio en ingresos)</label><select id="movCasa"></select></div>
+    <div class="field hidden" id="movCasaField"><label>Domicilio (obligatorio en ingresos)</label>
+      <input id="movCasaBuscar" type="search" placeholder="Escribe el domicilio…" autocomplete="off">
+      <input type="hidden" id="movCasa" value="">
+      <div class="list" id="movCasaSug" style="max-height:30vh;overflow:auto;margin-top:6px"></div>
+      <div class="vnote hidden" id="movCasaElegido" style="margin:6px 0 0"></div>
+    </div>
     <div class="field"><label>Monto (MXN)</label><input id="movAmount" type="number" inputmode="decimal" placeholder="0.00"></div>
     <div class="field hidden" id="movMotivoField"><label>Motivo de la corrección (obligatorio — queda en el historial)</label><textarea id="movMotivo" rows="2" maxlength="300" placeholder="Ej. Monto mal capturado, era $300"></textarea></div>
     <button class="btn-primary" id="saveMovBtn">Guardar movimiento</button>

@@ -2879,21 +2879,47 @@ function casaRequerida(){ return movType==='ingreso'; }
    revalida contra el padrón. Las suspendidas van incluidas a propósito: un moroso que llega a
    pagar tiene que poder pagar, y ese pago de Cuota dispara la reactivación automática (solo
    si la suspensión fue por mora; una manual no se quita sola). */
+/* Buscador de domicilio (mismo patrón que el de aperturas): filtra en vivo las casas ya cargadas
+   en el teléfono (jefes(), sin lecturas nuevas), sin distinguir mayúsculas ni acentos, máximo 20.
+   Solo se acepta lo elegido de las sugerencias: #movCasa (oculto) guarda el domicilio exacto. */
+function movCasaFuente(){
+  return jefes().filter(v => !v.casaPrueba)   // una casa de prueba no registra pagos (el Worker lo rechaza)
+    .sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
+}
+function movCasaElegir(dom){
+  const v = dom ? movCasaFuente().find(x => x.domicilio === dom) : null;
+  $('#movCasa').value = v ? v.domicilio : '';
+  const el = $('#movCasaElegido');
+  el.classList.toggle('hidden', !v);
+  el.innerHTML = v ? `Seleccionado: <b style="color:var(--text)">${esc(v.domicilio)}</b>${v.estado === 'suspendido' ? ' (suspendido)' : ''}` : '';
+}
 function poblarCasaSelect(){
-  const sel = $('#movCasa');
-  const fuente = jefes().filter(v => !v.casaPrueba);   // una casa de prueba no registra pagos (el Worker lo rechaza)
-  const activos = fuente.slice().sort((a,b)=>a.domicilio.localeCompare(b.domicilio,'es',{numeric:true}));
-  const prev = sel.value;
-  sel.innerHTML = '';
-  if (!activos.length){
-    sel.appendChild(new Option('Da de alta casas primero',''));
-    sel.disabled = true; return;
-  }
-  sel.disabled = false;
-  sel.appendChild(new Option('Selecciona el domicilio…',''));
-  activos.forEach(v => sel.appendChild(new Option(
-    v.estado === 'suspendido' ? v.domicilio + ' (suspendido)' : v.domicilio, v.domicilio)));
-  if (prev) sel.value = prev;   // conserva selección si sigue en el padrón
+  const cont = $('#movCasaSug'); cont.innerHTML = '';
+  const casas = movCasaFuente();
+  $('#movCasaBuscar').disabled = !casas.length;
+  if (!casas.length){ cont.innerHTML = '<div class="empty">Da de alta casas primero</div>'; return; }
+  const elegido = $('#movCasa').value;
+  if (elegido && !casas.some(v => v.domicilio === elegido)) movCasaElegir('');   // ya no está en el padrón
+  const norm = t => sinAcentos(t).replace(/s+/g, ' ');
+  const q = norm($('#movCasaBuscar').value.trim());
+  const hits = casas.filter(v => !q || norm(v.domicilio).includes(q)).slice(0, 20);
+  if (!hits.length){ cont.innerHTML = '<div class="empty">Sin coincidencias</div>'; return; }
+  hits.forEach(v => {
+    const row = document.createElement('div');
+    row.className = 'row'; row.style.cursor = 'pointer';
+    row.innerHTML = `<div class="rt"><div class="a">${esc(v.domicilio)}</div>`
+      + (v.estado === 'suspendido' ? '<div class="b">suspendido</div>' : '') + '</div>'
+      + (v.domicilio === $('#movCasa').value ? '<span class="tag in">Elegido</span>' : '');
+    row.addEventListener('click', () => movCasaSet(v.domicilio));
+    cont.appendChild(row);
+  });
+}
+$('#movCasaBuscar').addEventListener('input', () => { movCasaElegir(''); poblarCasaSelect(); });
+/* Pone (o limpia) el domicilio del formulario: al tocar una sugerencia, alta nueva, corrección, guardado. */
+function movCasaSet(dom){
+  movCasaElegir(dom || '');
+  $('#movCasaBuscar').value = $('#movCasa').value;
+  poblarCasaSelect();
 }
 function updateCasaField(){
   const req = casaRequerida();
@@ -2916,7 +2942,7 @@ function modoFormMov(m){
 }
 $('#newMovBtn').addEventListener('click', ()=>{
   // Si lo último fue una corrección, se limpia para no arrastrar sus datos a un alta nueva.
-  if (movCorrigiendo){ $('#movConcept').value = $('#movAmount').value = ''; $('#movCat').value = 'Cuota'; $('#movCasa').value = ''; setMovType('ingreso'); }
+  if (movCorrigiendo){ $('#movConcept').value = $('#movAmount').value = ''; $('#movCat').value = 'Cuota'; movCasaSet(''); setMovType('ingreso'); }
   modoFormMov(null); updateCasaField(); openSheet('#movOverlay');
 });
 /* "Corregir": abre la hoja con los datos del original; al guardar, el Worker cancela el original
@@ -2929,9 +2955,8 @@ function abrirCorreccion(m){
   $('#movCat').value = m.categoria || 'Otro';
   if (!$('#movCat').value) $('#movCat').value = 'Otro';   // categoría vieja fuera de la lista
   $('#movAmount').value = m.monto != null ? String(m.monto) : '';
-  $('#movCasa').value = '';
   updateCasaField();
-  if (m.casa) $('#movCasa').value = m.casa;
+  movCasaSet(m.casa || '');
   $('#movCorrigeNota').textContent = m.folioRecibo
     ? `El original (${m.folioRecibo}) quedará CANCELADO con su folio; el corregido llevará folio nuevo.`
     : 'El original quedará CANCELADO; el corregido lo reemplaza.';
@@ -2950,12 +2975,12 @@ async function saveMov(){
   const concepto = $('#movConcept').value.trim();
   const categoria = $('#movCat').value.trim() || 'Otro';
   const monto = parseFloat($('#movAmount').value);
-  const casa = $('#movCasa').value;  // FASE 4.6: dropdown numérico → "1".."totalCasas" o ""
+  const casa = $('#movCasa').value;  // solo un domicilio elegido de las sugerencias, o ""
   const orig = movCorrigiendo;
   const motivo = $('#movMotivo').value.trim();
   $('#movErr').textContent = '';
   if (!concepto || !(monto > 0)){ $('#movErr').textContent = 'Falta concepto o monto válido'; return; }
-  if (casaRequerida() && !casa){ $('#movErr').textContent = 'Selecciona la casa (obligatorio en ingresos)'; return; }
+  if (casaRequerida() && (!casa || !movCasaFuente().some(v => v.domicilio === casa))){ $('#movErr').textContent = 'Elige el domicilio de las sugerencias (obligatorio en ingresos)'; return; }
   if (orig && motivo.length < 5){ $('#movErr').textContent = 'Escribe el motivo de la corrección (mínimo 5 caracteres)'; return; }
   const btn = $('#saveMovBtn'); btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
   try {
@@ -2966,7 +2991,8 @@ async function saveMov(){
       : await authedFetch('/finanzas/registrar', { tipo: movType, concepto, categoria, monto, casa });
     toast(orig ? 'Corrección guardada · el original quedó cancelado' : 'Movimiento registrado', 'ok');
     closeSheet('#movOverlay');
-    $('#movConcept').value = $('#movCat').value = $('#movAmount').value = $('#movCasa').value = '';
+    $('#movConcept').value = $('#movCat').value = $('#movAmount').value = '';
+    movCasaSet('');
     modoFormMov(null);
     if (r && r.folioRecibo){
       abrirReciboSheet({
@@ -4240,7 +4266,7 @@ $('#votCerrarOverlay')?.addEventListener('click', e => { if (e.target.id==='votC
    — carrera que se pierde casi siempre, dejando el campo vacío. Este literal nunca fallará.
    Si el service worker activo responde con una versión DISTINTA (ver mostrarVersionSW más
    abajo), la reemplaza — eso solo pasa si ESTE dispositivo aún no terminó de actualizar. */
-const APP_VERSION = 'v37';
+const APP_VERSION = 'v38';
 /* Se pinta en todos los .app-version: al final de Puertas (todos) y en Gestión (staff). */
 function pintarVersion(v){
   document.querySelectorAll('.app-version').forEach(el => el.textContent = 'Versión ' + v);

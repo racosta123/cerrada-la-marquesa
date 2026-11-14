@@ -1,4 +1,4 @@
-const CACHE = 'marquesa-v37';
+const CACHE = 'marquesa-v38';
 
 // SHELL: cambia en cada publicación → se baja SIEMPRE del servidor al instalar una versión nueva.
 // cache:'reload' — GitHub Pages manda Cache-Control max-age=600: con addAll a secas el precache
