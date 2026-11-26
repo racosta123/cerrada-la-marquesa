@@ -2854,13 +2854,22 @@ function descargarPDFArchivo(blob, filename){
 }
 async function compartirPDF(doc, filename, title){
   const file = new File([doc.output('blob')], filename, { type:'application/pdf' });
-  if (navigator.canShare && navigator.canShare({ files:[file] })){
-    await navigator.share({ files:[file], title });
-    toast('PDF compartido', 'ok');
-    return 'compartido';
+  // En computadora (sin pantalla táctil) la hoja de compartir no sirve para WhatsApp: descarga directa.
+  // En celular (pointer:coarse) se intenta navigator.share; si falla por algo que no sea cancelación
+  // del usuario (AbortError), se descarga como respaldo.
+  const esTactil = window.matchMedia && window.matchMedia('(pointer:coarse)').matches;
+  if (esTactil && navigator.canShare && navigator.canShare({ files:[file] })){
+    try {
+      await navigator.share({ files:[file], title });
+      toast('PDF compartido', 'ok');
+      return 'compartido';
+    } catch(e){
+      if (e && e.name === 'AbortError') throw e;   // el usuario canceló: ni error ni descarga
+      console.error('compartirPDF share', e);      // cualquier otro fallo → respaldo: descargar
+    }
   }
   descargarPDFArchivo(file, filename);
-  toast('PDF descargado, envíalo como Documento en WhatsApp', 'ok');
+  toast('PDF descargado, adjúntalo como Documento en WhatsApp', 'ok');
   return 'descargado';
 }
 
