@@ -2840,12 +2840,36 @@ async function construirReportePDF(){
 }
 
 /* botón "Reporte PDF": solo descarga */
+/* ---- Compartir / descargar PDF sin subir nada a ningún servidor ----
+   El PDF solo sale del teléfono cuando el usuario elige compartirlo. descargarPDFArchivo arma
+   un <a download> con blob URL y la libera (revokeObjectURL) al terminar, para no dejar la
+   pestaña blob: colgada (ese link, al compartirse, le llega 404 al destinatario). compartirPDF
+   usa Web Share nivel 2 (navigator.share con archivo) y, sin soporte, cae a la descarga. */
+function descargarPDFArchivo(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 4000);   // libera la blob URL al terminar
+}
+async function compartirPDF(doc, filename, title){
+  const file = new File([doc.output('blob')], filename, { type:'application/pdf' });
+  if (navigator.canShare && navigator.canShare({ files:[file] })){
+    await navigator.share({ files:[file], title });
+    toast('PDF compartido', 'ok');
+    return 'compartido';
+  }
+  descargarPDFArchivo(file, filename);
+  toast('PDF descargado, envíalo como Documento en WhatsApp', 'ok');
+  return 'descargado';
+}
+
 async function generarPDF(){
   const btn = $('#pdfBtn'); const btnLabel = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generando…';
   try {
     const { doc, filename } = await construirReportePDF();
-    doc.save(filename);
+    descargarPDFArchivo(doc.output('blob'), filename);
   } catch(e){
     console.error('generarPDF', e);
     toast('No se pudo generar el PDF', 'bad');
@@ -2870,8 +2894,8 @@ async function compartirReportePDF(){
       await navigator.share({ files: [file], title: 'Reporte financiero · Cerrada La Marquesa' });
       toast('Reporte compartido', 'ok');
     } else {
-      doc.save(filename);
-      toast('PDF descargado — adjúntalo en WhatsApp', 'ok');
+      descargarPDFArchivo(file, filename);
+      toast('PDF descargado, envíalo como Documento en WhatsApp', 'ok');
     }
   } catch(e){
     if (e && e.name === 'AbortError'){
@@ -2943,8 +2967,8 @@ $('#reciboWaBtn').addEventListener('click', async () => {
       toast('Recibo compartido', 'ok');
       await marcarReciboEnviado(mov.id, 'compartido');
     } else {
-      doc.save(filename);
-      toast('PDF descargado — adjúntalo en WhatsApp', 'ok');
+      descargarPDFArchivo(file, filename);
+      toast('PDF descargado, envíalo como Documento en WhatsApp', 'ok');
       await marcarReciboEnviado(mov.id, 'descargado');
     }
   } catch(e){
@@ -2965,7 +2989,7 @@ $('#reciboDlBtn').addEventListener('click', async () => {
   try {
     await prepararPDF();
     const { doc, filename } = construirReciboPDF(mov);
-    doc.save(filename);
+    descargarPDFArchivo(doc.output('blob'), filename);
     toast('Recibo descargado', 'ok');
     await marcarReciboEnviado(mov.id, 'descargado');
   } catch(e){
@@ -2984,27 +3008,51 @@ $('#casaRepBtn').addEventListener('click', () => {
 });
 $('#casaRepOverlay').addEventListener('click', e => { if (e.target.id==='casaRepOverlay') closeSheet('#casaRepOverlay'); });
 
-$('#casaRepGo').addEventListener('click', async () => {
+/* Arma el PDF del historial de la casa (lectura + diseño); devuelve {doc, filename} o null
+   (ya dejó el mensaje de error). Lo comparten dos botones: descargar y Compartir PDF. */
+async function casaRepConstruir(){
   const casa = buscaCasaRep.valor();   // solo un domicilio elegido de las sugerencias
-  if (!casa){ $('#casaRepErr').textContent = 'Escribe y elige el domicilio de las sugerencias'; return; }
+  if (!casa){ $('#casaRepErr').textContent = 'Escribe y elige el domicilio de las sugerencias'; return null; }
+  // Historial completo de la casa (no solo los 6 meses del cache). Sin orderBy
+  // encadenado al where para no requerir índice compuesto — se ordena aquí.
+  const snap = await db.collection('finanzas').where('casa','==',casa).get();
+  const movs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+    .filter(m => m.tipo === 'ingreso' && !esCanceladoMov(m))   // un pago cancelado no es un pago
+    .sort((a,b) => tsADate(b.ts) - tsADate(a.ts));
+  if (!movs.length){ $('#casaRepErr').textContent = `Sin pagos registrados para "${casa}"`; return null; }
+  await prepararPDF();
+  return construirReporteCasaPDF(casa, movs);
+}
+
+$('#casaRepGo').addEventListener('click', async () => {
   const btn = $('#casaRepGo'); btn.disabled = true; btn.textContent = 'Generando…';
+  $('#casaRepErr').textContent = '';
   try {
-    // Historial completo de la casa (no solo los 6 meses del cache). Sin orderBy
-    // encadenado al where para no requerir índice compuesto — se ordena aquí.
-    const snap = await db.collection('finanzas').where('casa','==',casa).get();
-    const movs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-      .filter(m => m.tipo === 'ingreso' && !esCanceladoMov(m))   // un pago cancelado no es un pago
-      .sort((a,b) => tsADate(b.ts) - tsADate(a.ts));
-    if (!movs.length){ $('#casaRepErr').textContent = `Sin pagos registrados para "${casa}"`; return; }
-    await prepararPDF();
-    const { doc, filename } = construirReporteCasaPDF(casa, movs);
-    doc.save(filename);
+    const r = await casaRepConstruir();
+    if (!r) return;
+    descargarPDFArchivo(r.doc.output('blob'), r.filename);
     toast('Reporte descargado', 'ok');
     closeSheet('#casaRepOverlay');
   } catch(e){
     console.error('reporteCasa', e);
     $('#casaRepErr').textContent = 'No se pudo generar el reporte';
   } finally { btn.disabled = false; btn.textContent = 'Generar PDF'; }
+});
+
+$('#casaRepShare').addEventListener('click', async () => {
+  const btn = $('#casaRepShare'); const original = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generando…';
+  $('#casaRepErr').textContent = '';
+  try {
+    const r = await casaRepConstruir();
+    if (!r) return;
+    await compartirPDF(r.doc, r.filename, 'Reporte por casa · Cerrada La Marquesa');
+  } catch(e){
+    if (!(e && e.name === 'AbortError')){
+      console.error('compartirReporteCasa', e);
+      $('#casaRepErr').textContent = 'No se pudo generar el reporte';
+    }
+  } finally { btn.disabled = false; btn.textContent = original; }
 });
 
 /* ====================== REPORTE DE APERTURAS POR RESIDENTE (solo staff) ======================
@@ -3092,6 +3140,7 @@ $('#aperRepGo').addEventListener('click', async () => {
       list.appendChild(row);
     });
     $('#aperRepPdf').disabled = !r.registros.length;
+    $('#aperRepShare').disabled = !r.registros.length;
     $('#aperRepRes').classList.remove('hidden');
   } catch(e){ $('#aperRepErr').textContent = e.message || 'No se pudo consultar'; }
   finally { btn.disabled = false; btn.textContent = 'Consultar'; }
@@ -3103,12 +3152,28 @@ $('#aperRepPdf').addEventListener('click', async () => {
   try {
     await prepararPDF();
     const { doc, filename } = construirReporteAperturasPDF(aperRepUltimo);
-    doc.save(filename);
+    descargarPDFArchivo(doc.output('blob'), filename);
     toast('Reporte descargado', 'ok');
   } catch(e){
     console.error('reporteAperturas', e);
     $('#aperRepErr').textContent = 'No se pudo generar el PDF';
   } finally { btn.disabled = false; btn.textContent = 'Descargar PDF'; }
+});
+
+$('#aperRepShare').addEventListener('click', async () => {
+  if (!aperRepUltimo) return;
+  const btn = $('#aperRepShare'); const original = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generando…';
+  try {
+    await prepararPDF();
+    const { doc, filename } = construirReporteAperturasPDF(aperRepUltimo);
+    await compartirPDF(doc, filename, `Aperturas de ${aperRepUltimo.persona.nombre || 'residente'} · Cerrada La Marquesa`);
+  } catch(e){
+    if (!(e && e.name === 'AbortError')){
+      console.error('compartirAperturas', e);
+      $('#aperRepErr').textContent = 'No se pudo generar el PDF';
+    }
+  } finally { btn.disabled = false; btn.textContent = original; }
 });
 
 /* PDF del reporte de aperturas (diseño en pdf-marquesa.js): aquí solo se pasan los datos del Worker
