@@ -126,6 +126,17 @@
   }
   .icon-btn svg{width:20px;height:20px}
   .topbar .acts{display:flex;align-items:center;gap:8px}
+  .tienda-pill{
+    width:auto;height:40px;padding:0 10px;border-radius:20px;
+    background:#fcc81e;border:1px solid #fcc81e;color:#16130a;
+    display:flex;align-items:center;gap:5px;font-size:13px;font-weight:700;
+    white-space:nowrap;flex-shrink:0;
+  }
+  .tienda-pill svg{width:17px;height:17px;flex-shrink:0}
+  @media (max-width:380px){
+    .tienda-pill{padding:0 8px;font-size:12px;gap:4px}
+    .tienda-pill svg{width:15px;height:15px}
+  }
   /* Botón de modo (FASE 7): solo lo ve el jefe-admin. Cambia qué pestañas se pintan. */
   #modoBtn{
     display:flex;align-items:center;gap:6px;height:40px;padding:0 12px;border-radius:13px;
@@ -437,10 +448,11 @@
           <circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
         </svg>
       </button>
-      <a class="icon-btn" id="tiendaBtn" title="Tienda Diagonal Catorce" aria-label="Tienda Diagonal Catorce" href="https://tienda-diagonalcatorce.pages.dev" target="_blank" rel="noopener noreferrer">
+      <a class="tienda-pill" id="tiendaBtn" title="Tienda Diagonal Catorce" aria-label="Tienda Diagonal Catorce" href="https://tienda-diagonalcatorce.pages.dev" target="_blank" rel="noopener noreferrer">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
           <path d="M6 2 3 7v13a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-3-5"/><path d="M3 7h18"/><path d="M16 11a4 4 0 0 1-8 0"/>
         </svg>
+        <span>Tienda</span>
       </a>
       <button class="icon-btn" id="logoutBtn" title="Salir">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
